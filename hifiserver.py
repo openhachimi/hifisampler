@@ -64,6 +64,7 @@ class Config:
     hnsep_model_path: str = r"path\to\your\hnsep_240512\vr\model.pt"
     wave_norm: bool = True
     loop_mode: bool = False
+    peak_limit: float = 1.0
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class DotDict(dict):
@@ -78,7 +79,7 @@ def dynamic_range_compression_torch(x, C=1, clip_val=1e-9):
     return torch.log(torch.clamp(x, min=clip_val) * C)
 
 def loudness_norm(
-    audio: np.ndarray, rate: int, peak=-1.0, loudness=-23.0, block_size=0.400
+    audio: np.ndarray, rate: int, peak=-1.0, loudness=-23.0, block_size=0.400, strength=100
 ) -> np.ndarray:
     """
     Perform loudness normalization (ITU-R BS.1770-4) on audio files.
@@ -89,6 +90,7 @@ def loudness_norm(
         peak: peak normalize audio to N dB. Defaults to -1.0.
         loudness: loudness normalize audio to N dB LUFS. Defaults to -23.0.
         block_size: block size for loudness measurement. Defaults to 0.400. (400 ms)
+        strength: strength of the normalization. Defaults to 100.
 
     Returns:
         loudness normalized audio
@@ -108,8 +110,11 @@ def loudness_norm(
     meter = pyln.Meter(rate, block_size=block_size)  # create BS.1770 meter
     _loudness = meter.integrated_loudness(audio)
 
+    # Apply strength to calculate the target loudness
+    final_loudness = _loudness + (loudness - _loudness) * strength / 100
+
     # Loudness normalize audio to [loudness] LUFS
-    audio = pyln.normalize.loudness(audio, _loudness, loudness)
+    audio = pyln.normalize.loudness(audio, _loudness, final_loudness)
     
     # If original audio was shorter than block_size, crop it back to its original length
     if original_length < int(rate * block_size):
@@ -479,8 +484,6 @@ class Resampler:
             A dictionary of the MEL.
         """
         wave = read_wav(self.in_file)
-        if Config.wave_norm:
-            wave = loudness_norm(wave, Config.sample_rate, peak = -1, loudness=-16.0, block_size=0.400)
         wave = torch.from_numpy(wave).to(dtype=torch.float32, device=Config.device).unsqueeze(0).unsqueeze(0)
         print(wave.shape)
 
@@ -497,18 +500,15 @@ class Resampler:
                 else:    
                     wave = (wave - seg_output) + seg_output*((100-breath)/50)
 
-        wave = wave.squeeze(0)
-        if Config.wave_norm:
-            wave = wave.squeeze(0).cpu().numpy()
-            wave = loudness_norm(wave, Config.sample_rate, peak = -1, loudness=-16.0, block_size=0.400)
-            wave = torch.from_numpy(wave).to(dtype=torch.float32, device=Config.device).unsqueeze(0)
+        wave = wave.squeeze(0).squeeze(0).cpu().numpy()
+        wave = torch.from_numpy(wave).to(dtype=torch.float32, device=Config.device).unsqueeze(0) # 默认不缩放
         wave_max = torch.max(torch.abs(wave))
         if wave_max >= 0.5:
             logging.info('The audio volume is too high. Scaling down to 0.5')
             # 先缩小到最大0.5
             scale = 0.5 / wave_max
             wave = wave * scale
-            scale = scale.cpu().numpy()
+            scale = scale.item()
         else:
             logging.info('The audio volume is already low enough')
             scale = 1.0
@@ -718,7 +718,17 @@ class Resampler:
 
         render = render / scale
         new_max = np.max(np.abs(render))
-        if new_max > 1:
+
+        # normalize using loudness_norm
+        if Config.wave_norm:
+            if "P" in self.flags.keys():
+                p_strength = self.flags['P']
+                if p_strength is not None:
+                    render = loudness_norm(render, Config.sample_rate, peak = -1, loudness=-16.0, block_size=0.400, strength=p_strength)
+                else:
+                    render = loudness_norm(render, Config.sample_rate, peak = -1, loudness=-16.0, block_size=0.400)
+
+        if new_max > Config.peak_limit:
             render = render / new_max
         save_wav(self.out_file, render)
 
