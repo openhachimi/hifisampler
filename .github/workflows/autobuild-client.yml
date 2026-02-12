@@ -1,0 +1,58 @@
+﻿name: Build clients for multiple platforms when released
+
+# triggers when a new release is created
+on:
+  release:
+    types: [created]
+
+jobs:
+  compile:
+    name: Compile for ${{ matrix.rid }}
+    runs-on: ${{ matrix.runner }}
+    
+    # runs the job for each platform in the matrix
+    strategy:
+      matrix:
+        include:
+        # windows
+        - rid: win-x64
+          runner: windows-latest
+          ext: .exe
+        # intel mac
+        - rid: osx-x64
+          runner: macos-15-intel
+          ext: ""
+        # apple silicon mac
+        - rid: osx-arm64
+          runner: macos-15
+          ext: ""
+
+    steps:
+    # Check out the code
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    # Install the .NET SDK
+    - name: Setup .NET 9.0.x
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '9.0.x' # according to the previous release
+
+    # Compile the code for multiple platforms
+    - name: Compile AOT for ${{ matrix.rid }}
+      working-directory: ./client
+      run: |
+        dotnet publish -c Release -r ${{ matrix.rid }} /p:PublishAot=true /p:DebugType=none /p:DebugSymbols=false -o ./raw
+    # prepare for uploading
+    - name: Prepare for upload
+      working-directory: ./client
+      shell: bash
+      run: |
+        mkdir release_assets
+        cp "./raw/hifisampler${{ matrix.ext }}" "./release_assets/hifisampler-${{ matrix.rid }}${{ matrix.ext }}"
+    # upload to release
+    - name: Upload to release
+      uses: softprops/action-gh-release@v2
+      if: github.ref_type == 'tag'
+      with:
+        files: ./client/release_assets/*
