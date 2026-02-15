@@ -130,7 +130,9 @@ pc-nsf-hifigan 是传统 nsf-hifigan 的改进，支持输入与 mel 不匹配�
   - 范围: `-100` 到 `100` | 默认: `0`
 - **G:** 强制重新生成特征缓存（忽略已有缓存）。
   - 无需数值
-- **He:** 为长音启用 Mel 频谱循环模式。
+- **He:** 基于 `config.yaml`（`processing.loop_mode`）切换 Mel 频谱延长模式。
+  - 当 `processing.loop_mode=false` 时，`He` 会启用循环模式。
+  - 当 `processing.loop_mode=true` 时，`He` 会切换为拉伸模式。
   - 无需数值
 
 _注：由于 `B` 和 `V` 与其他 UTAU flags 名称冲突但定义不同，因此分别更名为 `Hb` 和 `Hv`。_

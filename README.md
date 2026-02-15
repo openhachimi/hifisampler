@@ -106,7 +106,9 @@ Three installation methods are provided; choose the one that best suits your nee
   - Range: `-100` to `100` | Default: `0`
 - **G:** Force to regenerate feature cache (Ignoring existed cache).
   - No value needed
-- **He:** Enable Mel spectrum loop mode.
+- **He:** Toggle Mel spectrum extension mode against `config.yaml` (`processing.loop_mode`).
+  - If `processing.loop_mode=false`, `He` enables loop mode.
+  - If `processing.loop_mode=true`, `He` switches to stretch mode.
   - No value needed
 
 _Note: The flags `B` and `V` were renamed to `Hb` and `Hv` respectively because they conflict with other UTAU flags but have different definitions._

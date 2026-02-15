@@ -201,8 +201,13 @@ class Resampler:
         logging.info(f'length_req: {length_req}')
         logging.info(f'stretch_length: {stretch_length}')
 
-        if CONFIG.loop_mode or "He" in self.flags.keys():
-            # 添加循环拼接模式
+        # `He` toggles extension strategy against config default:
+        # - loop_mode=False + no He => stretch
+        # - loop_mode=False + He    => loop
+        # - loop_mode=True  + no He => loop
+        # - loop_mode=True  + He    => stretch
+        use_loop_mode = bool(CONFIG.loop_mode) ^ ("He" in self.flags.keys())
+        if use_loop_mode:
             logging.info('Looping.')
             logging.info(
                 f'con_mel_frame: {int((con + thop_origin/2)//thop_origin)}')
