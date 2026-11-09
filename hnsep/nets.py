@@ -22,7 +22,7 @@ class BaseNet(nn.Module):
         self.dec2 = layers.Decoder(nout * (2 + 4), nout * 2, 3, 1, 1)
         self.lstm_dec2 = layers.LSTMModule(nout * 2, nin_lstm, nout_lstm)
         self.dec1 = layers.Decoder(nout * (1 + 2) + 1, nout * 1, 3, 1, 1)
-        
+
         self.fixed_length = fixed_length
 
     def __call__(self, x):
@@ -52,7 +52,7 @@ class CascadedNet(nn.Module):
         self.seg_length = 32 * hop_length
         self.is_complex = is_complex
         self.is_mono = is_mono
-        self.register_buffer("window", torch.hann_window(n_fft), persistent=False)
+        self.register_buffer("window", torch.hann_window(n_fft, dtype=torch.float32), persistent=False)
         self.max_bin = n_fft // 2
         self.output_bin = n_fft // 2 + 1
         self.nin_lstm = self.max_bin // 2
@@ -86,10 +86,11 @@ class CascadedNet(nn.Module):
         self.aux_out = nn.Conv2d(3 * nout // 4, nin, 1, bias=False)
 
     def forward(self, x):
+        weight_dtype = self.out.weight.dtype
         if self.is_complex:
             x = torch.cat([x.real, x.imag], dim=1)
 
-        x = x[:, :, :self.max_bin]
+        x = x[:, :, :self.max_bin].to(dtype=weight_dtype)
 
         bandw = x.size()[2] // 2
         l1_in = x[:, :, :bandw]
@@ -107,21 +108,21 @@ class CascadedNet(nn.Module):
         f3_in = torch.cat([x, aux1, aux2], dim=1)
         f3 = self.stg3_full_band_net(f3_in)
 
+        # Keep complex mask calculation and replicate padding in float32 on real/imag parts
+        # so ROCm/PyTorch never fails on F.pad(complex_tensor, mode='replicate') or ComplexHalf.
+        out_fp32 = self.out(f3).float()
+        pad_bins = self.output_bin - out_fp32.size()[2]
+        if pad_bins > 0:
+            out_fp32 = F.pad(out_fp32, pad=(0, 0, 0, pad_bins), mode='replicate')
+
         if self.is_complex:
-            mask = self.out(f3)
             if self.is_mono:
-                mask = torch.complex(mask[:, :1], mask[:, 1:])
+                mask = torch.complex(out_fp32[:, :1], out_fp32[:, 1:])
             else:
-                mask = torch.complex(mask[:, :2], mask[:, 2:])
+                mask = torch.complex(out_fp32[:, :2], out_fp32[:, 2:])
             mask = self.bounded_mask(mask)
         else:
-            mask = torch.sigmoid(self.out(f3))
-
-        mask = F.pad(
-            input=mask,
-            pad=(0, 0, 0, self.output_bin - mask.size()[2]),
-            mode='replicate'
-        )
+            mask = torch.sigmoid(out_fp32)
 
         return mask
 
@@ -150,6 +151,7 @@ class CascadedNet(nn.Module):
         return pred
 
     def audio2spec(self, x, use_pad=False):
+        x = x.float()
         B, C, T = x.shape
         x = x.reshape(B * C, T)
         if use_pad:
@@ -158,12 +160,13 @@ class CascadedNet(nn.Module):
             nl_pad = T_pad // 2 // self.hop_length
             Tl_pad = nl_pad * self.hop_length
             x = F.pad(x, (Tl_pad, T_pad - Tl_pad))
+        window = self.window.float()
         spec = torch.stft(
             x,
             n_fft=self.n_fft,
             hop_length=self.hop_length,
             return_complex=True,
-            window=self.window,
+            window=window,
             pad_mode='constant'
         )
         spec = spec.reshape(B, C, spec.shape[-2], spec.shape[-1])
@@ -172,31 +175,36 @@ class CascadedNet(nn.Module):
     def spec2audio(self, x):
         B, C, N, T = x.shape
         x = x.reshape(-1, N, T)
-        x = torch.istft(x, self.n_fft, self.hop_length, window=self.window)
+        window = self.window.float()
+        x = torch.istft(x, self.n_fft, self.hop_length, window=window)
         x = x.reshape(B, C, -1)
         return x
 
+    @torch.inference_mode()
     def predict_fromaudio(self, x):
+        orig_dtype = x.dtype
+        x = x.float()
         B, C, T = x.shape
         x = x.reshape(B * C, T)
         T1 = T + self.hop_length
-        T_pad = self.seg_length * ((T1 - 1) // self.seg_length + 1) - T1       
+        T_pad = self.seg_length * ((T1 - 1) // self.seg_length + 1) - T1
         nl_pad = T_pad // 2 // self.hop_length
-        Tl_pad = nl_pad * self.hop_length       
+        Tl_pad = nl_pad * self.hop_length
         x = F.pad(x, (Tl_pad, T_pad - Tl_pad))
+        window = self.window.float()
         spec = torch.stft(
             x,
             n_fft=self.n_fft,
             hop_length=self.hop_length,
             return_complex=True,
-            window=self.window,
+            window=window,
             pad_mode='constant'
         )
         spec = spec.reshape(B, C, spec.shape[-2], spec.shape[-1])
         mask = self.forward(spec)
         spec_pred = spec * mask
         spec_pred = spec_pred.reshape(B * C, spec.shape[-2], spec.shape[-1])
-        x_pred = torch.istft(spec_pred, self.n_fft, self.hop_length, window=self.window)
+        x_pred = torch.istft(spec_pred, self.n_fft, self.hop_length, window=window)
         x_pred = x_pred[:, Tl_pad: Tl_pad + T]
         x_pred = x_pred.reshape(B, C, T)
-        return x_pred
+        return x_pred.to(dtype=orig_dtype)

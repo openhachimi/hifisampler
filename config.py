@@ -1,8 +1,36 @@
 import dataclasses
+import logging
+import os
 from pathlib import Path
+from typing import Any
 import torch
 from util.load_config_from_yaml import load_config_from_yaml
-from typing import Any
+
+
+def _resolve_device(device_pref: Any) -> torch.device:
+    pref = str(device_pref or "auto").strip().lower()
+    if pref in ("auto", ""):
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    if pref in ("rocm", "hip", "cuda"):
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        logging.warning(f"Requested device '{pref}' is not available in PyTorch; falling back to CPU.")
+        return torch.device("cpu")
+    if pref == "mps":
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return torch.device("mps")
+        logging.warning("Requested device 'mps' is not available; falling back to CPU.")
+        return torch.device("cpu")
+    try:
+        return torch.device(pref)
+    except Exception:
+        logging.warning(f"Invalid device '{pref}' in config; falling back to CPU.")
+        return torch.device("cpu")
+
 
 @dataclasses.dataclass
 @load_config_from_yaml(script_path=Path(__file__))
@@ -16,9 +44,9 @@ class Config:
     mel_fmin: float = 40     # 必须和vocoder训练时一致
     mel_fmax: float = 16000  # 必须和vocoder训练时一致
     fill: int = 6
-    vocoder_path: str = r"\path\to\your\vocoder\pc_nsf_hifigan\model.ckpt"
-    model_type: str = 'ckpt'  # or 'onnx'
-    hnsep_model_path: str = r"\path\to\your\hnsep\model.pt"
+    vocoder_path: str = "./pc_nsf_hifigan_44.1k_hop512_128bin_2025.02/model.onnx"
+    model_type: str = 'onnx'  # or 'ckpt'
+    hnsep_model_path: str = "./hnsep/vr/model_fp16.onnx"
     wave_norm: bool = False
     trim_silence: bool = True  # 是否在响度标准化前截取无声部分
     silence_threshold: float = -52.0
@@ -26,6 +54,35 @@ class Config:
     peak_limit: float = 1.0
     # max_workers can be an int or 'auto' (resolved to physical cores at runtime)
     max_workers: Any = 2
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device: Any = "auto"
+    fp16: bool = False
+    idle_timeout: int = 0
+
+    def __post_init__(self):
+        self.device = _resolve_device(self.device)
+        is_rocm = bool(getattr(torch.version, "hip", None))
+        if self.device.type == "cuda":
+            if is_rocm:
+                # Avoid slow MIOpen exhaustive kernel search on dynamic note lengths
+                os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
+                torch.backends.cudnn.benchmark = True
+                try:
+                    dev_name = torch.cuda.get_device_name(0)
+                except Exception:
+                    dev_name = "AMD ROCm GPU"
+                logging.info(
+                    f"ROCm backend active: {dev_name} (HIP {torch.version.hip}, MIOPEN_FIND_MODE={os.environ.get('MIOPEN_FIND_MODE')})"
+                )
+            else:
+                torch.backends.cudnn.benchmark = True
+                try:
+                    dev_name = torch.cuda.get_device_name(0)
+                except Exception:
+                    dev_name = "NVIDIA CUDA GPU"
+                logging.info(f"CUDA backend active: {dev_name}")
+        elif self.device.type == "cpu" and self.fp16:
+            logging.warning("fp16=true is not recommended on CPU; disabling fp16.")
+            self.fp16 = False
+
 
 CONFIG = Config()

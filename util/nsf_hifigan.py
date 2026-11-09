@@ -1,5 +1,6 @@
-import pathlib
 import json
+import logging
+import pathlib
 
 import numpy as np
 import torch
@@ -16,7 +17,7 @@ LRELU_SLOPE = 0.1
 
 def load_model(model_path: pathlib.Path):
     config_file = model_path.with_name('config.json')
-    with open(config_file) as f:
+    with open(config_file, 'r', encoding='utf-8') as f:
         data = f.read()
 
     json_config = json.loads(data)
@@ -24,38 +25,51 @@ def load_model(model_path: pathlib.Path):
 
     generator = Generator(h)
 
-    cp_dict = torch.load(model_path, map_location='cpu')
+    try:
+        cp_dict = torch.load(model_path, map_location='cpu', weights_only=False)
+    except TypeError:
+        cp_dict = torch.load(model_path, map_location='cpu')
     generator.load_state_dict(cp_dict['generator'])
     generator.eval()
     generator.remove_weight_norm()
     del cp_dict
     return generator, h
 
+
 class NsfHifiGAN:
     def __init__(self, model_path):
-        print(f'Loading HifiGAN: {model_path}')
+        logging.info(f'Loading HifiGAN: {model_path}')
         self.model, self.h = load_model(model_path)
 
     @property
     def device(self):
         return next(self.model.parameters()).device
 
-    def to_device(self, device):
+    @property
+    def dtype(self):
+        return next(self.model.parameters()).dtype
+
+    def to_device(self, device, fp16: bool = False):
         self.model.to(device)
+        if fp16 and torch.device(device).type != 'cpu':
+            self.model.half()
+        else:
+            self.model.float()
 
     def get_device(self):
         return self.device
 
-    def spec2wav_torch(self, mel, **kwargs): 
+    def spec2wav_torch(self, mel, **kwargs):
         with torch.inference_mode():
-            c = mel  # [B, T, bins]
+            c = mel  # [B, bins, T]
             f0 = kwargs.get('f0')  # [B, T]
             if f0 is not None:
                 y = self.model(c, f0).view(-1)
             else:
                 y = self.model(c).view(-1)
         return y
-    
+
+
 class ResBlock1(torch.nn.Module):
     def __init__(self, h, channels, kernel_size=3, dilation=(1, 3, 5)):
         super(ResBlock1, self).__init__()
@@ -126,14 +140,6 @@ class SineGen(torch.nn.Module):
             sine_amp = 0.1, noise_std = 0.003,
             voiced_threshold = 0,
             flag_for_pulse=False)
-    samp_rate: sampling rate in Hz
-    harmonic_num: number of harmonic overtones (default 0)
-    sine_amp: amplitude of sine-waveform (default 0.1)
-    noise_std: std of Gaussian noise (default 0.003)
-    voiced_threshold: F0 threshold for U/V classification (default 0)
-    flag_for_pulse: this SinGen is used inside PulseGen (default False)
-    Note: when flag_for_pulse is True, the first time step of a voiced
-        segment is always sin(np.pi) or cos(0)
     """
 
     def __init__(self, samp_rate, harmonic_num=0,
@@ -148,22 +154,22 @@ class SineGen(torch.nn.Module):
         self.voiced_threshold = voiced_threshold
 
     def _f02uv(self, f0):
-        # generate uv signal
         uv = torch.ones_like(f0)
         uv = uv * (f0 > self.voiced_threshold)
         return uv
 
     def _f02sine(self, f0, upp):
         """ f0: (batchsize, length, dim)
-            where dim indicates fundamental tone and overtones
+            Always run phase accumulation in float32 to prevent FP16 cumsum overflow/precision loss.
         """
-        rad = f0 / self.sampling_rate * torch.arange(1, upp + 1, device=f0.device)
-        rad2 = torch.fmod(rad[..., -1:].float() + 0.5, 1.0) - 0.5
-        rad_acc = rad2.cumsum(dim=1).fmod(1.0).to(f0)
+        f0 = f0.float()
+        rad = f0 / self.sampling_rate * torch.arange(1, upp + 1, device=f0.device, dtype=torch.float32)
+        rad2 = torch.fmod(rad[..., -1:] + 0.5, 1.0) - 0.5
+        rad_acc = rad2.cumsum(dim=1).fmod(1.0)
         rad += F.pad(rad_acc[:, :-1, :], (0, 0, 1, 0))
         rad = rad.reshape(f0.shape[0], -1, 1)
-        rad = torch.multiply(rad, torch.arange(1, self.dim + 1, device=f0.device).reshape(1, 1, -1))
-        rand_ini = torch.rand(1, 1, self.dim, device=f0.device)
+        rad = torch.multiply(rad, torch.arange(1, self.dim + 1, device=f0.device, dtype=torch.float32).reshape(1, 1, -1))
+        rand_ini = torch.rand(1, 1, self.dim, device=f0.device, dtype=torch.float32)
         rand_ini[..., 0] = 0
         rad += rand_ini
         sines = torch.sin(2 * np.pi * rad)
@@ -171,13 +177,8 @@ class SineGen(torch.nn.Module):
 
     @torch.inference_mode()
     def forward(self, f0, upp):
-        """ sine_tensor, uv = forward(f0)
-        input F0: tensor(batchsize=1, length, dim=1)
-                  f0 for unvoiced steps should be 0
-        output sine_tensor: tensor(batchsize=1, length, dim)
-        output uv: tensor(batchsize=1, length, 1)
-        """
-        f0 = f0.unsqueeze(-1)
+        """ sine_tensor, uv = forward(f0) """
+        f0 = f0.float().unsqueeze(-1)
         sine_waves = self._f02sine(f0, upp) * self.sine_amp
         uv = (f0 > self.voiced_threshold).float()
         uv = F.interpolate(uv.transpose(2, 1), scale_factor=upp, mode='nearest').transpose(2, 1)
@@ -188,22 +189,7 @@ class SineGen(torch.nn.Module):
 
 
 class SourceModuleHnNSF(torch.nn.Module):
-    """ SourceModule for hn-nsf
-    SourceModule(sampling_rate, harmonic_num=0, sine_amp=0.1,
-                 add_noise_std=0.003, voiced_threshod=0)
-    sampling_rate: sampling_rate in Hz
-    harmonic_num: number of harmonic above F0 (default: 0)
-    sine_amp: amplitude of sine source signal (default: 0.1)
-    add_noise_std: std of additive Gaussian noise (default: 0.003)
-        note that amplitude of noise in unvoiced is decided
-        by sine_amp
-    voiced_threshold: threhold to set U/V given F0 (default: 0)
-    Sine_source, noise_source = SourceModuleHnNSF(F0_sampled)
-    F0_sampled (batchsize, length, 1)
-    Sine_source (batchsize, length, 1)
-    noise_source (batchsize, length 1)
-    uv (batchsize, length, 1)
-    """
+    """ SourceModule for hn-nsf """
 
     def __init__(self, sampling_rate, harmonic_num=0, sine_amp=0.1,
                  add_noise_std=0.003, voiced_threshold=0):
@@ -212,16 +198,14 @@ class SourceModuleHnNSF(torch.nn.Module):
         self.sine_amp = sine_amp
         self.noise_std = add_noise_std
 
-        # to produce sine waveforms
         self.l_sin_gen = SineGen(sampling_rate, harmonic_num,
                                  sine_amp, add_noise_std, voiced_threshold)
 
-        # to merge source harmonics into a single excitation
         self.l_linear = torch.nn.Linear(harmonic_num + 1, 1)
         self.l_tanh = torch.nn.Tanh()
 
     def forward(self, x, upp):
-        sine_wavs = self.l_sin_gen(x, upp)
+        sine_wavs = self.l_sin_gen(x, upp).to(dtype=self.l_linear.weight.dtype)
         sine_merge = self.l_tanh(self.l_linear(sine_wavs))
         return sine_merge
 
@@ -233,10 +217,10 @@ class Generator(torch.nn.Module):
         self.num_kernels = len(h.resblock_kernel_sizes)
         self.num_upsamples = len(h.upsample_rates)
         self.mini_nsf = h.mini_nsf
-            
+
         if h.mini_nsf:
-            self.source_sr = h.sampling_rate / int(np.prod(h.upsample_rates[2: ]))
-            self.upp = int(np.prod(h.upsample_rates[: 2]))
+            self.source_sr = h.sampling_rate / int(np.prod(h.upsample_rates[2:]))
+            self.upp = int(np.prod(h.upsample_rates[:2]))
         else:
             self.source_sr = h.sampling_rate
             self.upp = int(np.prod(h.upsample_rates))
@@ -245,9 +229,9 @@ class Generator(torch.nn.Module):
                 harmonic_num=8
             )
             self.noise_convs = nn.ModuleList()
-        
-        self.conv_pre = weight_norm(Conv1d(h.num_mels, h.upsample_initial_channel, 7, 1, padding=3))   
-        
+
+        self.conv_pre = weight_norm(Conv1d(h.num_mels, h.upsample_initial_channel, 7, 1, padding=3))
+
         self.ups = nn.ModuleList()
         self.resblocks = nn.ModuleList()
         resblock = ResBlock1 if h.resblock == '1' else ResBlock2
@@ -258,7 +242,7 @@ class Generator(torch.nn.Module):
             for j, (k, d) in enumerate(zip(h.resblock_kernel_sizes, h.resblock_dilation_sizes)):
                 self.resblocks.append(resblock(h, ch, k, d))
             if not h.mini_nsf:
-                if i + 1 < len(h.upsample_rates):  #
+                if i + 1 < len(h.upsample_rates):
                     stride_f0 = int(np.prod(h.upsample_rates[i + 1:]))
                     self.noise_convs.append(Conv1d(
                         1, ch, kernel_size=stride_f0 * 2, stride=stride_f0, padding=stride_f0 // 2))
@@ -269,27 +253,31 @@ class Generator(torch.nn.Module):
                 self.source_conv.apply(init_weights)
 
         self.conv_post = weight_norm(Conv1d(ch, 1, 7, 1, padding=3))
-        
+
         self.ups.apply(init_weights)
         self.conv_post.apply(init_weights)
-        
+
     def fastsinegen(self, f0):
-        n = torch.arange(1, self.upp + 1, device=f0.device)
+        # Always compute phase accumulation in float32 to prevent FP16 cumsum overflow
+        f0 = f0.float()
+        n = torch.arange(1, self.upp + 1, device=f0.device, dtype=torch.float32)
         s0 = f0.unsqueeze(-1) / self.source_sr
         ds0 = F.pad(s0[:, 1:, :] - s0[:, :-1, :], (0, 0, 0, 1))
         rad = s0 * n + 0.5 * ds0 * n * (n - 1) / self.upp
-        rad2 = torch.fmod(rad[..., -1:].float() + 0.5, 1.0) - 0.5
-        rad_acc = rad2.cumsum(dim=1).fmod(1.0).to(f0)
+        rad2 = torch.fmod(rad[..., -1:] + 0.5, 1.0) - 0.5
+        rad_acc = rad2.cumsum(dim=1).fmod(1.0)
         rad += F.pad(rad_acc[:, :-1, :], (0, 0, 1, 0))
         rad = rad.reshape(f0.shape[0], 1, -1)
         sines = torch.sin(2 * np.pi * rad)
         return sines
-        
+
     def forward(self, x, f0):
+        target_dtype = self.conv_pre.weight.dtype
         if self.mini_nsf:
-            har_source = self.fastsinegen(f0)
+            har_source = self.fastsinegen(f0).to(dtype=target_dtype)
         else:
-            har_source = self.m_source(f0, self.upp).transpose(1, 2)
+            har_source = self.m_source(f0, self.upp).transpose(1, 2).to(dtype=target_dtype)
+        x = x.to(dtype=target_dtype)
         x = self.conv_pre(x)
         for i in range(self.num_upsamples):
             x = F.leaky_relu(x, LRELU_SLOPE)
@@ -310,10 +298,10 @@ class Generator(torch.nn.Module):
         x = F.leaky_relu(x)
         x = self.conv_post(x)
         x = torch.tanh(x)
-        return x
+        return x.float()
 
     def remove_weight_norm(self):
-        print('Removing weight norm...')
+        logging.debug('Removing weight norm...')
         for l in self.ups:
             remove_parametrizations(l, "weight")
         for l in self.resblocks:

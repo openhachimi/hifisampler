@@ -9,7 +9,7 @@ model:
   vocoder_path: "./pc_nsf_hifigan_44.1k_hop512_128bin_2025.02/model.onnx"
   model_type: "onnx"
   hnsep_model_path: "./hnsep/vr/model_fp16.onnx"
-  # GPU users can also try torch model.
+  # GPU users (NVIDIA CUDA / AMD ROCm) can also use PyTorch models:
   # vocoder_path: "./pc_nsf_hifigan_44.1k_hop512_128bin_2025.02/model.ckpt"
   # model_type: "ckpt"
   # hnsep_model_path: "./hnsep/vr/model.pt"
@@ -30,4 +30,7 @@ processing:
   peak_limit: 1.0
   fill: 6
 performance:
-  max_workers: 2  # Number of worker threads. Recommend 2-4.
+  max_workers: 2      # Number of worker threads. Recommend 2-4.
+  device: "auto"      # "auto", "cuda", "rocm", "mps", or "cpu"
+  fp16: false         # Enable FP16 half-precision inference for PyTorch GPU models
+  idle_timeout: 0     # Auto-shutdown server after N seconds of inactivity (0 = disabled)

@@ -1,13 +1,15 @@
-numpy
-scipy
-pyyaml
-pathlib
-torch
-librosa
-soundfile
-resampy
-onnxruntime
-pyloudnorm
-tomli
+aiohttp
 filelock
+librosa
+numpy
+onnxruntime-directml; sys_platform == 'win32'
+onnxruntime; sys_platform != 'win32'
+praat-parselmouth
+pyloudnorm
+pyyaml
+resampy
 ruamel.yaml
+scipy
+soundfile
+tomli; python_version < '3.11'
+torch
