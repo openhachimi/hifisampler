@@ -61,13 +61,13 @@ class Resampler:
                 f'{self.in_file.stem}{cache_ext}')
 
         force_generate = 'G' in self.flags.keys()
-        features = cache_manager.load_features_cache(features_path, force_generate)
-
-        if features is not None:
-            return features
-        logging.info(f'{features_path.name} not found or forcing generation. Generating features.')
-        features = self.generate_features(features_path)
-        return cache_manager.save_features_cache(features_path, features, force_generate=force_generate)
+        with cache_manager.get_lock(features_path):
+            features = cache_manager.load_features_cache(features_path, force_generate)
+            if features is not None:
+                return features
+            logging.info(f'{features_path.name} not found or forcing generation. Generating features.')
+            features = self.generate_features(features_path)
+            return cache_manager.save_features_cache(features_path, features, force_generate=force_generate)
 
     def _needs_hnsep_separation(self, breath, voicing, tension):
         if tension != 0:
@@ -101,15 +101,16 @@ class Resampler:
 
             force_generate = 'G' in self.flags.keys()
 
-            seg_output = cache_manager.load_hnsep_cache(hnsep_cache_path, str(CONFIG.device), force_generate)
+            with cache_manager.get_lock(hnsep_cache_path):
+                seg_output = cache_manager.load_hnsep_cache(hnsep_cache_path, str(CONFIG.device), force_generate)
 
-            if seg_output is None:
-                logging.info(f'Generating hnsep features for {hnsep_cache_path.name}')
-                with models.gpu_infer_lock, torch.inference_mode():
-                    seg_output = models.hnsep_model.predict_fromaudio(wave)
-                seg_output = cache_manager.save_hnsep_cache(
-                    hnsep_cache_path, seg_output, device=str(CONFIG.device), force_generate=force_generate
-                )
+                if seg_output is None:
+                    logging.info(f'Generating hnsep features for {hnsep_cache_path.name}')
+                    with models.gpu_infer_lock, torch.inference_mode():
+                        seg_output = models.hnsep_model.predict_fromaudio(wave)
+                    seg_output = cache_manager.save_hnsep_cache(
+                        hnsep_cache_path, seg_output, device=str(CONFIG.device), force_generate=force_generate
+                    )
 
             breath = np.clip(breath, 0, 500)
             voicing = np.clip(voicing, 0, 150)

@@ -1,6 +1,7 @@
 import logging
 import os
 import threading
+import uuid
 from pathlib import Path
 from typing import Dict, Any
 import numpy as np
@@ -9,17 +10,17 @@ import torch
 
 class CacheManager:
     def __init__(self):
-        self._locks: Dict[str, threading.Lock] = {}
+        self._locks: Dict[str, threading.RLock] = {}
         self._locks_lock = threading.Lock()
 
-    def get_lock(self, cache_path: Path) -> threading.Lock:
+    def get_lock(self, cache_path: Path) -> threading.RLock:
         try:
             cache_key = str(cache_path.resolve())
         except OSError:
             cache_key = str(cache_path)
         with self._locks_lock:
             if cache_key not in self._locks:
-                self._locks[cache_key] = threading.Lock()
+                self._locks[cache_key] = threading.RLock()
             return self._locks[cache_key]
 
     def load_features_cache(self, cache_path: Path, force_generate: bool = False) -> Any:
@@ -44,14 +45,11 @@ class CacheManager:
         with self.get_lock(cache_path):
             if cache_path.exists():
                 try:
-                    try:
-                        data = torch.load(str(cache_path), map_location=device, weights_only=True)
-                    except Exception:
-                        data = torch.load(str(cache_path), map_location=device, weights_only=False)
+                    data = torch.load(str(cache_path), map_location=device, weights_only=True)
                     logging.debug(f'Hnsep cache loaded successfully: {cache_path.name}')
                     return data
                 except Exception as e:
-                    logging.warning(f'Failed to load hnsep cache {cache_path.name}: {type(e).__name__}: {e}')
+                    logging.warning(f'Failed to load hnsep cache {cache_path.name} (regenerating): {type(e).__name__}: {e}')
         return None
 
     def save_features_cache(self, cache_path: Path, features: Dict[str, Any], force_generate: bool = False):
@@ -65,7 +63,7 @@ class CacheManager:
                 except Exception:
                     pass
 
-            temp_base = cache_path.with_name(f"{cache_path.name}.{threading.get_ident()}.tmp")
+            temp_base = cache_path.with_name(f".{cache_path.name}.{uuid.uuid4().hex}.tmp")
             temp_npz_path = Path(str(temp_base) + ".npz")
             try:
                 np.savez_compressed(str(temp_base), **features)
@@ -93,16 +91,13 @@ class CacheManager:
         with self.get_lock(cache_path):
             if not force_generate and cache_path.exists():
                 try:
-                    try:
-                        existing_data = torch.load(str(cache_path), map_location=device, weights_only=True)
-                    except Exception:
-                        existing_data = torch.load(str(cache_path), map_location=device, weights_only=False)
+                    existing_data = torch.load(str(cache_path), map_location=device, weights_only=True)
                     logging.debug(f'Hnsep cache already exists, using existing: {cache_path.name}')
                     return existing_data
                 except Exception:
                     pass
 
-            temp_path = cache_path.with_name(f"{cache_path.name}.{threading.get_ident()}.tmp")
+            temp_path = cache_path.with_name(f".{cache_path.name}.{uuid.uuid4().hex}.tmp")
             try:
                 torch.save(data, str(temp_path))
                 os.replace(str(temp_path), str(cache_path))
