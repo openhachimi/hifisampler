@@ -76,6 +76,11 @@ def split_arguments(input_string: str) -> list[str]:
 
     args[0] = translate_wine_path(args[0])
     args[1] = translate_wine_path(args[1])
+
+    out_lower = args[1].strip().lower()
+    if out_lower not in ("nul", "/dev/null") and not out_lower.endswith(".wav"):
+        raise ValueError(f"Output file must end with .wav or be a null device, got: {args[1]}")
+
     return args
 
 
@@ -91,6 +96,10 @@ async def handle_get(request: web.Request):
 async def handle_post(request: web.Request):
     global server_ready, last_activity_time, active_jobs
     last_activity_time = time.monotonic()
+
+    if "Origin" in request.headers or "Sec-Fetch-Site" in request.headers:
+        logging.warning("Rejected browser cross-origin POST request.")
+        return web.Response(text="Forbidden: Browser requests are not allowed.", status=403)
 
     if not server_ready:
         logging.warning("POST arrived but server not ready.")
