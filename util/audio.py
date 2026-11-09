@@ -46,9 +46,14 @@ def loudness_norm(
     Returns:
         loudness normalized audio
     """
+    if len(audio) == 0 or np.max(np.abs(audio)) < 1e-8:
+        return audio
 
     original_length = len(audio)
     original_audio = audio.copy()  # 保存原始音频用于后续处理
+    voiced_frames = []
+    first_voiced = 0
+    hop_length = int(rate * 0.01)
 
     if CONFIG.trim_silence:
         def get_rms_db(audio_segment):
@@ -85,20 +90,26 @@ def loudness_norm(
                              padding_frames) * hop_length + frame_length)
 
             trimmed_audio = audio[start_sample:end_sample]
-            logging.info(
+            logging.debug(
                 f'Trimmed silence: {len(audio)} -> {len(trimmed_audio)} samples')
 
             # 使用截取后的音频进行响度标准化
             audio = trimmed_audio
 
+    if len(audio) == 0 or np.max(np.abs(audio)) < 1e-8:
+        return original_audio
+
     # 如果音频长度小于最小块大小，进行填充
-    if len(audio) < int(rate * block_size):
-        padding_length = int(rate * block_size) - len(audio)
+    min_samples = int(rate * block_size)
+    if len(audio) < min_samples:
+        padding_length = min_samples - len(audio)
         audio = np.pad(audio, (0, padding_length), mode='reflect')
 
     # Measure the loudness first
     meter = pyln.Meter(rate, block_size=block_size)  # create BS.1770 meter
     _loudness = meter.integrated_loudness(audio)
+    if not np.isfinite(_loudness):
+        return original_audio
 
     # Apply strength to calculate the target loudness
     final_loudness = _loudness + (loudness - _loudness) * strength / 100
@@ -109,7 +120,7 @@ def loudness_norm(
     # 如果启用了无声截取功能，需要恢复原始长度
     if CONFIG.trim_silence:
         # 创建一个全零数组作为输出
-        output = np.zeros(original_length)
+        output = np.zeros(original_length, dtype=original_audio.dtype)
 
         # 将标准化后的音频放回原位置，并添加平滑过渡
         if voiced_frames:  # 确保有声音帧存在
@@ -149,21 +160,24 @@ def loudness_norm(
                     # 填充剩余部分
                     output[crossfade_start:original_length] = remain_audio * fade_in
         else:  # 如果没有声音帧，直接返回原始音频
-            output = audio[:original_length]
+            output = original_audio[:original_length]
 
         audio = output
 
     # 如果原始音频短于block_size，裁剪回原始长度
-    if original_length < int(rate * block_size):
+    if original_length < min_samples:
         audio = audio[:original_length]
 
     return audio
+
 
 def pre_emphasis_base_tension(wave, b):
     """
     Args:
         wave: [1, 1, t]
     """
+    orig_dtype = wave.dtype
+    wave = wave.float()
     original_length = wave.size(-1)
     pad_length = (CONFIG.hop_size - (original_length %
                   CONFIG.hop_size)) % CONFIG.hop_size
@@ -171,12 +185,13 @@ def pre_emphasis_base_tension(wave, b):
         wave, (0, pad_length), mode='constant', value=0)
     wave = wave.squeeze(1)
 
+    window = torch.hann_window(CONFIG.win_size, device=wave.device, dtype=torch.float32)
     spec = torch.stft(
         wave,
         CONFIG.n_fft,
         hop_length=CONFIG.hop_size,
         win_length=CONFIG.win_size,
-        window=torch.hann_window(CONFIG.win_size).to(wave.device),
+        window=window,
         return_complex=True
     )
     spec_amp = torch.abs(spec)
@@ -186,7 +201,7 @@ def pre_emphasis_base_tension(wave, b):
 
     fft_bin = CONFIG.n_fft // 2 + 1
     x0 = fft_bin / ((CONFIG.sample_rate / 2) / 1500)
-    freq_filter = (-b / x0) * torch.arange(0, fft_bin, device=wave.device) + b
+    freq_filter = (-b / x0) * torch.arange(0, fft_bin, device=wave.device, dtype=torch.float32) + b
     spec_amp_db = spec_amp_db + \
         torch.clamp(freq_filter, min=-2, max=2).unsqueeze(0).unsqueeze(2)
 
@@ -198,17 +213,20 @@ def pre_emphasis_base_tension(wave, b):
         n_fft=CONFIG.n_fft,
         hop_length=CONFIG.hop_size,
         win_length=CONFIG.win_size,
-        window=torch.hann_window(CONFIG.win_size).to(wave.device)
+        window=window
     )
 
     original_max = torch.max(torch.abs(wave))
     filtered_max = torch.max(torch.abs(filtered_wave))
-    filtered_wave = filtered_wave * \
-        (original_max / filtered_max) * (np.clip(b/(-15), 0, 0.33) + 1)
+    if filtered_max > 1e-8:
+        filtered_wave = filtered_wave * \
+            (original_max / filtered_max) * (np.clip(b/(-15), 0, 0.33) + 1)
+    else:
+        filtered_wave = torch.zeros_like(filtered_wave)
     filtered_wave = filtered_wave.unsqueeze(1)
     filtered_wave = filtered_wave[:, :, :original_length]
 
-    return filtered_wave
+    return filtered_wave.to(dtype=orig_dtype)
 
 
 def read_wav(loc):
@@ -224,19 +242,32 @@ def read_wav(loc):
     ndarray
         Data read from WAV file remapped to [-1, 1] and in 44.1kHz
     """
-    if type(loc) is str:  # make sure input is Path
+    if isinstance(loc, str):  # make sure input is Path
         loc = Path(loc)
 
     exists = loc.exists()
-    if not exists:  # check for alternative files
+    if not exists:  # check for alternative files (case-insensitive for Linux)
+        supported_exts = {'.' + ext.lower() for ext in sf.available_formats().keys()}
         for ext in sf.available_formats().keys():
-            loc = loc.with_suffix('.' + ext.lower())
-            exists = loc.exists()
+            for candidate_ext in ('.' + ext.lower(), '.' + ext.upper()):
+                candidate = loc.with_suffix(candidate_ext)
+                if candidate.exists():
+                    loc = candidate
+                    exists = True
+                    break
             if exists:
                 break
 
+        if not exists and loc.parent.exists():
+            target_stem = loc.stem.lower()
+            for item in loc.parent.iterdir():
+                if item.stem.lower() == target_stem and item.suffix.lower() in supported_exts:
+                    loc = item
+                    exists = True
+                    break
+
     if not exists:
-        raise FileNotFoundError("No supported audio file was found.")
+        raise FileNotFoundError(f"No supported audio file was found for: {loc}")
 
     x, fs = sf.read(str(loc))
     if len(x.shape) == 2:
@@ -265,6 +296,9 @@ def save_wav(loc, x):
     None
     """
     try:
-        sf.write(str(loc), x, CONFIG.sample_rate, 'PCM_16')
+        out_path = Path(loc)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        sf.write(str(out_path), x, CONFIG.sample_rate, 'PCM_16')
     except Exception as e:
-        logging.error(f"Error saving WAV file: {e}")
+        logging.error(f"Error saving WAV file {loc}: {e}")
+        raise
