@@ -46,10 +46,14 @@ class Resampler:
     def get_features(self):
         features_path = self.in_file.with_suffix(cache_ext)
 
-        self.flags['Hb'] = self.flags.get('Hb', 100)
-        self.flags['Hv'] = self.flags.get('Hv', 100)
-        self.flags['Ht'] = self.flags.get('Ht', 0)
-        self.flags['g'] = self.flags.get('g', 0)
+        hb_val = self.flags.get('Hb', 100)
+        hv_val = self.flags.get('Hv', 100)
+        ht_val = self.flags.get('Ht', 0)
+        g_val = self.flags.get('g', 0)
+        self.flags['Hb'] = int(np.clip(100 if hb_val is None else hb_val, 0, 500))
+        self.flags['Hv'] = int(np.clip(100 if hv_val is None else hv_val, 0, 150))
+        self.flags['Ht'] = int(np.clip(0 if ht_val is None else ht_val, -100, 100))
+        self.flags['g'] = int(np.clip(0 if g_val is None else g_val, -100, 100))
 
         flag_suffix = '_'.join(f"{k}{v if v is not None else ''}" for k, v in sorted(
             self.flags.items()) if k in ['Hb', 'Hv', 'Ht', 'g'])
@@ -140,13 +144,15 @@ class Resampler:
             scale = 1.0
 
         gender = self.flags.get("g", 0)
-        gender = np.clip(gender, -600, 600)
+        if gender is None:
+            gender = 0
+        gender = np.clip(gender, -100, 100)
         logging.debug(f'gender: {gender}')
 
         with models.gpu_infer_lock, torch.inference_mode():
             mel_origin = models.mel_analyzer(
                 wave,
-                gender/100, 1).squeeze()
+                -gender * 0.06, 1).squeeze()
             logging.debug(f'mel_origin: {mel_origin.shape}')
             mel_origin = dynamic_range_compression_torch(mel_origin).cpu().numpy()
         logging.debug('Features generation completed.')
@@ -300,7 +306,8 @@ class Resampler:
         # Calculate pitch in MIDI note number terms
         pitch = self.pitchbend / 100 + self.pitch
         if "t" in self.flags.keys() and self.flags["t"]:
-            pitch = pitch + self.flags["t"] / 100
+            t_val = np.clip(self.flags["t"], -120, 120)
+            pitch = pitch + t_val / 10
         t_pitch = 60 * np.arange(len(pitch)) / (self.tempo * 96) + new_start
         pitch_interp = interp.Akima1DInterpolator(t_pitch, pitch)
         pitch_render = pitch_interp(np.clip(t, new_start, t_pitch[-1]))

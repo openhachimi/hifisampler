@@ -2,11 +2,11 @@
 # Copy this file alongside hifisampler.exe or hifisampler.sh in OpenUtau's Resamplers folder
 # (matching the executable filename, e.g. hifisampler.yaml or hifisampler.sh.yaml).
 expressions:
-  - name: gender (hifi)
-    abbr: g
+  - name: gender
+    abbr: gen
     type: Numerical
-    min: -600
-    max: 600
+    min: -100
+    max: 100
     default_value: 0
     is_flag: true
     flag: g
@@ -43,18 +43,18 @@ expressions:
     is_flag: true
     flag: HG
   - name: loudness norm (hifi)
-    abbr: P
+    abbr: norm
     type: Numerical
     min: 0
     max: 100
     default_value: 100
     is_flag: true
     flag: P
-  - name: pitch shift cents (hifi)
+  - name: pitch shift (10 cents) (hifi)
     abbr: t
     type: Numerical
-    min: -1200
-    max: 1200
+    min: -120
+    max: 120
     default_value: 0
     is_flag: true
     flag: t

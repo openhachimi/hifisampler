@@ -39,8 +39,8 @@ pc-nsf-hifigan 采用神经网络对输入特征进行上采样，音质比传�
 1. 安装 [uv](https://docs.astral.sh/uv/getting-started/installation/)。
 2. 下载 [Release](https://github.com/openhachimi/hifisampler/releases) 中的源码与模型文件，解压并放入同一项目文件夹内。
 3. **启动服务**：
-   - **Windows**：双击运行 `start.bat`（或在终端执行 `uv run hifiserver.py`）。
-   - **Linux / macOS**：在项目目录终端执行 `./start.sh`（或 `uv run hifiserver.py`）。首次运行会自动生成 `config.yaml` 并完成环境配置。
+   - **Windows**：双击运行 `start.bat`（首次运行会自动按您的显卡类型创建 `.venv` 并安装依赖）。
+   - **Linux / macOS**：在项目目录终端执行 `./start.sh`。首次运行会自动检测显卡（NVIDIA CUDA / AMD ROCm / CPU）并完成环境与 `config.yaml` 配置。
 4. **接入 OpenUtau**：
    - **Windows**：将 `hifisampler.exe` 和 `hifisampler.yaml` 复制到 `OpenUtau\Resamplers\` 目录。
    - **Linux / macOS**：可以直接使用 OpenUtau 内置的 `hifisampler`；或者将项目目录下的 `hifisampler.sh`（或 `hifisampler-linux-x64`）与 `hifisampler.yaml` 复制到 `~/.local/share/OpenUtau/Resamplers/`（复制 `hifisampler.yaml` 时若配合脚本使用，可重命名为 `hifisampler.sh.yaml` 以自动加载表情参数）：
@@ -56,7 +56,7 @@ pc-nsf-hifigan 采用神经网络对输入特征进行上采样，音质比传�
 
 1. 安装 Miniconda，在项目文件夹下打开终端并创建虚拟环境：
    ```bash
-   conda create -n hifisampler python=3.10 -y
+   conda create -n hifisampler python=3.11 -y
    conda activate hifisampler
    ```
 2. 安装依赖：
@@ -80,8 +80,8 @@ pc-nsf-hifigan 采用神经网络对输入特征进行上采样，音质比传�
 | :--- | :--- | :--- |
 | **Windows + AMD / Intel 显卡** | **ONNX 模式（默认）** | Windows 下 PyTorch 官方几乎不支持 ROCm，**请直接保持默认的 `model_type: "onnx"`**。程序已内置 DirectML 加速，会自动调用 AMD / Intel 显卡（含核显），无需任何额外配置。 |
 | **Windows / Linux + NVIDIA 显卡** | **ONNX（默认）或 PyTorch (`ckpt`)** | 默认 ONNX 即可加速；若想使用 PyTorch 模型，取消 `config.yaml` 中 `.ckpt` / `.pt` 的注释，并可将 `fp16` 设为 `true` 进一步提速。 |
-| **Linux + AMD 显卡 (ROCm)** | **PyTorch (`ckpt`) 或 ONNX** | Linux 下支持原生 ROCm 加速。若使用 `.ckpt` / `.pt` 模型，可在项目环境中执行：<br>`uv pip install --index-url https://download.pytorch.org/whl/rocm6.3 torch`<br>并在 `config.yaml` 中切换为 `ckpt` 模式，推荐同时开启 `fp16: true`。 |
-| **纯 CPU（无独立显卡）** | **ONNX 模式（默认）** | 保持默认配置即可。若使用 `uv` 手动安装且不需要下载体积较大的 CUDA 组件，可将 `pyproject.toml` 中的 `pytorch-cu129` 改为 `pytorch-cpu`。 |
+| **Linux + AMD 显卡 (ROCm)** | **PyTorch (`ckpt`) 或 ONNX** | Linux 下 `./start.sh` 会自动检测并安装 ROCm 版 PyTorch。您可在 `config.yaml` 中切换为 `ckpt` 模式，推荐同时开启 `fp16: true`。 |
+| **纯 CPU（无独立显卡）** | **ONNX 模式（默认）** | 保持默认配置即可。`start.bat` / `start.sh` 在未检测到独立显卡时会自动安装轻量 CPU 版环境。 |
 
 ### 常用 `config.yaml` 选项说明
 
@@ -95,20 +95,20 @@ pc-nsf-hifigan 采用神经网络对输入特征进行上采样，音质比传�
 
 将 `hifisampler.yaml` 一并放入 OpenUtau 的 `Resamplers` 文件夹后，OpenUtau 会自动识别并显示以下全部表情参数：
 
-- **g:** 调整性别 / 共振峰。
-  - 范围: `-600` 到 `600` | 默认: `0`
-- **Hb:** 控制气息 / 噪波成分的音量。
+- **g (`gen`):** 调整性别 / 共振峰（与其他主流采样器一致：正值偏成熟/男声，负值偏幼态/女声）。
+  - 范围: `-100` 到 `100` | 默认: `0`
+- **Hb:** 控制气息 / 噪波成分的音量百分比。
   - 范围: `0` 到 `500` | 默认: `100`
-- **Hv:** 控制发声 / 谐波成分的音量。
+- **Hv:** 控制发声 / 谐波成分的音量百分比。
   - 范围: `0` 到 `150` | 默认: `100`
 - **Ht:** 调整声线张力（Tension）。
   - 范围: `-100` 到 `100` | 默认: `0`
 - **HG:** 怒音 / 嘶吼效果（Growl）。
   - 范围: `0` 到 `100` | 默认: `0`
-- **P:** 音符响度标准化强度（以 -16 LUFS 为基准，需在 `config.yaml` 中保持 `wave_norm: true`）。
+- **P (`norm`):** 音符响度标准化强度（以 -16 LUFS 为基准，需在 `config.yaml` 中保持 `wave_norm: true`）。
   - 范围: `0` 到 `100` | 默认: `100`
-- **t:** 音高微调，单位为音分（1 音分 = 1/100 半音）。
-  - 范围: `-1200` 到 `1200` | 默认: `0`
+- **t:** 音高微调，单位为 10 音分（`t+10` = 升高 1 个半音，与传统 UTAU 采样器一致）。
+  - 范围: `-120` 到 `120` | 默认: `0`
 - **A:** 随音高变化自动调制音量振幅，使颤音更自然。
   - 范围: `-100` 到 `100` | 默认: `0`
 - **G:** 强制重新生成当前音符的特征缓存（忽略并覆盖已有缓存）。

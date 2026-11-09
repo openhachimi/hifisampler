@@ -39,8 +39,8 @@ Choose any of the installation methods below based on your operating system and 
 1. Install [`uv`](https://docs.astral.sh/uv/getting-started/installation/).
 2. Download the source code and model files from [Releases](https://github.com/openhachimi/hifisampler/releases) and extract them into the project folder.
 3. **Start the server**:
-   - **Windows**: Double-click `start.bat` (or run `uv run hifiserver.py` in a terminal).
-   - **Linux / macOS**: Run `./start.sh` (or `uv run hifiserver.py`) in the project directory. `config.yaml` will be generated automatically on first launch.
+   - **Windows**: Double-click `start.bat` (on first launch, it automatically detects your GPU and sets up `.venv`).
+   - **Linux / macOS**: Run `./start.sh` in the project directory. On first launch, it automatically detects your hardware (NVIDIA CUDA / AMD ROCm / CPU), installs dependencies, and generates `config.yaml`.
 4. **Connect to OpenUtau**:
    - **Windows**: Copy `hifisampler.exe` and `hifisampler.yaml` into `OpenUtau\Resamplers\`.
    - **Linux / macOS**: Either select OpenUtau's built-in `hifisampler` while the server is running, or copy `hifisampler.sh` (or `hifisampler-linux-x64`) and `hifisampler.yaml` into `~/.local/share/OpenUtau/Resamplers/`:
@@ -54,9 +54,9 @@ Choose any of the installation methods below based on your operating system and 
 
 ### Method 3: Manual Installation with Conda / pip
 
-1. Create and activate a Python 3.10 environment:
+1. Create and activate a Python 3.11 environment:
    ```bash
-   conda create -n hifisampler python=3.10 -y
+   conda create -n hifisampler python=3.11 -y
    conda activate hifisampler
    ```
 2. Install dependencies:
@@ -80,8 +80,8 @@ By default, hifisampler uses **ONNX mode**, which works out of the box across al
 | :--- | :--- | :--- |
 | **Windows + AMD / Intel GPU** | **ONNX mode (Default)** | Official PyTorch ROCm is largely unavailable on Windows. **Simply keep the default `model_type: "onnx"`** — DirectML acceleration is built in and automatically uses your AMD or Intel GPU (including integrated GPUs) with zero extra setup. |
 | **Windows / Linux + NVIDIA GPU** | **ONNX (Default) or PyTorch (`ckpt`)** | Default ONNX works out of the box. To use PyTorch models instead, uncomment the `.ckpt` / `.pt` paths in `config.yaml` (you can also set `fp16: true` for faster rendering). |
-| **Linux + AMD GPU (ROCm)** | **PyTorch (`ckpt`) or ONNX** | Linux supports native AMD ROCm acceleration. To run `.ckpt` / `.pt` models on ROCm, install ROCm PyTorch:<br>`uv pip install --index-url https://download.pytorch.org/whl/rocm6.3 torch`<br>then switch `config.yaml` to `ckpt` mode (setting `fp16: true` is also recommended). |
-| **CPU Only** | **ONNX mode (Default)** | Keep the default settings. If installing via `uv` on a CPU-only machine and you want to avoid downloading CUDA packages, change `pytorch-cu129` to `pytorch-cpu` in `pyproject.toml`. |
+| **Linux + AMD GPU (ROCm)** | **PyTorch (`ckpt`) or ONNX** | `./start.sh` automatically detects AMD GPUs and installs ROCm PyTorch on Linux. You can switch `config.yaml` to `ckpt` mode (setting `fp16: true` is also recommended). |
+| **CPU Only** | **ONNX mode (Default)** | Keep the default settings. `start.bat` and `start.sh` automatically install the lightweight CPU environment when no dedicated GPU is detected. |
 
 ### Useful `config.yaml` Settings
 
@@ -95,20 +95,20 @@ By default, hifisampler uses **ONNX mode**, which works out of the box across al
 
 Placing `hifisampler.yaml` in OpenUtau's `Resamplers` folder alongside the client allows OpenUtau to automatically display all supported expression flags:
 
-- **g:** Adjust gender / formants.
-  - Range: `-600` to `600` | Default: `0`
-- **Hb:** Adjust breathiness / noise component.
+- **g (`gen`):** Adjust gender / formants (aligned with standard UTAU resamplers: positive values = deeper/masculine, negative values = brighter/feminine).
+  - Range: `-100` to `100` | Default: `0`
+- **Hb:** Adjust breathiness / noise component percentage.
   - Range: `0` to `500` | Default: `100`
-- **Hv:** Adjust voicing / harmonic component.
+- **Hv:** Adjust voicing / harmonic component percentage.
   - Range: `0` to `150` | Default: `100`
 - **Ht:** Adjust vocal tension.
   - Range: `-100` to `100` | Default: `0`
 - **HG:** Vocal fry / growl effect.
   - Range: `0` to `100` | Default: `0`
-- **P:** Note-level loudness normalization strength targeting -16 LUFS (requires `wave_norm: true` in `config.yaml`).
+- **P (`norm`):** Note-level loudness normalization strength targeting -16 LUFS (requires `wave_norm: true` in `config.yaml`).
   - Range: `0` to `100` | Default: `100`
-- **t:** Pitch shift in cents (1 cent = 1/100 semitone).
-  - Range: `-1200` to `1200` | Default: `0`
+- **t:** Pitch shift in units of 10 cents (`t+10` = +1 semitone, matching standard UTAU resamplers).
+  - Range: `-120` to `120` | Default: `0`
 - **A:** Modulate amplitude based on pitch changes for more natural vibrato.
   - Range: `-100` to `100` | Default: `0`
 - **G:** Force regenerate feature cache for the note (overwrites existing cache).
