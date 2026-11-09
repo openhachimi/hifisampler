@@ -15,6 +15,9 @@ def _resolve_device(device_pref: Any) -> torch.device:
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             return torch.device("mps")
         return torch.device("cpu")
+    if pref in ("dml", "directml"):
+        # DirectML is handled by ONNX Runtime (DmlExecutionProvider); PyTorch tensors stay on CPU
+        return torch.device("cpu")
     if pref in ("rocm", "hip", "cuda"):
         if torch.cuda.is_available():
             return torch.device("cuda")
@@ -57,9 +60,11 @@ class Config:
     device: Any = "auto"
     fp16: bool = False
     idle_timeout: int = 0
+    device_preference: str = dataclasses.field(default="auto", init=False)
 
     def __post_init__(self):
-        self.device = _resolve_device(self.device)
+        self.device_preference = str(self.device or "auto").strip().lower()
+        self.device = _resolve_device(self.device_preference)
         is_rocm = bool(getattr(torch.version, "hip", None))
         if self.device.type == "cuda":
             if is_rocm:

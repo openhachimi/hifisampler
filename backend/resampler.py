@@ -346,7 +346,7 @@ class Resampler:
             mel = np.expand_dims(mel, axis=0).transpose(0, 2, 1)
             f0 = np.expand_dims(f0, axis=0)
             input_data = {'mel': mel, 'f0': f0, }
-            if CONFIG.device.type != 'cpu':
+            if CONFIG.device.type != 'cpu' or getattr(models, 'ort_uses_gpu', False):
                 with models.gpu_infer_lock:
                     output = models.ort_session.run(['waveform'], input_data)[0]
             else:

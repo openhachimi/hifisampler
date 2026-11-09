@@ -19,7 +19,10 @@ def get_onnx_providers():
     import onnxruntime
     available_providers = onnxruntime.get_available_providers()
 
-    if str(CONFIG.device) == "cpu":
+    # Only force CPUExecutionProvider when the user explicitly set device: "cpu" in config.yaml.
+    # When device is "auto" on Windows AMD/Intel GPUs, CONFIG.device is cpu for PyTorch,
+    # but ONNX Runtime should still use DmlExecutionProvider!
+    if getattr(CONFIG, "device_preference", "auto") == "cpu":
         return ["CPUExecutionProvider"]
 
     preferred_providers = []
