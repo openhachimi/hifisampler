@@ -2,93 +2,121 @@
 
 [中文文档](README_zh_cn.md) | [English Document](README.md)
 
-A neural UTAU / OpenUtau resampler based on [pc-nsf-hifigan](https://github.com/openvpi/vocoders) for virtual singers, supporting Windows, Linux, and macOS with NVIDIA CUDA, AMD ROCm, and ONNX Runtime acceleration.
+A neural UTAU / OpenUtau resampler based on [pc-nsf-hifigan](https://github.com/openvpi/vocoders) for virtual singers. Runs on Windows, Linux, and macOS with support for NVIDIA, AMD, and Intel GPUs as well as CPU.
 
-**For Jinriki please use our [Hachimisampler](https://github.com/openhachimi/hachimisampler).**
+**For Jinriki VOCALOID / OtoMAD use, please check out our [Hachimisampler](https://github.com/openhachimi/hachimisampler).**
 
 ## Why is it called hifisampler?
 
-Hifisampler was modified from [straycatresampler](https://github.com/UtaUtaUtau/straycat), replacing the original WORLD vocoder with pc-nsf-hifigan.
+hifisampler was modified from [straycatresampler](https://github.com/UtaUtaUtau/straycat), replacing the traditional WORLD vocoder with the neural vocoder pc-nsf-hifigan.
 
 ## What makes pc-nsf-hifigan different from traditional vocoders?
 
-pc-nsf-hifigan employs neural networks to upsample input features, offering clearer audio quality than traditional vocoders. It is an improvement over standard nsf-hifigan, supporting F0 inputs that do not match the original Mel spectrogram, making it suitable for UTAU / OpenUtau resampling.
+pc-nsf-hifigan uses neural networks to upsample acoustic features, producing clearer and more natural audio quality than traditional algorithmic vocoders. It also supports F0 (pitch) inputs that differ from the original sample's Mel spectrogram, making it ideal for UTAU / OpenUtau pitch shifting and resampling.
 
-## How to use?
+---
 
-### 1. Integrated Environment Package (Recommended on Windows)
+## How to Use?
 
-1. Download the latest [release](https://github.com/openhachimi/hifisampler/releases) package, extract it, and run `start.bat` once to initialize the rendering service (this automatically registers a global locator beacon at `~/.hifisampler/server.json`).
-2. Add the client to OpenUtau's `Resamplers` folder:
-   - **Direct Copy (Recommended, supports server auto-start)**: Once `start.bat` or `uv run hifiserver.py` has been run at least once, you can directly copy `hifisampler.exe` and `hifisampler.yaml` into `OpenUtau\Resamplers\` without needing `mklink`!
-   - **Or Symbolic Link**:
+Choose any of the installation methods below based on your operating system and preference.
+
+### Method 1: All-in-One Package (Easiest on Windows)
+
+1. Download the latest [Release](https://github.com/openhachimi/hifisampler/releases) package, extract it, and double-click `start.bat` once to start the rendering server.
+2. Connect to OpenUtau (choose any option):
+   - **Option A (Recommended — Direct Copy)**: After running `start.bat` at least once, simply **copy** `hifisampler.exe` and `hifisampler.yaml` into OpenUtau's `Resamplers` folder (no administrator privileges or symbolic links required; OpenUtau can also auto-start the server when needed).
+   - **Option B (OpenUtau Built-in Tool)**: Keep `start.bat` running and select the built-in `hifisampler` resampler directly inside OpenUtau.
+   - **Option C (Symbolic Link)**:
      ```cmd
      mklink "C:\[OpenUtau Path]\Resamplers\hifisampler.exe" "C:\[Project Path]\hifisampler.exe"
      ```
-3. Set the UTAU / OpenUtau resampler to `hifisampler.exe`.
+3. Set your resampler in UTAU / OpenUtau to `hifisampler.exe`.
 
-### 2. Linux / macOS & OpenUtau Setup
+---
 
-1. Install [`uv`](https://docs.astral.sh/uv/getting-started/installation/) and extract the source code and model files into the project folder.
-2. Run `./start.sh` once (or `uv run hifiserver.py --register-only`) to initialize `.venv` and register the `~/.hifisampler/server.json` locator beacon.
-3. Connect to OpenUtau (choose either method):
-   - **Method A (OpenUtau Built-in Hifisampler)**: Start `./start.sh` and select the built-in `hifisampler` resampler in OpenUtau.
-   - **Method B (External Resampler with Auto-Start & Expression Manifest)**: Copy `hifisampler.sh` (or the native `hifisampler-linux-x64` binary) and `hifisampler.yaml` into `~/.local/share/OpenUtau/Resamplers/`:
+### Method 2: Manual Installation with `uv` (Windows / Linux / macOS)
+
+1. Install [`uv`](https://docs.astral.sh/uv/getting-started/installation/).
+2. Download the source code and model files from [Releases](https://github.com/openhachimi/hifisampler/releases) and extract them into the project folder.
+3. **Start the server**:
+   - **Windows**: Double-click `start.bat` (or run `uv run hifiserver.py` in a terminal).
+   - **Linux / macOS**: Run `./start.sh` (or `uv run hifiserver.py`) in the project directory. `config.yaml` will be generated automatically on first launch.
+4. **Connect to OpenUtau**:
+   - **Windows**: Copy `hifisampler.exe` and `hifisampler.yaml` into `OpenUtau\Resamplers\`.
+   - **Linux / macOS**: Either select OpenUtau's built-in `hifisampler` while the server is running, or copy `hifisampler.sh` (or `hifisampler-linux-x64`) and `hifisampler.yaml` into `~/.local/share/OpenUtau/Resamplers/`:
      ```bash
      cp hifisampler.sh ~/.local/share/OpenUtau/Resamplers/hifisampler.sh
      cp hifisampler.yaml ~/.local/share/OpenUtau/Resamplers/hifisampler.sh.yaml
      chmod +x ~/.local/share/OpenUtau/Resamplers/hifisampler.sh
      ```
-     *Note: On Linux, if the server is not running when OpenUtau invokes `hifisampler.sh`, it will first attempt to launch a visible GUI terminal (`ptyxis`, `kgx`, `gnome-terminal`, `konsole`, `kitty`, `alacritty`, `wezterm`, `foot`, `xfce4-terminal`, etc.) detached via `setsid`, and automatically fall back to a background daemon logging to `logs/hifiserver.log` if no GUI terminal is found.*
 
-### 3. AMD ROCm / NVIDIA CUDA / FP16 Configuration
+---
 
-1. **AMD ROCm on Linux (Recommended: Native PyTorch ROCm + `.ckpt`/`.pt` models)**:
-   - Install ROCm PyTorch inside the project environment:
-     ```bash
-     uv pip install --index-url https://download.pytorch.org/whl/rocm6.3 torch
-     ```
-   - Configure `config.yaml` to use the PyTorch checkpoints and optional FP16 inference (`MIOPEN_FIND_MODE=FAST` and startup kernel warmup are enabled automatically, while STFT, complex masks, and NSF phase accumulation stay in FP32 to preserve pitch accuracy):
-     ```yaml
-     model:
-       vocoder_path: "./pc_nsf_hifigan_44.1k_hop512_128bin_2025.02/model.ckpt"
-       model_type: "ckpt"
-       hnsep_model_path: "./hnsep/vr/model.pt"
-     performance:
-       max_workers: 2
-       device: "auto"      # "auto", "cuda", "rocm", "mps", or "cpu"
-       fp16: true          # Enable FP16 inference for PyTorch GPU models
-       idle_timeout: 0     # Auto-shutdown server after N seconds of inactivity (0 = disabled)
-     ```
-2. **NVIDIA CUDA / CPU**:
-   - `pyproject.toml` defaults to `pytorch-cu129`. For CPU-only installations, switch `[tool.uv.sources]` to `pytorch-cpu`.
+### Method 3: Manual Installation with Conda / pip
+
+1. Create and activate a Python 3.10 environment:
+   ```bash
+   conda create -n hifisampler python=3.10 -y
+   conda activate hifisampler
+   ```
+2. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+3. Download the model files from [Releases](https://github.com/openhachimi/hifisampler/releases) into the project folder, and install the appropriate PyTorch version from the [PyTorch website](https://pytorch.org/) according to the GPU guide below.
+4. Start the rendering server:
+   ```bash
+   conda activate hifisampler
+   python hifiserver.py
+   ```
+
+---
+
+## GPU & Hardware Recommendations (NVIDIA / AMD / Intel / CPU)
+
+By default, hifisampler uses **ONNX mode**, which works out of the box across all hardware. You can customize `config.yaml` based on your setup:
+
+| OS & Hardware | Recommended Mode (`config.yaml`) | Notes |
+| :--- | :--- | :--- |
+| **Windows + AMD / Intel GPU** | **ONNX mode (Default)** | Official PyTorch ROCm is largely unavailable on Windows. **Simply keep the default `model_type: "onnx"`** — DirectML acceleration is built in and automatically uses your AMD or Intel GPU (including integrated GPUs) with zero extra setup. |
+| **Windows / Linux + NVIDIA GPU** | **ONNX (Default) or PyTorch (`ckpt`)** | Default ONNX works out of the box. To use PyTorch models instead, uncomment the `.ckpt` / `.pt` paths in `config.yaml` (you can also set `fp16: true` for faster rendering). |
+| **Linux + AMD GPU (ROCm)** | **PyTorch (`ckpt`) or ONNX** | Linux supports native AMD ROCm acceleration. To run `.ckpt` / `.pt` models on ROCm, install ROCm PyTorch:<br>`uv pip install --index-url https://download.pytorch.org/whl/rocm6.3 torch`<br>then switch `config.yaml` to `ckpt` mode (setting `fp16: true` is also recommended). |
+| **CPU Only** | **ONNX mode (Default)** | Keep the default settings. If installing via `uv` on a CPU-only machine and you want to avoid downloading CUDA packages, change `pytorch-cu129` to `pytorch-cpu` in `pyproject.toml`. |
+
+### Useful `config.yaml` Settings
+
+- **`wave_norm`** (default `true`): Enables note-level loudness normalization (used with the `P` flag).
+- **`fp16`** (default `false`): When running PyTorch (`ckpt`) models on a GPU, set to `true` for faster half-precision inference and lower VRAM usage.
+- **`idle_timeout`** (default `0`): Auto-shutdown timer in seconds. `0` keeps the server running indefinitely; setting it to e.g. `600` will automatically shut down the server after 10 minutes of inactivity to free GPU VRAM (the client will automatically start it again on the next render).
+
+---
 
 ## Implemented Flags
 
-Place `hifisampler.yaml` alongside the client in OpenUtau's `Resamplers/` folder (e.g. `hifisampler.yaml` or `hifisampler.sh.yaml`) to automatically register all flags in OpenUtau:
+Placing `hifisampler.yaml` in OpenUtau's `Resamplers` folder alongside the client allows OpenUtau to automatically display all supported expression flags:
 
-- **g:** Adjust gender/formants.
+- **g:** Adjust gender / formants.
   - Range: `-600` to `600` | Default: `0`
-- **Hb:** Adjust breath/noise.
+- **Hb:** Adjust breathiness / noise component.
   - Range: `0` to `500` | Default: `100`
-- **Hv:** Adjust voice/harmonic.
+- **Hv:** Adjust voicing / harmonic component.
   - Range: `0` to `150` | Default: `100`
-- **HG:** Vocal fry/growl.
+- **Ht:** Adjust vocal tension.
+  - Range: `-100` to `100` | Default: `0`
+- **HG:** Vocal fry / growl effect.
   - Range: `0` to `100` | Default: `0`
-- **P:** Normalize loudness at the note level, targeting -16 LUFS. Enable this by setting `wave_norm` to `true` in `config.yaml`.
+- **P:** Note-level loudness normalization strength targeting -16 LUFS (requires `wave_norm: true` in `config.yaml`).
   - Range: `0` to `100` | Default: `100`
-- **t:** Shift the pitch by a specific amount, in cents (1 cent = 1/100 of a semitone).
+- **t:** Pitch shift in cents (1 cent = 1/100 semitone).
   - Range: `-1200` to `1200` | Default: `0`
-- **Ht:** Adjust tension.
+- **A:** Modulate amplitude based on pitch changes for more natural vibrato.
   - Range: `-100` to `100` | Default: `0`
-- **A:** Modulate amplitude based on pitch variations for natural vibrato.
-  - Range: `-100` to `100` | Default: `0`
-- **G:** Force regeneration of feature cache (overwrites existing cache on disk).
-  - No value needed
-- **He:** Enable Mel spectrum loop mode for long notes.
-  - No value needed
+- **G:** Force regenerate feature cache for the note (overwrites existing cache).
+  - Toggle flag (no value needed)
+- **He:** Enable Mel spectrogram loop mode for long notes (when `loop_mode: false` in `config.yaml`).
+  - Toggle flag (no value needed)
 
-_Note: The flags `B` and `V` were renamed to `Hb` and `Hv` respectively because they conflict with other UTAU flags but have different definitions._
+_Note: The flags `B` and `V` were renamed to `Hb` and `Hv` respectively to avoid conflicts with standard UTAU flags that have different definitions._
 
 ## Acknowledgments
 
