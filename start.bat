@@ -8,7 +8,7 @@ if exist ".venv\Scripts\python.exe" (
     goto :eof
 )
 
-rem --- First-time setup: ensure uv is installed and run hifiserver.py ---
+rem --- First-time setup: ensure uv is installed and initialize .venv by GPU type ---
 call :SetupUv
 if %errorlevel% neq 0 (
     echo.
@@ -17,7 +17,36 @@ if %errorlevel% neq 0 (
     goto :eof
 )
 
-uv run hifiserver.py %*
+echo --- Creating Python 3.11 virtual environment (.venv)...
+uv venv .venv --python 3.11
+if %errorlevel% neq 0 (
+    echo Error: Failed to create virtual environment.
+    pause
+    goto :eof
+)
+
+where nvidia-smi >nul 2>&1 && nvidia-smi -L >nul 2>&1
+if %errorlevel% equ 0 (
+    echo --- NVIDIA GPU detected. Installing PyTorch with CUDA support...
+    uv pip install --python .venv "torch>=2.6.0" --index-url https://download.pytorch.org/whl/cu129
+    if errorlevel 1 (
+        echo Error: Failed to install PyTorch with CUDA support.
+        pause
+        goto :eof
+    )
+) else (
+    echo --- No NVIDIA GPU detected. Installing lightweight PyTorch ^(CPU^) + DirectML support...
+)
+
+echo --- Installing HifiSampler dependencies...
+uv pip install --python .venv -r requirements.txt
+if %errorlevel% neq 0 (
+    echo Error: Failed to install dependencies.
+    pause
+    goto :eof
+)
+
+".venv\Scripts\python.exe" hifiserver.py %*
 
 endlocal
 goto :eof
@@ -25,6 +54,11 @@ goto :eof
 
 :SetupUv
     echo --- Checking for uv...
+    if exist "%~dp0uv.exe" (
+        set "PATH=%~dp0;%PATH%"
+        exit /b 0
+    )
+
     uv --version >nul 2>&1
     if %errorlevel% equ 0 (
         echo uv is already installed and accessible.

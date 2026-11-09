@@ -23,16 +23,9 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-# Default uses CUDA 12.9 wheels on Windows/Linux.
-# For AMD ROCm on Linux, install torch from the pytorch-rocm index:
-#   uv pip install --index-url https://download.pytorch.org/whl/rocm6.3 torch
 torch = [
   { index = "pytorch-cu129", marker = "sys_platform == 'win32' or sys_platform == 'linux'" },
 ]
-
-[[tool.uv.index]]
-url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
-default = true
 
 [[tool.uv.index]]
 name = "pytorch-cu129"
