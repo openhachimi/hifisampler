@@ -3,10 +3,11 @@ name = "hifisampler"
 version = "0.0.6"
 description = "A new UTAU resampler based on pc-nsf-hifigan and straycatresampler for virtual singer."
 readme = "README.md"
-requires-python = ">=3.10, <3.13"
+requires-python = ">=3.11, <3.13"
 dependencies = [
-    "aiohttp>=3.12.15",
-    "filelock>=3.17.0",
+    "aiohttp>=3.14.4",
+    "certifi>=2026.10.18",
+    "filelock>=4.2.1",
     "librosa>=0.10.2.post1",
     "numpy>=2.1.3",
     "onnxruntime-directml>=1.22.0; sys_platform == 'win32'",
@@ -18,7 +19,7 @@ dependencies = [
     "ruamel-yaml>=0.18.10",
     "scipy>=1.15.2",
     "soundfile>=0.13.1",
-    "torch>=2.6.0",
+    "torch>=2.13.0",
 ]
 
 [tool.uv.sources]
