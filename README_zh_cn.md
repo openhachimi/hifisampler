@@ -2,115 +2,82 @@
 
 [中文文档](README_zh_cn.md) | [English Document](README.md)
 
-一个基于 [pc-nsf-hifigan](https://github.com/openvpi/vocoders)的新的 utau 重采样器。
+一个基于 [pc-nsf-hifigan](https://github.com/openvpi/vocoders) 的新一代 UTAU / OpenUtau 重采样器，支持 Windows、Linux 与 macOS，原生兼容 NVIDIA CUDA、AMD ROCm 与 ONNX Runtime。
 
 ## 为什么叫 hifisampler?
 
-hifisampler 是由 [straycatresampler](https://github.com/UtaUtaUtau/straycat) 修改而来，用 pc-nsf-hifigan 替换了原来的 world。
+hifisampler 是由 [straycatresampler](https://github.com/UtaUtaUtau/straycat) 修改而来，用 pc-nsf-hifigan 替换了原来的 WORLD。
 
 ## pc-nsf-hifigan 和其它传统 vocoder 有什么不同?
 
 pc-nsf-hifigan 采用神经网络对输入的特征进行上采样，音质比传统的 vocoder 更加清晰。
-pc-nsf-hifigan 是传统 nsf-hifigan 的改进，支持输入与 mel 不匹配的 f0，因此可以用于 utau 的重采样。
+pc-nsf-hifigan 是传统 nsf-hifigan 的改进，支持输入与 mel 不匹配的 f0，因此可以用于 UTAU / OpenUtau 的重采样。
 
 ## 如何使用?
 
 提供三种安装方式，按自己需要和喜好选择。
 
-### 使用环境整合包（推荐 NVIDIA GPU）
+### 1. 使用环境整合包（Windows 推荐）
 
-1. 下载最新的 [release](https://github.com/openhachimi/hifisampler/releases) 整合包并解压，运行`start.bat` 启动渲染服务。
-2. （可选但不推荐）如果采用服务端自启动（实验性），则需要保持 `config.default.yaml`, `hifiserver.py`, `hifisampler.exe` 以及 `launch_server.py` 四个文件在同一目录下。建议解压后保持原文件结构不变。OpenUTAU 可以采用创建软链接的方式将 `hifisampler.exe` 链接到 Resamplers 文件夹。
+1. 下载最新的 [release](https://github.com/openhachimi/hifisampler/releases) 整合包并解压，运行一次 `start.bat` 启动渲染服务（首次启动会自动在 `~/.hifisampler/server.json` 写入全局定位信标）。
+2. 将客户端放入 OpenUtau 的 `Resamplers` 文件夹：
+   - **直接复制（推荐，支持服务端自启动）**：运行过一次 `start.bat` 或 `uv run hifiserver.py` 后，直接把 `hifisampler.exe` 和 `hifisampler.yaml` 复制到 `OpenUtau\Resamplers\` 目录即可，无需创建软链接！
+   - **或创建软链接**：
+     ```cmd
+     mklink "C:\[OpenUtau路径]\Resamplers\hifisampler.exe" "C:\[项目路径]\hifisampler.exe"
+     ```
+3. 在 OpenUtau 中将重采样器设置为 `hifisampler.exe`。
 
-   ```cmd
-   mklink "C:\[OpenUTAU路径]\Resamplers\hifisampler.exe" "C:\[项目路径]\hifisampler.exe"
-   ```
+### 2. Linux / macOS 与 OpenUtau 配置指南
 
-3. 将 utau 的重采样器设置为 `hifisampler.exe`，并确保渲染服务已启动。
+1. 安装 [uv](https://docs.astral.sh/uv/getting-started/installation/)，解压源码与模型文件到项目目录。
+2. 在项目目录下运行一次 `./start.sh`（或 `uv run hifiserver.py --register-only`）完成环境初始化与全局信标 `~/.hifisampler/server.json` 注册。
+3. 将客户端接入 OpenUtau 的 `Resamplers` 目录（二选一）：
+   - **方式 A（OpenUtau 内置 Hifisampler 工具）**：启动 `./start.sh` 后，直接在 OpenUtau 中选择内置 `hifisampler`（连接 `127.0.0.1:8572`）。
+   - **方式 B（外部重采样器 + 自动拉起服务端 + 表情参数自动加载）**：将项目根目录下的 `hifisampler.sh`（或编译好的 `hifisampler-linux-x64`）与 `hifisampler.yaml` 直接复制或软链接到 `~/.local/share/OpenUtau/Resamplers/`：
+     ```bash
+     cp hifisampler.sh ~/.local/share/OpenUtau/Resamplers/hifisampler.sh
+     cp hifisampler.yaml ~/.local/share/OpenUtau/Resamplers/hifisampler.sh.yaml
+     chmod +x ~/.local/share/OpenUtau/Resamplers/hifisampler.sh
+     ```
+     *注：在 Linux 下若尚未启动服务端，`hifisampler.sh` 被 OpenUtau 调用时会自动优先弹出桌面终端窗口（支持 `ptyxis`、`kgx`、`gnome-terminal`、`konsole`、`kitty`、`alacritty`、`wezterm`、`foot`、`xfce4-terminal` 等），若无可用终端则自动退化为后台静默守护进程并将日志输出到 `logs/hifiserver.log`。*
 
-### 使用 uv 手动安装
+### 3. AMD ROCm / NVIDIA CUDA / FP16 加速配置
 
-0. 安装 uv，安装方法请参考 [uv 文档](https://docs.astral.sh/uv/getting-started/installation/)。
-1. 下载 [release](https://github.com/openhachimi/hifisampler/releases) 源码并解压，进入文件夹。
-2. 从 release assets 下载模型文件，解压后放入项目文件夹。
-3. 在 config.yaml 中填入配置（如果是首次使用，则在 config.default.yaml 中修改，首次运行时会自动生成 config.yaml 文件）。
-4. 根据个人需求，可以选择适合自己硬件的 cuda 版本以获取加速，具体而言，在 `pyproject.toml` 中，如果需要 cuda 加速，则需要修改配置文件的 `tool.uv.sources` 部分，如：
+1. **AMD ROCm（Linux 推荐 PyTorch 原生 ROCm + `.ckpt`/`.pt` 模型）**：
+   - 安装 ROCm 版 PyTorch：
+     ```bash
+     uv pip install --index-url https://download.pytorch.org/whl/rocm6.3 torch
+     ```
+   - 在 `config.yaml` 中启用 PyTorch 模型与可选 FP16 半精度加速（服务端已内置 `MIOPEN_FIND_MODE=FAST` 与启动预热 Warmup，且对 STFT、复数掩码与 NSF 相位累加保持 FP32 高精度防破音）：
+     ```yaml
+     model:
+       vocoder_path: "./pc_nsf_hifigan_44.1k_hop512_128bin_2025.02/model.ckpt"
+       model_type: "ckpt"
+       hnsep_model_path: "./hnsep/vr/model.pt"
+     performance:
+       max_workers: 2
+       device: "auto"      # 自动识别 CUDA / ROCm / MPS / CPU
+       fp16: true          # 开启 GPU FP16 推理加速
+       idle_timeout: 0     # 空闲自动关闭服务端释放显存秒数（0 为常驻不关闭）
+     ```
+2. **NVIDIA CUDA / CPU**：
+   - 默认 `pyproject.toml` 配置为 `pytorch-cu129`；若仅使用 CPU，可在 `pyproject.toml` 的 `[tool.uv.sources]` 中改为 `pytorch-cpu`。
 
-   ```toml
-   [tool.uv.sources]
-   torch = [
-      { index = "pytorch-cu128" },
-   ]
-   ```
+### 4. 使用 conda 手动安装
 
-   如果使用 CPU，则：
-
-   ```toml
-   [tool.uv.sources]
-    torch = [
-        { index = "pytorch-cpu" },
-    ]
-    ```
-
-5. （可选但不推荐）如果采用服务端自启动（实验性），则需要保持 `config.default.yaml`, `hifiserver.py`, `hifisampler.exe` 以及 `launch_server.py` 四个文件在同一目录下。建议解压后保持原文件结构不变。OpenUTAU 可以采用创建软链接的方式将 `hifisampler.exe` 链接到 Resamplers 文件夹。
-
-   ```cmd
-   mklink "C:\[OpenUTAU路径]\Resamplers\hifisampler.exe" "C:\[项目路径]\hifisampler.exe"
-   ```
-
-6. 每次使用前运行 `hifiserver.py` 启动渲染服务。如果采用服务端自启动（实验性）则可以跳过此步骤。在终端输入
-
+1. 创建并激活虚拟环境：
    ```bash
-   uv run hifiserver.py
-   ```
-
-7. 将 utau 的重采样器设置为 `hifisampler.exe`，并确保渲染服务已启动。
-
-### 使用 conda 手动安装
-
-0. 下载 [release](https://github.com/openhachimi/hifisampler/releases) 解压，进入文件夹，如果有嵌套的话继续打开直到显示有 hifiserver.py 文件。
-
-1. 安装 miniconda ，安装好后在刚刚打开的文件夹右击，点在终端中打开，输入
-
-   ```bash
-   conda create -n hifisampler python=3.8 -y
-   ```
-
-   创建完成后，输入
-
-   ```bash
+   conda create -n hifisampler python=3.10 -y
    conda activate hifisampler
-   ```
-
-   即可进入虚拟环境。虚拟环境只需创建一次，以后直接进入有 hifiserver.py 的文件夹打开终端输入 activate 命令即可  
-   进入成功后会发现终端工作目录前面有 ( hifisamper ) 标志  
-   如果报错说 conda 不是内部外部命令，是环境变量没设置好，搜索： conda 设置环境变量，按要求操作即可
-
-2. 安装依赖，输入
-
-   ```bash
    pip install -r requirements.txt
    ```
-
-3. 从 release assets 下载模型文件，解压后放入项目文件夹。
-4. 在 [torch 官网] (<https://pytorch.org/>) 下载 cuda 版本的 pytorch ( 如果你确定只使用 onnx 版，那么可以下载 cpu 版的 pytorch )
-   具体安装方法：进入后往下滑，看到 INSTALL PYTORCH 以及一个表格，PyTorch Build 选 Stable , Your OS 选你的操作系统 , Package 选 pip , Language 选 python , Compute Platform 如果要下载 gpu 版就选带 cuda 的，下载 cpu 版选 cpu ，然后复制 Run this Command 右边表格里的命令到终端运行
-5. （可选但不推荐）如果采用服务端自启动（实验性），则需要保持 `config.default.yaml`, `hifiserver.py`, `hifisampler.exe` 以及 `launch_server.py` 四个文件在同一目录下。建议解压后保持原文件结构不变。OpenUTAU 可以采用创建软链接的方式将 `hifisampler.exe` 链接到 Resamplers 文件夹。
-
-   ```cmd
-   mklink "C:\[OpenUTAU路径]\Resamplers\hifisampler.exe" "C:\[项目路径]\hifisampler.exe"
-   ```
-
-6. 每次使用前运行 `hifiserver.py` 启动渲染服务。如果采用服务端自启动（实验性）则可以跳过此步骤。在终端输入
-
-   ```bash
-   conda activate hifisampler
-   python hifiserver.py
-   ```
-
-7. 将 utau 的重采样器设置为 `hifisampler.exe`，并确保渲染服务已启动。
+2. 根据硬件前往 [PyTorch 官网](https://pytorch.org/) 安装对应 CUDA / ROCm / CPU 版本的 `torch`。
+3. 运行 `python hifiserver.py` 启动服务。
 
 ## 已实现的 flags
+
+将 `hifisampler.yaml` 放入 OpenUtau 的 `Resamplers` 目录（与客户端同名，如 `hifisampler.yaml` 或 `hifisampler.sh.yaml`）即可在 OpenUtau 中自动加载以下全部表情参数：
 
 - **g:** 调整性别/共振峰。
   - 范围: `-600` 到 `600` | 默认: `0`
@@ -120,7 +87,7 @@ pc-nsf-hifigan 是传统 nsf-hifigan 的改进，支持输入与 mel 不匹配�
   - 范围: `0` 到 `150` | 默认: `100`
 - **HG:** 怒音/嘶吼效果。
   - 范围: `0` 到 `100` | 默认: `0`
-- **P:** 以 -16 LUFS 为基准进行音符粒度的响度标准化。需要在 config.yaml 中设置 `wave_norm` 为 `true`。
+- **P:** 以 -16 LUFS 为基准进行音符粒度的响度标准化。需要在 `config.yaml` 中设置 `wave_norm` 为 `true`。
   - 范围: `0` 到 `100` | 默认: `100`
 - **t:** 移动特定的音高，单位为音分，1 分=1/100 个半音。
   - 范围: `-1200` 到 `1200` | 默认: `0`
@@ -128,16 +95,12 @@ pc-nsf-hifigan 是传统 nsf-hifigan 的改进，支持输入与 mel 不匹配�
   - 范围: `-100` 到 `100` | 默认: `0`
 - **A:** 根据音高的变化调制振幅，有助于生成相对真实的颤音。
   - 范围: `-100` 到 `100` | 默认: `0`
-- **G:** 强制重新生成特征缓存（忽略已有缓存）。
+- **G:** 强制重新生成特征缓存（忽略已有缓存并覆写磁盘缓存）。
   - 无需数值
 - **He:** 为长音启用 Mel 频谱循环模式。
   - 无需数值
 
 _注：由于 `B` 和 `V` 与其他 UTAU flags 名称冲突但定义不同，因此分别更名为 `Hb` 和 `Hv`。_
-
-## 其他注意事项
-
-- 如果采用服务端自启动（实验性），在服务器启动过程中关闭终端窗口或渲染，可能导致服务端卡住，可以尝试手动解除 `hifisampler.exe` 的文件占用。推荐手动使用 `./start.bat` 启动渲染服务。
 
 ## 感谢
 

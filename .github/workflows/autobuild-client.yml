@@ -1,4 +1,4 @@
-﻿name: Build clients for multiple platforms when released
+name: Build clients for multiple platforms when released
 
 # triggers when a new release is created
 on:
@@ -9,7 +9,7 @@ jobs:
   compile:
     name: Compile for ${{ matrix.rid }}
     runs-on: ${{ matrix.runner }}
-    
+
     # runs the job for each platform in the matrix
     strategy:
       matrix:
@@ -18,6 +18,14 @@ jobs:
         - rid: win-x64
           runner: windows-latest
           ext: .exe
+        # linux x64
+        - rid: linux-x64
+          runner: ubuntu-latest
+          ext: ""
+        # linux arm64
+        - rid: linux-arm64
+          runner: ubuntu-24.04-arm
+          ext: ""
         # intel mac
         - rid: osx-x64
           runner: macos-15-intel
@@ -36,20 +44,26 @@ jobs:
     - name: Setup .NET 9.0.x
       uses: actions/setup-dotnet@v4
       with:
-        dotnet-version: '9.0.x' # according to the previous release
+        dotnet-version: '9.0.x'
 
     # Compile the code for multiple platforms
     - name: Compile AOT for ${{ matrix.rid }}
       working-directory: ./client
       run: |
         dotnet publish -c Release -r ${{ matrix.rid }} /p:PublishAot=true /p:DebugType=none /p:DebugSymbols=false -o ./raw
+
     # prepare for uploading
     - name: Prepare for upload
       working-directory: ./client
       shell: bash
       run: |
-        mkdir release_assets
+        mkdir -p release_assets
         cp "./raw/hifisampler${{ matrix.ext }}" "./release_assets/hifisampler-${{ matrix.rid }}${{ matrix.ext }}"
+        if [ "${{ matrix.rid }}" = "linux-x64" ]; then
+          cp ../hifisampler.sh ./release_assets/hifisampler.sh
+          cp ../hifisampler.yaml ./release_assets/hifisampler.yaml
+        fi
+
     # upload to release
     - name: Upload to release
       uses: softprops/action-gh-release@v2

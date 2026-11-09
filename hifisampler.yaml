@@ -1,0 +1,90 @@
+# OpenUtau Resampler Manifest for HifiSampler
+# Copy this file alongside hifisampler.exe or hifisampler.sh in OpenUtau's Resamplers folder
+# (matching the executable filename, e.g. hifisampler.yaml or hifisampler.sh.yaml).
+expressions:
+  - name: gender (hifi)
+    abbr: g
+    type: Numerical
+    min: -600
+    max: 600
+    default_value: 0
+    is_flag: true
+    flag: g
+  - name: breathiness (hifi)
+    abbr: Hb
+    type: Numerical
+    min: 0
+    max: 500
+    default_value: 100
+    is_flag: true
+    flag: Hb
+  - name: voicing (hifi)
+    abbr: Hv
+    type: Numerical
+    min: 0
+    max: 150
+    default_value: 100
+    is_flag: true
+    flag: Hv
+  - name: tension (hifi)
+    abbr: Ht
+    type: Numerical
+    min: -100
+    max: 100
+    default_value: 0
+    is_flag: true
+    flag: Ht
+  - name: growl (hifi)
+    abbr: HG
+    type: Numerical
+    min: 0
+    max: 100
+    default_value: 0
+    is_flag: true
+    flag: HG
+  - name: loudness norm (hifi)
+    abbr: P
+    type: Numerical
+    min: 0
+    max: 100
+    default_value: 100
+    is_flag: true
+    flag: P
+  - name: pitch shift cents (hifi)
+    abbr: t
+    type: Numerical
+    min: -1200
+    max: 1200
+    default_value: 0
+    is_flag: true
+    flag: t
+  - name: amplitude modulation (hifi)
+    abbr: A
+    type: Numerical
+    min: -100
+    max: 100
+    default_value: 0
+    is_flag: true
+    flag: A
+  - name: force regenerate cache (hifi)
+    abbr: G
+    type: Options
+    min: 0
+    max: 1
+    default_value: 0
+    is_flag: true
+    flag: G
+    options:
+      - ""
+      - "G"
+  - name: loop mode (hifi)
+    abbr: He
+    type: Options
+    min: 0
+    max: 1
+    default_value: 0
+    is_flag: true
+    flag: He
+    options:
+      - ""
+      - "He"

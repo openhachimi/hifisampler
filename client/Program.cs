@@ -1,26 +1,30 @@
-﻿using System;
+using System;
+using System.Diagnostics;
+using System.IO;
 using System.Net;
 using System.Net.Http;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
-using System.IO;
-using System.Diagnostics;
 
 class Program
 {
-    // Static HttpClient for actual POST requests
     static readonly HttpClient PostClient = new HttpClient() { Timeout = TimeSpan.FromSeconds(180) };
-    // Factory for short-timeout clients for readiness checks
     static readonly Func<HttpClient> CheckClientFactory = () => new HttpClient() { Timeout = TimeSpan.FromSeconds(2) };
 
-    static readonly int TargetPort = 8572;
-    // start.bat for Windows, start.sh for Linux/Mac
+    static int TargetPort = 8572;
     static readonly string LauncherScriptName = OperatingSystem.IsWindows() ? "start.bat" : "start.sh";
-    private const string ServerStartupMutexName = "Global\\HifiSamplerServerStartupMutex_DCL_8572"; // Unique name for DCL version
 
-    // --- Main Entry Point ---
+    sealed class ServerLocation
+    {
+        public string ServerRoot { get; set; } = "";
+        public string PythonExe { get; set; } = "";
+        public string ScriptPath { get; set; } = "";
+        public string LauncherScript { get; set; } = "";
+    }
+
     static async Task Main(string[] args)
     {
         if (args.Length < 1)
@@ -29,208 +33,294 @@ class Program
             Environment.Exit(1);
         }
 
+        var location = ResolveServerLocation();
+
         bool proceedToCommunication = false;
         bool errorOccurred = false;
         string errorMessage = "";
 
         // --- Phase 1: Quick Readiness Check (No Lock) ---
-        Console.WriteLine("[Main] Performing initial readiness check (no lock)...");
         if (await IsServerReady(TargetPort))
         {
-            Console.WriteLine("[Main] Initial check PASSED. Server is ready.");
             proceedToCommunication = true;
         }
         else
         {
-            Console.WriteLine("[Main] Initial check FAILED. Server not ready. Proceeding with mutex...");
+            Console.WriteLine("[Main] Server not ready. Acquiring startup lock...");
 
-            // --- Phase 2: Acquire Mutex and Double-Check ---
-            using (var mutex = new Mutex(false, ServerStartupMutexName))
+            // --- Phase 2: Cross-Platform File Lock and Double-Check ---
+            using var lockStream = await TryAcquireStartupLockAsync(TargetPort, TimeSpan.FromSeconds(5));
+            if (lockStream != null)
             {
-                bool mutexAcquired = false;
-                bool mutexOwned = false; // Track if we actually own the mutex
                 try
                 {
-                    try
+                    if (await IsServerReady(TargetPort))
                     {
-                        mutexAcquired = mutex.WaitOne(TimeSpan.FromSeconds(5));
-                        mutexOwned = mutexAcquired; // Normal acquisition
+                        proceedToCommunication = true;
                     }
-                    catch (AbandonedMutexException)
+                    else if (!IsPortInUse(TargetPort))
                     {
-                        Console.WriteLine("[Main] Warning: Acquired abandoned mutex. Previous owner likely crashed.");
-                        mutexAcquired = true;
-                        mutexOwned = true; // We own it after abandoned mutex exception
-                    }
-
-                    // --- Phase 3: Actions Inside Mutex (if acquired) ---
-                    if (mutexAcquired)
-                    {
-                        Console.WriteLine("[Main] Mutex acquired. Performing second readiness check...");
-
-                        // ** Double-Check **
-                        if (await IsServerReady(TargetPort))
+                        Console.WriteLine($"[Main] Port {TargetPort} is free. Launching HifiSampler server...");
+                        if (string.IsNullOrEmpty(location.ServerRoot))
                         {
-                            Console.WriteLine("[Main] Second check PASSED (inside mutex). Server is ready.");
-                            proceedToCommunication = true; // Mark ready, will skip final wait
+                            errorMessage =
+                                "Could not locate HifiSampler server directory. " +
+                                "Please run start.bat / start.sh (or uv run hifiserver.py) once in the server folder to register ~/.hifisampler/server.json, " +
+                                "or set the HIFISAMPLER_HOME environment variable.";
+                            errorOccurred = true;
                         }
                         else
                         {
-                            Console.WriteLine("[Main] Second check FAILED (inside mutex). Checking port...");
-                            // Server still not ready, check if someone else might be launching it
-                            if (!IsPortInUse(TargetPort))
+                            try
                             {
-                                // Port is free - WE MUST LAUNCH
-                                Console.WriteLine($"[Main] Port {TargetPort} is free. This instance will launch the server.");
-                                string exeDir = AppContext.BaseDirectory;
-                                string scriptPath = Path.Combine(exeDir, LauncherScriptName);
-
-                                if (!File.Exists(scriptPath))
+                                LaunchServerProcess(location);
+                                // Wait up to 45s (staying safely under OpenUtau's 60s process kill timeout)
+                                bool initialWaitOk = await WaitForServerToStart(TargetPort, 45, "[InitialWait]");
+                                if (initialWaitOk)
                                 {
-                                    errorMessage = $"Error: {LauncherScriptName} not found at '{scriptPath}'.";
-                                    errorOccurred = true;
+                                    proceedToCommunication = true;
                                 }
                                 else
                                 {
-                                    try
-                                    {
-                                        LaunchServerLauncher(scriptPath);
-                                        Console.WriteLine("[Main] Launch initiated. Performing initial wait *inside* mutex...");
-
-                                        // Initial wait while holding the lock
-                                        bool initialWaitOk = await WaitForServerToStart(TargetPort, 60, "[InitialWait]");
-                                        if (initialWaitOk)
-                                        {
-                                            Console.WriteLine("[Main] Initial wait successful. Server presumed ready by launcher.");
-                                            proceedToCommunication = true; // Our launch succeeded
-                                        }
-                                        else
-                                        {
-                                            errorMessage = "Server launched by this instance did not become ready during initial wait.";
-                                            errorOccurred = true;
-                                        }
-                                    }
-                                    catch (Exception ex)
-                                    {
-                                        errorMessage = $"Error during server launch execution: {ex.Message}";
-                                        errorOccurred = true;
-                                    }
+                                    errorMessage = "Server launched (warming up in background), but did not become ready within 45s.";
+                                    errorOccurred = true;
                                 }
                             }
-                            else
+                            catch (Exception ex)
                             {
-                                // Port is in use, but not ready. Someone else is launching/initializing.
-                                Console.WriteLine($"[Main] Port {TargetPort} is in use, but server not ready. Assuming another instance is handling it.");
-                                // proceedToCommunication remains false - needs final wait outside lock
+                                errorMessage = $"Error during server launch execution: {ex.Message}";
+                                errorOccurred = true;
                             }
                         }
                     }
-                    else // Mutex not acquired (timed out)
+                    else
                     {
-                        Console.WriteLine("[Main] Mutex not acquired (timeout). Assuming another instance handled checks/launch.");
-                        // proceedToCommunication remains false - needs final wait outside lock
+                        Console.WriteLine($"[Main] Port {TargetPort} is in use; waiting for server initialization...");
                     }
                 }
-                catch (Exception ex) // Catch unexpected errors during mutex-protected logic
+                catch (Exception ex)
                 {
-                    errorMessage = $"Unexpected error during mutex protected checks: {ex.Message}";
+                    errorMessage = $"Unexpected error during startup checks: {ex.Message}";
                     errorOccurred = true;
                 }
-                finally
-                {
-                    // Improved mutex release with better error handling
-                    if (mutexOwned)
-                    {
-                        bool releaseSucceeded = false;
-                        try
-                        {
-                            mutex.ReleaseMutex();
-                            Console.WriteLine("[Main] Mutex released successfully.");
-                            releaseSucceeded = true;
-                        }
-                        catch (ApplicationException ex)
-                        {
-                            // This usually means the mutex was already released or we don't own it
-                            Console.WriteLine($"[Main] ApplicationException during mutex release (usually safe to ignore): {ex.Message}");
-                            releaseSucceeded = true; // Treat as success since mutex is effectively released
-                        }
-                        catch (ObjectDisposedException ex)
-                        {
-                            // Mutex was disposed, which means it's effectively released
-                            Console.WriteLine($"[Main] Mutex was already disposed: {ex.Message}");
-                            releaseSucceeded = true;
-                        }
-                        catch (Exception ex)
-                        {
-                            Console.Error.WriteLine($"[Main] Unexpected error releasing mutex: {ex.GetType().Name} - {ex.Message}");
-                            // Don't treat as success - this might be a real problem
-                        }
-
-                        if (releaseSucceeded)
-                        {
-                            mutexOwned = false; // Mark as no longer owned
-                        }
-                        else
-                        {
-                            Console.Error.WriteLine("[Main] Warning: Failed to properly release mutex. This may affect future launches.");
-                        }
-                    }
-                }
-            } // --- End of using (Mutex) block ---
+            }
+            else
+            {
+                Console.WriteLine("[Main] Another client instance holds the startup lock; waiting for server...");
+            }
         }
 
-        // --- Phase 4: Handle Errors or Perform Final Wait ---
         if (errorOccurred)
         {
             Console.Error.WriteLine($"[Main] Exiting due to critical error: {errorMessage}");
             Environment.Exit(1);
         }
 
-        // Perform final wait ONLY if the server wasn't confirmed ready earlier
         if (!proceedToCommunication)
         {
-            Console.WriteLine("[Main] Performing final wait for server readiness confirmation...");
-            bool finalReadinessCheck = await WaitForServerToStart(TargetPort, 95, "[FinalWait]");
-
+            bool finalReadinessCheck = await WaitForServerToStart(TargetPort, 45, "[FinalWait]");
             if (!finalReadinessCheck)
             {
-                Console.Error.WriteLine("[Main] Error: Server failed final readiness check.");
+                Console.Error.WriteLine("[Main] Error: Server failed readiness check within timeout.");
                 Environment.Exit(1);
             }
-            Console.WriteLine("[Main] Final readiness check successful.");
-            proceedToCommunication = true; // Now we can proceed
+            proceedToCommunication = true;
         }
 
-        // --- Phase 5: Communicate ---
         if (proceedToCommunication)
         {
-            Console.WriteLine("[Main] Proceeding to communication...");
             await CommunicateWithServer(args);
-            Console.WriteLine("[Main] Task completed successfully.");
-        }
-        else
-        {
-            // Should be unreachable if logic is correct
-            Console.Error.WriteLine("[Main] Error: Logic flaw - Communication attempted without readiness confirmation.");
-            Environment.Exit(1);
         }
     }
 
-    // --- Communication Function (with Retries) ---
+    static ServerLocation ResolveServerLocation()
+    {
+        string? portEnv = Environment.GetEnvironmentVariable("HIFISAMPLER_PORT");
+        if (!string.IsNullOrWhiteSpace(portEnv) && int.TryParse(portEnv, out int parsedPort) && parsedPort > 0)
+        {
+            TargetPort = parsedPort;
+        }
+
+        // 1. Check HIFISAMPLER_HOME environment variable
+        string? envHome = Environment.GetEnvironmentVariable("HIFISAMPLER_HOME");
+        if (!string.IsNullOrWhiteSpace(envHome) && TryProbeServerDir(envHome, out var fromEnv))
+        {
+            return fromEnv;
+        }
+
+        // 2. Check symlink target of current executable (if linked via ln -s or mklink)
+        string? processPath = Environment.ProcessPath;
+        if (!string.IsNullOrEmpty(processPath) && File.Exists(processPath))
+        {
+            try
+            {
+                FileSystemInfo? linkTarget = File.ResolveLinkTarget(processPath, returnFinalTarget: true);
+                if (linkTarget != null)
+                {
+                    string? targetDir = Path.GetDirectoryName(linkTarget.FullName);
+                    if (!string.IsNullOrEmpty(targetDir) && TryProbeServerDir(targetDir, out var fromLink))
+                    {
+                        return fromLink;
+                    }
+                }
+            }
+            catch
+            {
+                // Ignore if OS/filesystem does not support ResolveLinkTarget
+            }
+        }
+
+        // 3. Check executable's own directory
+        if (TryProbeServerDir(AppContext.BaseDirectory, out var fromBase))
+        {
+            return fromBase;
+        }
+
+        // 4. Check Global Locator Beacon ~/.hifisampler/server.json
+        try
+        {
+            string userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            string beaconPath = Path.Combine(userHome, ".hifisampler", "server.json");
+            if (File.Exists(beaconPath))
+            {
+                string jsonText = File.ReadAllText(beaconPath, Encoding.UTF8);
+                using JsonDocument doc = JsonDocument.Parse(jsonText);
+                JsonElement root = doc.RootElement;
+
+                if (root.TryGetProperty("port", out JsonElement portEl) && portEl.TryGetInt32(out int beaconPort) && beaconPort > 0)
+                {
+                    if (string.IsNullOrWhiteSpace(portEnv))
+                    {
+                        TargetPort = beaconPort;
+                    }
+                }
+
+                string? serverRoot = root.TryGetProperty("server_root", out JsonElement srEl) ? srEl.GetString() : null;
+                if (!string.IsNullOrWhiteSpace(serverRoot) && TryProbeServerDir(serverRoot, out var fromBeacon))
+                {
+                    if (root.TryGetProperty("python_exe", out JsonElement pyEl))
+                    {
+                        string? pyExe = pyEl.GetString();
+                        if (!string.IsNullOrWhiteSpace(pyExe) && File.Exists(pyExe))
+                        {
+                            fromBeacon.PythonExe = pyExe;
+                        }
+                    }
+                    return fromBeacon;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[Locator] Warning reading ~/.hifisampler/server.json: {ex.Message}");
+        }
+
+        return new ServerLocation();
+    }
+
+    static bool TryProbeServerDir(string dirPath, out ServerLocation location)
+    {
+        location = new ServerLocation();
+        if (string.IsNullOrWhiteSpace(dirPath) || !Directory.Exists(dirPath))
+        {
+            return false;
+        }
+
+        string fullDir = Path.GetFullPath(dirPath);
+        string scriptPath = Path.Combine(fullDir, "hifiserver.py");
+        string launcherPath = Path.Combine(fullDir, LauncherScriptName);
+
+        if (!File.Exists(scriptPath) && !File.Exists(launcherPath))
+        {
+            return false;
+        }
+
+        string venvPython = OperatingSystem.IsWindows()
+            ? Path.Combine(fullDir, ".venv", "Scripts", "python.exe")
+            : Path.Combine(fullDir, ".venv", "bin", "python");
+
+        location.ServerRoot = fullDir;
+        location.ScriptPath = File.Exists(scriptPath) ? scriptPath : "";
+        location.LauncherScript = File.Exists(launcherPath) ? launcherPath : "";
+        location.PythonExe = File.Exists(venvPython) ? venvPython : "";
+        return true;
+    }
+
+    static async Task<FileStream?> TryAcquireStartupLockAsync(int port, TimeSpan timeout)
+    {
+        string userTag = (Environment.UserName ?? "user");
+        foreach (char c in Path.GetInvalidFileNameChars())
+        {
+            userTag = userTag.Replace(c, '_');
+        }
+        string lockFilePath = Path.Combine(Path.GetTempPath(), $"hifisampler-client-startup-{port}-{userTag}.lock");
+        var sw = Stopwatch.StartNew();
+        while (sw.Elapsed < timeout)
+        {
+            try
+            {
+                return new FileStream(lockFilePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+            }
+            catch (IOException)
+            {
+                await Task.Delay(150);
+            }
+            catch (UnauthorizedAccessException)
+            {
+                await Task.Delay(150);
+            }
+        }
+        return null;
+    }
+
+    static string BuildJsonPayload(string[] args)
+    {
+        var sb = new StringBuilder(256);
+        sb.Append("{\"args\":[");
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (i > 0) sb.Append(',');
+            sb.Append('"');
+            string s = args[i] ?? "";
+            foreach (char c in s)
+            {
+                switch (c)
+                {
+                    case '"': sb.Append("\\\""); break;
+                    case '\\': sb.Append("\\\\"); break;
+                    case '\b': sb.Append("\\b"); break;
+                    case '\f': sb.Append("\\f"); break;
+                    case '\n': sb.Append("\\n"); break;
+                    case '\r': sb.Append("\\r"); break;
+                    case '\t': sb.Append("\\t"); break;
+                    default:
+                        if (char.IsControl(c))
+                            sb.Append($"\\u{(int)c:x4}");
+                        else
+                            sb.Append(c);
+                        break;
+                }
+            }
+            sb.Append('"');
+        }
+        sb.Append("]}");
+        return sb.ToString();
+    }
+
     static async Task CommunicateWithServer(string[] args)
     {
         int maxRetries = 2;
         int retryDelayMs = 800;
-        HttpResponseMessage response = null;
         bool requestSucceeded = false;
+        string jsonPayload = BuildJsonPayload(args);
+
         for (int attempt = 1; attempt <= maxRetries + 1; attempt++)
         {
             try
             {
-                var postFields = string.Join(" ", args);
-                var content = new StringContent(postFields, Encoding.UTF8, "application/x-www-form-urlencoded");
-                Console.WriteLine($"[Communicate] Attempting POST (Attempt {attempt}/{maxRetries + 1})...");
-                response = await PostClient.PostAsync($"http://127.0.0.1:{TargetPort}/", content);
+                using var content = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
+                Console.WriteLine($"[Communicate] Sending POST (Attempt {attempt}/{maxRetries + 1})...");
+                using HttpResponseMessage response = await PostClient.PostAsync($"http://127.0.0.1:{TargetPort}/", content);
                 if (response.IsSuccessStatusCode)
                 {
                     Console.WriteLine($"[Communicate] Success (Attempt {attempt}, Status: {(int)response.StatusCode})");
@@ -240,11 +330,11 @@ class Program
                 else
                 {
                     string responseBody = response.Content == null ? "[No Body]" : await response.Content.ReadAsStringAsync();
-                    Console.Error.WriteLine($"[Communicate] Error (Attempt {attempt}): Server Status: {(int)response.StatusCode} {response.ReasonPhrase}");
-                    Console.Error.WriteLine($"[Communicate] Response Body: {responseBody.Substring(0, Math.Min(responseBody.Length, 500))}{(responseBody.Length > 500 ? "..." : "")}");
-                    if ((response.StatusCode == HttpStatusCode.ServiceUnavailable || response.StatusCode == HttpStatusCode.InternalServerError) && attempt <= maxRetries)
+                    Console.Error.WriteLine($"[Communicate] Error (Attempt {attempt}): Status {(int)response.StatusCode} {response.ReasonPhrase} - {responseBody}");
+                    // Only retry on 503 ServiceUnavailable (do not retry on 400 Bad Request, 404 Not Found, or 500 Internal Error)
+                    if (response.StatusCode == HttpStatusCode.ServiceUnavailable && attempt <= maxRetries)
                     {
-                        Console.WriteLine($"[Communicate] Retrying potential transient error {(int)response.StatusCode}...");
+                        Console.WriteLine("[Communicate] Server still initializing (503), retrying...");
                     }
                     else
                     {
@@ -256,30 +346,23 @@ class Program
             {
                 Console.Error.WriteLine($"[Communicate] Network Error (Attempt {attempt}): {ex.Message}");
             }
-            catch (TaskCanceledException ex)
+            catch (TaskCanceledException)
             {
-                if (ex.InnerException is TimeoutException || !ex.CancellationToken.IsCancellationRequested)
-                {
-                    Console.Error.WriteLine($"[Communicate] Request Timed Out (Attempt {attempt}).");
-                    break;
-                }
-                else
-                {
-                    Console.Error.WriteLine($"[Communicate] Request Cancelled (Attempt {attempt}): {ex.Message}");
-                    break;
-                }
+                Console.Error.WriteLine($"[Communicate] Request Timed Out (Attempt {attempt}).");
+                break;
             }
             catch (Exception ex)
             {
                 Console.Error.WriteLine($"[Communicate] Unexpected Error (Attempt {attempt}): {ex.GetType().Name} - {ex.Message}");
                 break;
             }
+
             if (!requestSucceeded && attempt <= maxRetries)
             {
-                Console.WriteLine($"[Communicate] Waiting {retryDelayMs}ms before retry #{attempt + 1}...");
                 await Task.Delay(retryDelayMs);
             }
         }
+
         if (!requestSucceeded)
         {
             Console.Error.WriteLine("[Communicate] Failed after all attempts.");
@@ -287,157 +370,205 @@ class Program
         }
     }
 
-    // --- Readiness Check Function (GET /) ---
     static async Task<bool> IsServerReady(int port)
     {
-        HttpClient checkClient = null;
         try
         {
-            checkClient = CheckClientFactory();
-            HttpResponseMessage response = await checkClient.GetAsync($"http://127.0.0.1:{port}/");
+            using HttpClient checkClient = CheckClientFactory();
+            using HttpResponseMessage response = await checkClient.GetAsync($"http://127.0.0.1:{port}/");
             return response.StatusCode == HttpStatusCode.OK;
         }
         catch
         {
             return false;
         }
-        finally
-        {
-            checkClient?.Dispose();
-        }
     }
 
-    // --- Wait Function (Polls IsServerReady) ---
     static async Task<bool> WaitForServerToStart(int port, int timeoutSeconds, string logPrefix = "[WaitForServer]")
     {
-        Console.WriteLine($"{logPrefix} Waiting up to {timeoutSeconds}s for server at port {port} to be ready (GET / returns 200 OK)...");
+        Console.WriteLine($"{logPrefix} Waiting up to {timeoutSeconds}s for server at port {port}...");
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
         var sw = Stopwatch.StartNew();
-        bool loggedPortInfo = false;
         while (!cts.IsCancellationRequested)
         {
             if (await IsServerReady(port))
             {
-                Console.WriteLine($"\n{logPrefix} Server became ready after {sw.Elapsed.TotalSeconds:F1}s.");
+                Console.WriteLine($"{logPrefix} Server became ready after {sw.Elapsed.TotalSeconds:F1}s.");
                 return true;
             }
-            if (!loggedPortInfo && sw.Elapsed.TotalSeconds > 2)
-            {
-                loggedPortInfo = true;
-                if (IsPortInUse(port))
-                {
-                    Console.WriteLine($"{logPrefix} Port {port} is open, waiting for application readiness...");
-                }
-                else
-                {
-                    Console.WriteLine($"{logPrefix} Port {port} is not open yet...");
-                }
-            }
-            if ((int)sw.Elapsed.TotalSeconds % 5 == 1) Console.Write(".");
             try
             {
-                await Task.Delay(TimeSpan.FromMilliseconds(500), cts.Token);
+                await Task.Delay(TimeSpan.FromMilliseconds(400), cts.Token);
             }
             catch (TaskCanceledException)
             {
                 break;
             }
         }
-        Console.WriteLine($"\n{logPrefix} Server did not become ready within {timeoutSeconds}s.");
+        Console.WriteLine($"{logPrefix} Server did not become ready within {timeoutSeconds}s.");
         return false;
     }
 
-    // --- Basic Port Check (Used ONLY inside mutex) ---
     static bool IsPortInUse(int port)
     {
         const int timeoutMs = 150;
-        Socket socket = null;
         try
         {
-            socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
             var result = socket.BeginConnect("127.0.0.1", port, null, null);
-            bool success = result.AsyncWaitHandle.WaitOne(timeoutMs);
-            if (success)
+            if (result.AsyncWaitHandle.WaitOne(timeoutMs))
             {
                 socket.EndConnect(result);
                 return true;
             }
-            else
-            {
-                return false;
-            }
+            return false;
         }
         catch
         {
             return false;
         }
-        finally
-        {
-            socket?.Close();
-            socket?.Dispose();
-        }
     }
 
-    // --- Server Launcher (Revised for VISIBLE Window) ---
-    static void LaunchServerLauncher(string launcherScriptPath)
+    static void LaunchServerProcess(ServerLocation loc)
     {
-        if (string.IsNullOrEmpty(launcherScriptPath) || !File.Exists(launcherScriptPath))
+        string workingDir = loc.ServerRoot;
+        bool hasDirectVenv = !string.IsNullOrEmpty(loc.PythonExe) && File.Exists(loc.PythonExe)
+                             && !string.IsNullOrEmpty(loc.ScriptPath) && File.Exists(loc.ScriptPath);
+
+        if (OperatingSystem.IsWindows())
         {
-            throw new FileNotFoundException("Launcher script path invalid.", launcherScriptPath);
+            string innerCmd = hasDirectVenv
+                ? $"\"\"{loc.PythonExe}\" \"{loc.ScriptPath}\"\""
+                : $"\"\"{loc.LauncherScript}\"\"";
+
+            string arguments =
+                $"/C start \"HifiSampler Server\" /D \"{workingDir}\" cmd /C \"title HifiSampler Server & echo Starting HifiSampler Server... & {innerCmd} & echo. & echo Server process finished. & pause\"";
+
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = "cmd.exe",
+                Arguments = arguments,
+                WorkingDirectory = workingDir,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            });
+            Console.WriteLine($"[LaunchServer] Started Windows server console in '{workingDir}'.");
+            return;
         }
-        Console.WriteLine($"[LaunchServerLauncher] Attempting launch (visible window): '{launcherScriptPath}'");
-        string command, arguments;
-        string workingDir = Path.GetDirectoryName(launcherScriptPath) ?? ".";
-        bool useShellExecute = false;
-        try
+
+        if (OperatingSystem.IsLinux() || OperatingSystem.IsMacOS())
         {
-            if (OperatingSystem.IsWindows())
+            string targetExec = hasDirectVenv
+                ? $"{QuotePosixSingle(loc.PythonExe)} {QuotePosixSingle(loc.ScriptPath)}"
+                : $"bash {QuotePosixSingle(loc.LauncherScript)}";
+
+            string interactiveCmd =
+                $"cd {QuotePosixSingle(workingDir)} && echo 'Starting HifiSampler Server...' && {targetExec} ; echo ; echo 'Server exited. Press Enter to close.' ; read -r _";
+
+            bool hasGuiSession = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("DISPLAY"))
+                                 || !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WAYLAND_DISPLAY"));
+
+            if (hasGuiSession)
             {
-                command = "cmd.exe";
-                arguments = $"/C start \"HifiSampler Server\" /D \"{workingDir}\" cmd /C \"title HifiSampler Server & echo Starting server... & \"{launcherScriptPath}\" & echo. & echo Server process finished. & pause\"";
-                useShellExecute = false;
-                Process.Start(new ProcessStartInfo { FileName = command, Arguments = arguments, WorkingDirectory = workingDir, UseShellExecute = useShellExecute, CreateNoWindow = true });
-            }
-            else if (OperatingSystem.IsLinux() || OperatingSystem.IsMacOS())
-            {
-                string scriptCmd = $"echo Starting HifiSampler Server... ; \\\"{launcherScriptPath}\\\" ; echo ; echo Server process finished. Press Enter to close terminal. ; read -p ''";
-                string bashCmd = $"bash -c '{scriptCmd}'";
-                var terminals = new[] { new { Name = "gnome-terminal", Arg = "--", Cmd = bashCmd }, new { Name = "konsole", Arg = "-e", Cmd = bashCmd }, new { Name = "xfce4-terminal", Arg = "--command", Cmd = bashCmd }, new { Name = "mate-terminal", Arg = "-e", Cmd = bashCmd }, new { Name = "terminator", Arg = "-e", Cmd = bashCmd }, new { Name = "lxterminal", Arg = "-e", Cmd = bashCmd }, new { Name = "xterm", Arg = "-e", Cmd = bashCmd } };
-                bool launched = false;
+                var terminals = new (string Name, string[] PrefixArgs)[]
+                {
+                    ("ptyxis", new[] { "--", "bash", "-c", interactiveCmd }),
+                    ("kgx", new[] { "--", "bash", "-c", interactiveCmd }),
+                    ("gnome-terminal", new[] { "--", "bash", "-c", interactiveCmd }),
+                    ("konsole", new[] { "-e", "bash", "-c", interactiveCmd }),
+                    ("kitty", new[] { "bash", "-c", interactiveCmd }),
+                    ("alacritty", new[] { "-e", "bash", "-c", interactiveCmd }),
+                    ("wezterm", new[] { "start", "--", "bash", "-c", interactiveCmd }),
+                    ("foot", new[] { "bash", "-c", interactiveCmd }),
+                    ("xfce4-terminal", new[] { "-x", "bash", "-c", interactiveCmd }),
+                    ("mate-terminal", new[] { "-x", "bash", "-c", interactiveCmd }),
+                    ("terminator", new[] { "-x", "bash", "-c", interactiveCmd }),
+                    ("lxterminal", new[] { "-e", "bash", "-c", interactiveCmd }),
+                    ("xterm", new[] { "-e", "bash", "-c", interactiveCmd }),
+                };
+
                 foreach (var term in terminals)
                 {
-                    Process checkProc = null;
-                    try
+                    if (CommandExistsPosix(term.Name))
                     {
-                        ProcessStartInfo checkPsi = new ProcessStartInfo("which", term.Name) { RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true };
-                        checkProc = Process.Start(checkPsi);
-                        checkProc?.WaitForExit(500);
-                        if (checkProc?.ExitCode == 0)
+                        try
                         {
-                            Console.WriteLine($"[LaunchServerLauncher] Found terminal: {term.Name}. Launching...");
-                            Process.Start(new ProcessStartInfo { FileName = term.Name, Arguments = $"{term.Arg} {term.Cmd}", WorkingDirectory = workingDir, UseShellExecute = true, CreateNoWindow = false });
-                            launched = true;
-                            break;
+                            var psi = new ProcessStartInfo
+                            {
+                                FileName = CommandExistsPosix("setsid") ? "setsid" : term.Name,
+                                WorkingDirectory = workingDir,
+                                UseShellExecute = false,
+                                CreateNoWindow = false,
+                            };
+                            if (psi.FileName == "setsid")
+                            {
+                                psi.ArgumentList.Add(term.Name);
+                            }
+                            foreach (string arg in term.PrefixArgs)
+                            {
+                                psi.ArgumentList.Add(arg);
+                            }
+                            Process.Start(psi);
+                            Console.WriteLine($"[LaunchServer] Launched server in detached GUI terminal: {term.Name}");
+                            return;
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.Error.WriteLine($"[LaunchServer] Terminal '{term.Name}' failed ({ex.Message}), trying next...");
                         }
                     }
-                    catch { }
-                    finally
-                    {
-                        checkProc?.Dispose();
-                    }
                 }
-                if (!launched) throw new NotSupportedException("Could not find supported graphical terminal.");
             }
-            else
+
+            // Fallback: Detached background daemon logging to logs/hifiserver.log
+            string logDir = Path.Combine(workingDir, "logs");
+            Directory.CreateDirectory(logDir);
+            string logFile = Path.Combine(logDir, "hifiserver.log");
+            string bgCmd = $"cd {QuotePosixSingle(workingDir)} && exec {targetExec} >> {QuotePosixSingle(logFile)} 2>&1 < /dev/null";
+
+            var bgPsi = new ProcessStartInfo
             {
-                throw new PlatformNotSupportedException("Unsupported OS for launching server window.");
-            }
-            Console.WriteLine($"[LaunchServerLauncher] Server launch command issued.");
+                FileName = CommandExistsPosix("setsid") ? "setsid" : "nohup",
+                WorkingDirectory = workingDir,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            bgPsi.ArgumentList.Add("bash");
+            bgPsi.ArgumentList.Add("-c");
+            bgPsi.ArgumentList.Add(bgCmd);
+            Process.Start(bgPsi);
+            Console.WriteLine($"[LaunchServer] Launched detached background server (log: {logFile}).");
+            return;
         }
-        catch (Exception ex)
+
+        throw new PlatformNotSupportedException("Unsupported operating system.");
+    }
+
+    static string QuotePosixSingle(string value)
+    {
+        return "'" + (value ?? "").Replace("'", "'\\''") + "'";
+    }
+
+    static bool CommandExistsPosix(string commandName)
+    {
+        try
         {
-            Console.Error.WriteLine($"[LaunchServerLauncher] Launch failure: {ex.Message}");
-            throw;
+            var psi = new ProcessStartInfo("sh")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            psi.ArgumentList.Add("-c");
+            psi.ArgumentList.Add($"command -v \"{commandName}\" >/dev/null 2>&1");
+            using var proc = Process.Start(psi);
+            proc?.WaitForExit(500);
+            return proc?.ExitCode == 0;
+        }
+        catch
+        {
+            return false;
         }
     }
 }
