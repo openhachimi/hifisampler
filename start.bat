@@ -1,7 +1,14 @@
 @echo off
 setlocal
+cd /d "%~dp0"
 
-rem --- 设置和验证 uv 环境 ---
+rem --- Fast path: if .venv already exists, start hifiserver.py directly ---
+if exist ".venv\Scripts\python.exe" (
+    ".venv\Scripts\python.exe" hifiserver.py %*
+    goto :eof
+)
+
+rem --- First-time setup: ensure uv is installed and run hifiserver.py ---
 call :SetupUv
 if %errorlevel% neq 0 (
     echo.
@@ -10,8 +17,7 @@ if %errorlevel% neq 0 (
     goto :eof
 )
 
-rem --- 启动服务 ---
-uv run launch_server.py
+uv run hifiserver.py %*
 
 endlocal
 goto :eof
@@ -19,35 +25,30 @@ goto :eof
 
 :SetupUv
     echo --- Checking for uv...
-    
-    rem 尝试直接执行 uv，如果成功，说明一切就绪，直接返回
     uv --version >nul 2>&1
     if %errorlevel% equ 0 (
         echo uv is already installed and accessible.
         exit /b 0
     )
 
-    rem 如果命令失败，则开始安装流程
-    echo uv not found or not working. Attempting to install...
+    if exist "%USERPROFILE%\.local\bin\uv.exe" (
+        set "PATH=%USERPROFILE%\.local\bin;%PATH%"
+        exit /b 0
+    )
+
+    echo uv not found. Attempting to install...
     powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://astral.sh/uv/install.ps1 | iex"
     if %errorlevel% neq 0 (
-        echo Error: Failed to execute uv installation script. Please check your internet connection or PowerShell settings.
+        echo Error: Failed to execute uv installation script.
         exit /b 1
     )
 
-    rem 安装后，更新当前会话的 PATH
-    echo Installation script finished. Updating PATH for this session...
     set "UV_BIN_PATH=%USERPROFILE%\.local\bin"
     set "PATH=%UV_BIN_PATH%;%PATH%"
 
-    rem 再次验证，确保安装和路径设置都已生效
-    echo Verifying installation...
-    uv --version
+    uv --version >nul 2>&1
     if %errorlevel% neq 0 (
-        echo Error: uv was installed but is still not working after PATH update.
-        echo Please check the installation path is correct: %UV_BIN_PATH%
+        echo Error: uv was installed but is still not accessible in %UV_BIN_PATH%.
         exit /b 1
     )
-
-    echo Verification successful!
     exit /b 0
