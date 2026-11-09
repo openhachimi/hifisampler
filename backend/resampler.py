@@ -159,9 +159,6 @@ class Resampler:
             logging.info('Null output file. Skipping...')
             return
 
-        mod = self.modulation / 100
-        logging.debug(f"mod: {mod}")
-
         self.out_file = Path(self.out_file)
 
         scale = features['scale']
@@ -417,11 +414,11 @@ class Resampler:
                     render = loudness_norm(
                         render, CONFIG.sample_rate, peak=-1, loudness=-16.0, block_size=0.400)
 
+        volume_scale = self.volume / 100.0
+        render = render * volume_scale
+
         new_max = np.max(np.abs(render)) if len(render) > 0 else 0.0
         if new_max > CONFIG.peak_limit and new_max > 1e-8:
             render = render * (CONFIG.peak_limit / new_max)
-
-        volume_scale = self.volume / 100.0
-        render = render * volume_scale
 
         save_wav(self.out_file, render)

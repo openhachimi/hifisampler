@@ -1,5 +1,7 @@
 import logging
+import os
 from pathlib import Path
+import uuid
 import numpy as np
 import resampy
 import torch
@@ -194,22 +196,14 @@ def pre_emphasis_base_tension(wave, b):
         window=window,
         return_complex=True
     )
-    spec_amp = torch.abs(spec)
-    spec_phase = torch.atan2(spec.imag, spec.real)
-
-    spec_amp_db = torch.log(torch.clamp(spec_amp, min=1e-9))
 
     fft_bin = CONFIG.n_fft // 2 + 1
     x0 = fft_bin / ((CONFIG.sample_rate / 2) / 1500)
     freq_filter = (-b / x0) * torch.arange(0, fft_bin, device=wave.device, dtype=torch.float32) + b
-    spec_amp_db = spec_amp_db + \
-        torch.clamp(freq_filter, min=-2, max=2).unsqueeze(0).unsqueeze(2)
-
-    spec_amp = torch.exp(spec_amp_db)
+    gain = torch.exp(torch.clamp(freq_filter, min=-2, max=2)).unsqueeze(0).unsqueeze(2)
 
     filtered_wave = torch.istft(
-        torch.complex(spec_amp * torch.cos(spec_phase),
-                      spec_amp * torch.sin(spec_phase)),
+        spec * gain,
         n_fft=CONFIG.n_fft,
         hop_length=CONFIG.hop_size,
         win_length=CONFIG.win_size,
@@ -281,7 +275,7 @@ def read_wav(loc):
 
 
 def save_wav(loc, x):
-    """Save data into a WAV file.
+    """Atomically save audio data into a 16-bit PCM WAV file.
 
     Parameters
     ----------
@@ -290,15 +284,18 @@ def save_wav(loc, x):
 
     x : ndarray
         Audio data in 44.1kHz within [-1, 1].
-
-    Returns
-    -------
-    None
     """
+    out_path = Path(loc)
+    tmp_path = out_path.with_name(f".{out_path.name}.{uuid.uuid4().hex}.tmp")
     try:
-        out_path = Path(loc)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        sf.write(str(out_path), x, CONFIG.sample_rate, 'PCM_16')
+        sf.write(str(tmp_path), x, CONFIG.sample_rate, subtype='PCM_16', format='WAV')
+        os.replace(str(tmp_path), str(out_path))
     except Exception as e:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
         logging.error(f"Error saving WAV file {loc}: {e}")
         raise
