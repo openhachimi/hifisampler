@@ -11,6 +11,8 @@
 TestResults/
 Properties/
 *.log
+logs/
+dist/
 *.tmp
 *.bak
 *.cache

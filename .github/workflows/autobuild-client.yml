@@ -1,9 +1,10 @@
 name: Build clients for multiple platforms when released
 
-# triggers when a new release is created
+# triggers when a new release is created or manually dispatched
 on:
   release:
     types: [created]
+  workflow_dispatch:
 
 jobs:
   compile:
@@ -64,9 +65,16 @@ jobs:
           cp ../hifisampler.yaml ./release_assets/hifisampler.yaml
         fi
 
+    # upload build artifact for workflow_dispatch or inspection
+    - name: Upload build artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: client-${{ matrix.rid }}
+        path: ./client/release_assets/*
+
     # upload to release
     - name: Upload to release
       uses: softprops/action-gh-release@v2
-      if: github.ref_type == 'tag'
+      if: github.event_name == 'release' && github.ref_type == 'tag'
       with:
         files: ./client/release_assets/*

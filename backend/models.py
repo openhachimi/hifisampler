@@ -71,6 +71,11 @@ def initialize_models():
 
     hnsep_result = hnsep_loader.load_model()
     hnsep_model, hnsep_type, _ = hnsep_result
+    if hnsep_type == "onnx" and not ort_uses_gpu:
+        try:
+            ort_uses_gpu = hnsep_model.session.get_providers()[0] != "CPUExecutionProvider"
+        except Exception:
+            pass
 
     mel_analyzer = PitchAdjustableMelSpectrogram(
         sample_rate=CONFIG.sample_rate,
