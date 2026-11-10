@@ -4,6 +4,7 @@ using System.IO;
 using System.Net;
 using System.Net.Http;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -11,6 +12,56 @@ using System.Threading.Tasks;
 
 class Program
 {
+    private const uint CREATE_NEW_CONSOLE = 0x00000010;
+    private const uint CREATE_NEW_PROCESS_GROUP = 0x00000200;
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct STARTUPINFOW
+    {
+        public int cb;
+        public string? lpReserved;
+        public string? lpDesktop;
+        public string? lpTitle;
+        public int dwX;
+        public int dwY;
+        public int dwXSize;
+        public int dwYSize;
+        public int dwXCountChars;
+        public int dwYCountChars;
+        public int dwFillAttribute;
+        public int dwFlags;
+        public short wShowWindow;
+        public short cbReserved2;
+        public IntPtr lpReserved2;
+        public IntPtr hStdInput;
+        public IntPtr hStdOutput;
+        public IntPtr hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PROCESS_INFORMATION
+    {
+        public IntPtr hProcess;
+        public IntPtr hThread;
+        public int dwProcessId;
+        public int dwThreadId;
+    }
+
+    [DllImport("kernel32.dll", EntryPoint = "CreateProcessW", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool CreateProcessW(
+        string? lpApplicationName,
+        string lpCommandLine,
+        IntPtr lpProcessAttributes,
+        IntPtr lpThreadAttributes,
+        bool bInheritHandles,
+        uint dwCreationFlags,
+        IntPtr lpEnvironment,
+        string? lpCurrentDirectory,
+        ref STARTUPINFOW lpStartupInfo,
+        out PROCESS_INFORMATION lpProcessInformation);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr hObject);
     static readonly HttpClient PostClient = new HttpClient(new SocketsHttpHandler
     {
         ConnectTimeout = TimeSpan.FromMilliseconds(300),
@@ -572,22 +623,46 @@ class Program
 
         if (OperatingSystem.IsWindows())
         {
-            string targetCmd = hasDirectVenv
+            string cmdLine = hasDirectVenv
                 ? $"\"{loc.PythonExe}\" \"{loc.ScriptPath}\""
-                : $"\"{loc.LauncherScript}\"";
+                : $"cmd.exe /C \"\"{loc.LauncherScript}\"\"";
 
-            string arguments =
-                $"/C start \"HifiSampler Server\" /D \"{workingDir}\" {targetCmd}";
-
-            using var winProc = Process.Start(new ProcessStartInfo
+            var si = new STARTUPINFOW
             {
-                FileName = "cmd.exe",
-                Arguments = arguments,
-                WorkingDirectory = workingDir,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-            });
-            Console.WriteLine($"[LaunchServer] Started Windows server console in '{workingDir}'.");
+                cb = Marshal.SizeOf<STARTUPINFOW>(),
+                lpTitle = "HifiSampler Server"
+            };
+
+            // CRITICAL: bInheritHandles MUST be false so the long-running server process
+            // never inherits OpenUtau's redirected stdout/stderr anonymous pipe handles.
+            bool created = CreateProcessW(
+                lpApplicationName: null,
+                lpCommandLine: cmdLine,
+                lpProcessAttributes: IntPtr.Zero,
+                lpThreadAttributes: IntPtr.Zero,
+                bInheritHandles: false,
+                dwCreationFlags: CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP,
+                lpEnvironment: IntPtr.Zero,
+                lpCurrentDirectory: workingDir,
+                ref si,
+                out PROCESS_INFORMATION pi);
+
+            if (!created)
+            {
+                int err = Marshal.GetLastWin32Error();
+                throw new InvalidOperationException($"CreateProcessW failed with Win32 error {err} when launching '{cmdLine}'.");
+            }
+
+            if (pi.hProcess != IntPtr.Zero)
+            {
+                CloseHandle(pi.hProcess);
+            }
+            if (pi.hThread != IntPtr.Zero)
+            {
+                CloseHandle(pi.hThread);
+            }
+
+            Console.WriteLine($"[LaunchServer] Started Windows server console (PID {pi.dwProcessId}) in '{workingDir}'.");
             return;
         }
 
@@ -622,28 +697,32 @@ class Program
                     ("xterm", new[] { "-e", "bash", "-c", interactiveCmd }),
                 };
 
+                string setsidPrefix = CommandExistsPosix("setsid") ? "setsid " : "";
                 foreach (var term in terminals)
                 {
                     if (CommandExistsPosix(term.Name))
                     {
                         try
                         {
-                            var psi = new ProcessStartInfo
-                            {
-                                FileName = CommandExistsPosix("setsid") ? "setsid" : term.Name,
-                                WorkingDirectory = workingDir,
-                                UseShellExecute = false,
-                                CreateNoWindow = false,
-                            };
-                            if (psi.FileName == "setsid")
-                            {
-                                psi.ArgumentList.Add(term.Name);
-                            }
+                            var sb = new StringBuilder();
+                            sb.Append(setsidPrefix).Append(QuotePosixSingle(term.Name));
                             foreach (string arg in term.PrefixArgs)
                             {
-                                psi.ArgumentList.Add(arg);
+                                sb.Append(' ').Append(QuotePosixSingle(arg));
                             }
+                            sb.Append(" >/dev/null 2>&1 </dev/null &");
+
+                            var psi = new ProcessStartInfo
+                            {
+                                FileName = "/bin/sh",
+                                WorkingDirectory = workingDir,
+                                UseShellExecute = false,
+                                CreateNoWindow = true,
+                            };
+                            psi.ArgumentList.Add("-c");
+                            psi.ArgumentList.Add(sb.ToString());
                             using var termProc = Process.Start(psi);
+                            termProc?.WaitForExit(2000);
                             Console.WriteLine($"[LaunchServer] Launched server in detached GUI terminal: {term.Name}");
                             return;
                         }
@@ -659,19 +738,20 @@ class Program
             string logDir = Path.Combine(workingDir, "logs");
             Directory.CreateDirectory(logDir);
             string logFile = Path.Combine(logDir, "hifiserver.log");
-            string bgCmd = $"cd {QuotePosixSingle(workingDir)} && exec {targetExec} >> {QuotePosixSingle(logFile)} 2>&1 < /dev/null";
+            string detachPrefix = CommandExistsPosix("setsid") ? "setsid" : "nohup";
+            string bgCmd = $"{detachPrefix} bash -c {QuotePosixSingle($"cd {QuotePosixSingle(workingDir)} && exec {targetExec}")} >> {QuotePosixSingle(logFile)} 2>&1 </dev/null &";
 
             var bgPsi = new ProcessStartInfo
             {
-                FileName = CommandExistsPosix("setsid") ? "setsid" : "nohup",
+                FileName = "/bin/sh",
                 WorkingDirectory = workingDir,
                 UseShellExecute = false,
                 CreateNoWindow = true,
             };
-            bgPsi.ArgumentList.Add("bash");
             bgPsi.ArgumentList.Add("-c");
             bgPsi.ArgumentList.Add(bgCmd);
             using var bgProc = Process.Start(bgPsi);
+            bgProc?.WaitForExit(2000);
             Console.WriteLine($"[LaunchServer] Launched detached background server (log: {logFile}).");
             return;
         }
