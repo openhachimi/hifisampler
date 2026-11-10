@@ -1,3 +1,4 @@
+import contextlib
 import logging
 import time
 import numpy as np
@@ -8,15 +9,19 @@ from pathlib import Path
 from config import CONFIG
 from backend import models
 from util.growl import growl
-from util.audio import dynamic_range_compression_torch, loudness_norm, pre_emphasis_base_tension, read_wav, save_wav
+from util.audio import _peak_abs, dynamic_range_compression_torch, loudness_norm, pre_emphasis_base_tension, read_wav, save_wav
 from util.parse_utau import flag_re, midi_to_hz, note_to_midi, pitch_string_to_cents
 from util.cache_manager import cache_manager
 
 cache_ext = '.hifi.npz'  # cache file extension
 
 
+def _gpu_lock(use_gpu: bool):
+    return models.gpu_infer_lock if use_gpu else contextlib.nullcontext()
+
+
 class Resampler:
-    def __init__(self, in_file, out_file, pitch, velocity, flags='', offset=0, length=1000, consonant=0, cutoff=0, volume=100, modulation=0, tempo='!100', pitch_string='AA'):
+    def __init__(self, in_file, out_file, pitch, velocity, flags='', offset=0, length=1000, consonant=0, cutoff=0, volume=100, modulation=0, tempo='!100', pitch_string='AA', *, auto_render: bool = True):
         self.in_file = Path(in_file)
         self.out_file = out_file
         self.pitch = note_to_midi(pitch)
@@ -26,15 +31,17 @@ class Resampler:
             if k not in self.flags:
                 self.flags[k] = int(v) if v else None
         self.offset = float(offset)
-        self.length = int(length)
+        self.length = max(1, int(round(float(length))))
         self.consonant = float(consonant)
         self.cutoff = float(cutoff)
         self.volume = float(volume)
         self.modulation = float(modulation)
-        self.tempo = float(tempo[1:]) if str(tempo).startswith('!') else float(tempo)
+        parsed_tempo = float(tempo[1:]) if str(tempo).startswith('!') else float(tempo)
+        self.tempo = max(1.0, parsed_tempo)
         self.pitchbend = pitch_string_to_cents(pitch_string)
 
-        self.render()
+        if auto_render:
+            self.render()
 
     def render(self):
         t0 = time.perf_counter()
@@ -64,14 +71,16 @@ class Resampler:
             features_path = features_path.with_name(
                 f'{self.in_file.stem}{cache_ext}')
 
-        force_generate = 'G' in self.flags.keys()
+        force_generate = self.flags.get('G', 0) != 0
         with cache_manager.get_lock(features_path):
-            features = cache_manager.load_features_cache(features_path, force_generate)
+            features = cache_manager.load_features_cache(features_path, force_generate, source_path=self.in_file)
             if features is not None:
                 return features
             logging.info(f'{features_path.name} not found or forcing generation. Generating features.')
             features = self.generate_features(features_path)
-            return cache_manager.save_features_cache(features_path, features, force_generate=force_generate)
+            return cache_manager.save_features_cache(
+                features_path, features, force_generate=force_generate, source_path=self.in_file
+            )
 
     def _needs_hnsep_separation(self, breath, voicing, tension):
         if tension != 0:
@@ -97,51 +106,50 @@ class Resampler:
         tension = self.flags.get("Ht", 0)
         logging.debug(f'breath: {breath}, voicing: {voicing}, tension: {tension}')
 
+        torch_gpu = getattr(models, 'torch_uses_gpu', CONFIG.device.type != 'cpu')
+        hnsep_gpu = getattr(models, 'hnsep_uses_gpu', False) or torch_gpu
+
         if self._needs_hnsep_separation(breath, voicing, tension):
             logging.debug('Hb, Hv, or Ht flag requires hnsep separation. Split audio into breath, voicing')
 
             hnsep_cache_path = self.in_file.with_name(
                 f'{self.in_file.stem}_hnsep')
 
-            force_generate = 'G' in self.flags.keys()
+            force_generate = self.flags.get('G', 0) != 0
 
             with cache_manager.get_lock(hnsep_cache_path):
-                seg_output = cache_manager.load_hnsep_cache(hnsep_cache_path, str(CONFIG.device), force_generate)
+                seg_output = cache_manager.load_hnsep_cache(
+                    hnsep_cache_path, str(CONFIG.device), force_generate, source_path=self.in_file
+                )
 
                 if seg_output is None:
                     logging.info(f'Generating hnsep features for {hnsep_cache_path.name}')
-                    with models.gpu_infer_lock, torch.inference_mode():
+                    with _gpu_lock(hnsep_gpu), torch.inference_mode():
                         seg_output = models.hnsep_model.predict_fromaudio(wave)
                     seg_output = cache_manager.save_hnsep_cache(
-                        hnsep_cache_path, seg_output, device=str(CONFIG.device), force_generate=force_generate
+                        hnsep_cache_path,
+                        seg_output,
+                        device=str(CONFIG.device),
+                        force_generate=force_generate,
+                        source_path=self.in_file,
                     )
 
             breath = np.clip(breath, 0, 500)
             voicing = np.clip(voicing, 0, 150)
-            if tension != 0:
-                tension = np.clip(tension, -100, 100)
-                wave = (breath/100)*(wave - seg_output) + \
-                    pre_emphasis_base_tension(
-                        (voicing/100)*seg_output, -tension/50)
-            else:
-                wave = (breath/100)*(wave - seg_output) + \
-                    (voicing/100)*seg_output
+            with _gpu_lock(torch_gpu), torch.inference_mode():
+                if tension != 0:
+                    tension = np.clip(tension, -100, 100)
+                    wave = (breath/100)*(wave - seg_output) + \
+                        pre_emphasis_base_tension(
+                            (voicing/100)*seg_output, -tension/50)
+                else:
+                    wave = (breath/100)*(wave - seg_output) + \
+                        (voicing/100)*seg_output
         elif breath != 100 or voicing != 100:
             # 当 breath == voicing 且不等于 100 时，应用简单缩放优化
             logging.debug(f'Hb == Hv ({breath}), applying optimized simple scaling instead of hnsep separation')
-            wave = self._apply_simple_scaling(wave, breath)
-
-        wave = wave.squeeze(1)  # [1, 1, T] -> [1, T], keep on target device
-        wave_max = torch.max(torch.abs(wave))
-        if wave_max >= 0.5:
-            logging.debug('The audio volume is too high. Scaling down to 0.5')
-            # 先缩小到最大0.5
-            scale = 0.5 / wave_max
-            wave = wave * scale
-            scale = scale.item()
-        else:
-            logging.debug('The audio volume is already low enough')
-            scale = 1.0
+            with _gpu_lock(torch_gpu), torch.inference_mode():
+                wave = self._apply_simple_scaling(wave, breath)
 
         gender = self.flags.get("g", 0)
         if gender is None:
@@ -149,10 +157,22 @@ class Resampler:
         gender = np.clip(gender, -100, 100)
         logging.debug(f'gender: {gender}')
 
-        with models.gpu_infer_lock, torch.inference_mode():
+        with _gpu_lock(torch_gpu), torch.inference_mode():
+            wave = wave.squeeze(1)  # [1, 1, T] -> [1, T], keep on target device
+            wave_max = torch.max(torch.abs(wave))
+            if wave_max >= 0.5:
+                logging.debug('The audio volume is too high. Scaling down to 0.5')
+                # 先缩小到最大0.5
+                scale_tensor = 0.5 / wave_max
+                wave = wave * scale_tensor
+                scale = float(scale_tensor.item())
+            else:
+                logging.debug('The audio volume is already low enough')
+                scale = 1.0
+
             mel_origin = models.mel_analyzer(
                 wave,
-                -gender * 0.06, 1).squeeze()
+                -gender * 0.06, 1).squeeze(0)
             logging.debug(f'mel_origin: {mel_origin.shape}')
             mel_origin = dynamic_range_compression_torch(mel_origin).cpu().numpy()
         logging.debug('Features generation completed.')
@@ -209,7 +229,7 @@ class Resampler:
         logging.debug(f'length_req: {length_req}')
         logging.debug(f'stretch_length: {stretch_length}')
 
-        if CONFIG.loop_mode or "He" in self.flags.keys():
+        if CONFIG.loop_mode or self.flags.get("He", 0) != 0:
             # 添加循环拼接模式
             logging.debug('Looping.')
             con_frame = max(0, min(mel_origin.shape[1] - 1, int((con + thop_origin/2)//thop_origin)))
@@ -230,9 +250,6 @@ class Resampler:
                     mel_origin.shape[1]) * thop_origin + thop_origin / 2
                 total_time = t_area_origin[-1] + thop_origin/2
                 logging.debug(f'new_total_time: {total_time}')
-
-        # Make interpolators to render new areas
-        mel_interp = interp.interp1d(t_area_origin, mel_origin, axis=1)
 
         if stretch_length <= 1e-6:
             logging.warning(f'stretch_length ({stretch_length:.4f}s) <= 0, clamping scaling_ratio to 1.0')
@@ -297,7 +314,17 @@ class Resampler:
         logging.debug(f'stretched_t_mel[0]: {stretched_t_mel[0]}')
         logging.debug(f'stretched_t_mel[-1]: {stretched_t_mel[-1]}')
 
-        mel_render = mel_interp(stretch_t_mel)
+        # Vectorized O(N) uniform-grid linear interpolation (replaces scipy.interpolate.interp1d)
+        n_origin = mel_origin.shape[1]
+        if n_origin <= 1:
+            mel_render = np.repeat(mel_origin, len(stretch_t_mel), axis=1)
+        else:
+            pos = (stretch_t_mel - t_area_origin[0]) / thop_origin
+            pos = np.clip(pos, 0.0, float(n_origin - 1))
+            idx0 = np.floor(pos).astype(np.intp)
+            idx1 = np.minimum(idx0 + 1, n_origin - 1)
+            frac = (pos - idx0).astype(mel_origin.dtype)[np.newaxis, :]
+            mel_render = mel_origin[:, idx0] * (1.0 - frac) + mel_origin[:, idx1] * frac
         logging.debug(f'mel_render: {mel_render.shape}')
 
         t = np.arange(mel_render.shape[1]) * thop
@@ -309,12 +336,23 @@ class Resampler:
             t_val = np.clip(self.flags["t"], -120, 120)
             pitch = pitch + t_val / 10
         t_pitch = 60 * np.arange(len(pitch)) / (self.tempo * 96) + new_start
-        pitch_interp = interp.Akima1DInterpolator(t_pitch, pitch)
-        pitch_render = pitch_interp(np.clip(t, new_start, t_pitch[-1]))
-        f0_render = midi_to_hz(pitch_render)
+        if len(pitch) < 2 or np.all(pitch == pitch[0]):
+            const_pitch = float(pitch[0]) if len(pitch) else float(self.pitch)
+            pitch_render = np.full(len(t), const_pitch, dtype=np.float64)
+            f0_render = np.full(len(t), float(midi_to_hz(const_pitch)), dtype=np.float32)
+        else:
+            pitch_interp = interp.Akima1DInterpolator(t_pitch, pitch)
+            pitch_render = pitch_interp(np.clip(t, new_start, t_pitch[-1]))
+            f0_render = midi_to_hz(pitch_render)
         logging.debug(f'f0_render: {f0_render.shape}')
 
         logging.debug('Cutting mel and f0.')
+
+        vocoder_gpu = (
+            getattr(models, 'vocoder_uses_gpu', False)
+            or getattr(models, 'ort_uses_gpu', False)
+            or getattr(models, 'torch_uses_gpu', CONFIG.device.type != 'cpu')
+        )
 
         if CONFIG.model_type == "ckpt":
 
@@ -327,7 +365,7 @@ class Resampler:
 
             logging.debug('Rendering audio.')
 
-            with models.gpu_infer_lock, torch.inference_mode():
+            with _gpu_lock(vocoder_gpu), torch.inference_mode():
                 wav_con = models.vocoder.spec2wav_torch(mel_render.to(
                     CONFIG.device), f0=f0_render.to(CONFIG.device))
             cut_l = max(0, int(new_start * CONFIG.sample_rate))
@@ -345,16 +383,10 @@ class Resampler:
             logging.debug(f'render: {render.shape}')
         elif CONFIG.model_type == "onnx":
             logging.debug('Rendering audio.')
-            f0 = f0_render.astype(np.float32)
-            mel = mel_render.astype(np.float32)
-            # 给mel和f0添加batched维度
-            mel = np.expand_dims(mel, axis=0).transpose(0, 2, 1)
-            f0 = np.expand_dims(f0, axis=0)
-            input_data = {'mel': mel, 'f0': f0, }
-            if CONFIG.device.type != 'cpu' or getattr(models, 'ort_uses_gpu', False):
-                with models.gpu_infer_lock:
-                    output = models.ort_session.run(['waveform'], input_data)[0]
-            else:
+            mel = np.ascontiguousarray(mel_render.T[np.newaxis, :, :], dtype=np.float32)
+            f0 = np.ascontiguousarray(f0_render[np.newaxis, :], dtype=np.float32)
+            input_data = {'mel': mel, 'f0': f0}
+            with _gpu_lock(vocoder_gpu):
                 output = models.ort_session.run(['waveform'], input_data)[0]
             wav_con = output[0]
 
@@ -375,13 +407,13 @@ class Resampler:
             raise ValueError(f"Unsupported model type: {CONFIG.model_type}")
 
         # 添加幅度调制
-        A_flag = self.flags.get('A', 0)
+        A_flag = self.flags.get('A') or 0
         if A_flag != 0:
             logging.debug(f'Applying Amplitude Modulation A={A_flag}')
             A_clamped = np.clip(A_flag, -100, 100)
 
             if len(pitch_render) > 1 and len(t) > 1 and len(render) > 0:
-                pitch_derivative = np.gradient(pitch_render, t)
+                pitch_derivative = np.gradient(pitch_render, thop)
                 gain_at_mel_frames = 5**((10**-4) *
                                          A_clamped * pitch_derivative)
                 num_samples = len(render)
@@ -393,7 +425,7 @@ class Resampler:
                                               gain_at_mel_frames,
                                               # Value for time < t[0]
                                               left=gain_at_mel_frames[0],
-                                              right=gain_at_mel_frames[-1])  # Value for time > t[-1]
+                                              right=gain_at_mel_frames[-1]).astype(np.float32, copy=False)  # Value for time > t[-1]
 
                 render = render * interpolated_gain
                 logging.debug('Amplitude modulation applied.')
@@ -401,13 +433,15 @@ class Resampler:
                 logging.warning(
                     "Not enough pitch points (>1) to calculate derivative for Amplitude Modulation.")
 
-        render = render / scale
+        if scale != 1.0:
+            render = render * np.float32(1.0 / scale)
 
         if "HG" in self.flags.keys():
             hg_strength = self.flags['HG']
             if hg_strength is not None and hg_strength > 0:
+                hg_clamped = float(np.clip(hg_strength, 0, 100))
                 render = growl(
-                    render, CONFIG.sample_rate, frequency=80.0, strength=hg_strength/100)
+                    render, CONFIG.sample_rate, frequency=80.0, strength=hg_clamped / 100.0)
 
         # normalize using loudness_norm
         if CONFIG.wave_norm:
@@ -422,10 +456,13 @@ class Resampler:
                         render, CONFIG.sample_rate, peak=-1, loudness=-16.0, block_size=0.400)
 
         volume_scale = self.volume / 100.0
-        render = render * volume_scale
-
-        new_max = np.max(np.abs(render)) if len(render) > 0 else 0.0
-        if new_max > CONFIG.peak_limit and new_max > 1e-8:
-            render = render * (CONFIG.peak_limit / new_max)
+        raw_peak = _peak_abs(render)
+        scaled_peak = raw_peak * abs(volume_scale)
+        if scaled_peak > CONFIG.peak_limit and scaled_peak > 1e-8:
+            final_gain = (volume_scale * CONFIG.peak_limit) / scaled_peak
+        else:
+            final_gain = volume_scale
+        if final_gain != 1.0:
+            render = render * np.float32(final_gain)
 
         save_wav(self.out_file, render)

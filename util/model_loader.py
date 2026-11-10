@@ -40,20 +40,36 @@ def get_onnx_providers():
     return preferred_providers
 
 
-def create_optimized_session_options():
+def create_optimized_session_options(preferred_providers=None):
     """Create optimized ONNX session options."""
     import onnxruntime
 
+    logical_cpus = os.cpu_count() or 2
+    physical_cpus = max(1, logical_cpus // 2)
+    uses_dml = bool(preferred_providers and "DmlExecutionProvider" in preferred_providers)
+    raw_workers = getattr(CONFIG, "max_workers", 2)
+    if str(raw_workers).strip().lower() == "auto":
+        workers = max(1, min(4, physical_cpus))
+    else:
+        try:
+            workers = max(1, int(raw_workers))
+        except (ValueError, TypeError):
+            workers = 2
+    if uses_dml:
+        workers = 1
+
     session_options = onnxruntime.SessionOptions()
-    session_options.execution_mode = onnxruntime.ExecutionMode.ORT_PARALLEL
+    session_options.intra_op_num_threads = max(1, physical_cpus // workers)
+    session_options.inter_op_num_threads = 1
+    session_options.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
     session_options.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
-    session_options.enable_mem_pattern = True
+    session_options.enable_mem_pattern = not uses_dml
     session_options.enable_mem_reuse = True
     session_options.enable_cpu_mem_arena = True
 
     logging.debug(
         f"ONNX Session configured with intra_op_threads={session_options.intra_op_num_threads}, "
-        f"inter_op_threads={session_options.inter_op_num_threads}"
+        f"inter_op_threads={session_options.inter_op_num_threads}, dml={uses_dml}"
     )
     return session_options
 
@@ -70,12 +86,16 @@ def create_onnx_session(actual_path: Path, model_label: str):
     import onnxruntime
 
     preferred_providers = get_onnx_providers()
-    session_options = create_optimized_session_options()
+    session_options = create_optimized_session_options(preferred_providers)
 
     provider_options = []
     for provider in preferred_providers:
         if provider == "CPUExecutionProvider":
             provider_options.append(("CPUExecutionProvider", get_cpu_provider_options()))
+        elif provider == "DmlExecutionProvider":
+            # Disable DirectML MetaCommands so dynamic Mel frame lengths T do not trigger
+            # 20-85s per-shape D3D12 driver shader recompilations on every new note duration.
+            provider_options.append(("DmlExecutionProvider", {"disable_metacommands": "true"}))
         else:
             provider_options.append((provider, {}))
 
@@ -103,7 +123,7 @@ def resolve_model_path(configured_path, default_paths):
 
     for default_path in default_paths:
         if default_path.exists():
-            logging.info(f"Configured path '{model_path}' not found, using default: {default_path}")
+            logging.warning(f"Configured path '{model_path}' not found, using default: {default_path}")
             return default_path
 
     raise FileNotFoundError(f"No model found. Checked {model_path} and defaults: {default_paths}")
@@ -154,9 +174,9 @@ class HNSEPLoader:
 
     def get_default_paths(self):
         return [
-            Path("hnsep/vr/model.pt"),
             Path("hnsep/vr/model_fp16.onnx"),
             Path("hnsep/vr/model.onnx"),
+            Path("hnsep/vr/model.pt"),
         ]
 
     def get_model_config(self, model_path):

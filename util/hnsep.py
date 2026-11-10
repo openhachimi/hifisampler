@@ -1,6 +1,7 @@
 import logging
 import os
 from pathlib import Path
+import numpy as np
 import yaml
 import torch
 from hnsep.nets import CascadedNet
@@ -19,6 +20,11 @@ class HnsepModel:
         self.output_bin = self.n_fft // 2 + 1
         self.offset = 64
         self._window_cache = {}
+        inputs = onnx_session.get_inputs()
+        outputs = onnx_session.get_outputs()
+        self.input_name = inputs[0].name if inputs else 'input'
+        self.input_dtype = np.float16 if (inputs and getattr(inputs[0], 'type', '') == 'tensor(float16)') else np.float32
+        self.output_name = outputs[0].name if outputs else 'output'
 
     def _get_window(self, device: torch.device) -> torch.Tensor:
         key = str(device)
@@ -42,9 +48,9 @@ class HnsepModel:
         else:
             x_input = x
 
-        x_numpy = x_input.detach().cpu().numpy()
+        x_numpy = x_input.detach().cpu().numpy().astype(self.input_dtype, copy=False)
 
-        output = self.session.run(['output'], {'input': x_numpy})[0]
+        output = self.session.run([self.output_name], {self.input_name: x_numpy})[0]
 
         output_tensor = torch.from_numpy(output).to(device=original_device, dtype=torch.float32)
 

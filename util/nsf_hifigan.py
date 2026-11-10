@@ -10,7 +10,7 @@ from torch.nn import Conv1d, ConvTranspose1d
 from torch.nn.utils.parametrizations import weight_norm
 from torch.nn.utils.parametrize import remove_parametrizations
 
-from util.utils import AttrDict, init_weights, get_padding
+from util.utils import AttrDict, get_padding
 
 LRELU_SLOPE = 0.1
 
@@ -82,7 +82,6 @@ class ResBlock1(torch.nn.Module):
             weight_norm(Conv1d(channels, channels, kernel_size, 1, dilation=dilation[2],
                                padding=get_padding(kernel_size, dilation[2])))
         ])
-        self.convs1.apply(init_weights)
 
         self.convs2 = nn.ModuleList([
             weight_norm(Conv1d(channels, channels, kernel_size, 1, dilation=1,
@@ -92,7 +91,6 @@ class ResBlock1(torch.nn.Module):
             weight_norm(Conv1d(channels, channels, kernel_size, 1, dilation=1,
                                padding=get_padding(kernel_size, 1)))
         ])
-        self.convs2.apply(init_weights)
 
     def forward(self, x):
         for c1, c2 in zip(self.convs1, self.convs2):
@@ -120,7 +118,6 @@ class ResBlock2(torch.nn.Module):
             weight_norm(Conv1d(channels, channels, kernel_size, 1, dilation=dilation[1],
                                padding=get_padding(kernel_size, dilation[1])))
         ])
-        self.convs.apply(init_weights)
 
     def forward(self, x):
         for c in self.convs:
@@ -250,12 +247,8 @@ class Generator(torch.nn.Module):
                     self.noise_convs.append(Conv1d(1, ch, kernel_size=1))
             elif i == 1:
                 self.source_conv = Conv1d(1, ch, 1)
-                self.source_conv.apply(init_weights)
 
         self.conv_post = weight_norm(Conv1d(ch, 1, 7, 1, padding=3))
-
-        self.ups.apply(init_weights)
-        self.conv_post.apply(init_weights)
 
     def fastsinegen(self, f0):
         # Always compute phase accumulation in float32 to prevent FP16 cumsum overflow
