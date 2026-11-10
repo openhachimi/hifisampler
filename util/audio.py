@@ -204,11 +204,148 @@ def _get_pre_emphasis_tensors(device: torch.device):
         return cached
 
 
+def _fant_lf_poles(rd: float, f0_ref: float = 240.0):
+    """
+    Compute analytical LF glottal spectral poles (fa, Fg) and open quotient Oq
+    from Fant (1995) 'The LF-model revisited: Transformations and frequency domain analysis'
+    and Doval et al. (2006) 'The spectrum of glottal flow models'.
+    Valid physiological range: Rd in [0.25, 3.00].
+    """
+    rd = float(np.clip(rd, 0.25, 3.00))
+    ra = (-1.0 + 4.8 * rd) / 100.0
+    rk = (22.4 + 11.8 * rd) / 100.0
+    # Fant (1995) Eq. 4: 0.11 * Rd = (0.5 + 1.2 * Rk) * (Rk / (4 * Rg) + Ra)
+    rg_denom = 4.0 * (0.11 * rd - ra * (0.5 + 1.2 * rk))
+    rg = (rk * (0.5 + 1.2 * rk)) / max(rg_denom, 1e-4)
+    oq = (1.0 + rk) / (2.0 * rg)
+
+    fa = f0_ref / (2.0 * np.pi * ra)
+    fg = f0_ref / (2.0 * oq)
+    return fa, fg, oq
+
+
+def _estimate_harmonic_f0(mean_power: torch.Tensor, sr: int, n_fft: int) -> float:
+    """
+    Zero-extra-STFT source fundamental frequency (f0_src) estimator from the
+    voiced-frame mean power spectrum via 1D Wiener-Khinchin autocorrelation.
+    Returns f0_src clamped in [95.0, 580.0] Hz (falls back to 240.0 Hz on silence/noise).
+    """
+    total_power = float(torch.sum(mean_power).item())
+    if total_power < 1e-10:
+        return 240.0
+
+    autocorr = torch.fft.irfft(mean_power, n=n_fft)
+    r0 = float(autocorr[0].item())
+    if r0 <= 1e-10:
+        return 240.0
+
+    lag_min = max(2, int(sr / 580.0))
+    lag_max = min(n_fft // 2 - 2, int(sr / 95.0))
+    if lag_max <= lag_min + 2:
+        return 240.0
+
+    seg = autocorr[lag_min:lag_max + 1]
+    max_val = float(torch.max(seg).item())
+    if max_val < 0.25 * r0:
+        return 240.0
+
+    # Pick the first local peak >= 0.82 * max_val to prevent subharmonic octave-down jumps
+    threshold = 0.82 * max_val
+    is_local_peak = (seg[1:-1] >= seg[:-2]) & (seg[1:-1] >= seg[2:]) & (seg[1:-1] >= threshold)
+    peak_indices = torch.nonzero(is_local_peak, as_tuple=False)
+    if peak_indices.numel() > 0:
+        rel_idx = int(peak_indices[0].item()) + 1
+    else:
+        rel_idx = int(torch.argmax(seg).item())
+
+    tau = lag_min + rel_idx
+    # 3-point parabolic interpolation for sub-sample lag accuracy
+    if 1 <= tau < n_fft // 2 - 1:
+        y_prev = float(autocorr[tau - 1].item())
+        y_curr = float(autocorr[tau].item())
+        y_next = float(autocorr[tau + 1].item())
+        denom = y_prev - 2.0 * y_curr + y_next
+        if abs(denom) > 1e-12:
+            delta = 0.5 * (y_prev - y_next) / denom
+            tau_interp = tau + float(np.clip(delta, -0.5, 0.5))
+        else:
+            tau_interp = float(tau)
+    else:
+        tau_interp = float(tau)
+
+    return float(np.clip(sr / max(tau_interp, 1.0), 95.0, 580.0))
+
+
+def _apply_formant_plateau_protection(
+    log_gain: torch.Tensor,
+    mean_power: torch.Tensor,
+    freqs: torch.Tensor,
+    sr: int,
+    n_fft: int,
+    alpha_prot: float = 0.50,
+) -> torch.Tensor:
+    """
+    Formant-Preserving Slope-Damped Plateau (Option C):
+    Extracts vowel formant peaks (F1, F2, F3) via band-pass cepstral liftering
+    (quefrency q in [4, sr/1200]) and damps the local slope of log_gain across
+    formant peaks while preserving the full macroscopic LF spectral tilt.
+    """
+    if float(torch.sum(mean_power).item()) < 1e-10:
+        return log_gain
+
+    log_spec_mean = 0.5 * torch.log(torch.clamp(mean_power, min=1e-12))
+    cep = torch.fft.irfft(log_spec_mean, n=n_fft)
+
+    q_low = 4
+    q_high = min(n_fft // 2 - 1, max(12, int(sr / 1200.0)))
+    cep_bp = torch.zeros_like(cep)
+    cep_bp[q_low:q_high] = cep[q_low:q_high]
+    cep_bp[-q_high + 1:-q_low + 1] = cep[-q_high + 1:-q_low + 1]
+
+    formant_prominence = torch.fft.rfft(cep_bp, n=n_fft).real
+    vowel_band = (freqs >= 220.0) & (freqs <= 3600.0)
+    pos_prom = torch.relu(formant_prominence) * vowel_band.to(dtype=log_gain.dtype)
+    max_prom = torch.max(pos_prom)
+    if float(max_prom.item()) < 1e-5:
+        return log_gain
+
+    formant_mask = torch.clamp(pos_prom / (max_prom + 1e-6), 0.0, 1.0)
+
+    # Damp local derivative d(log_gain)/df inside formant peak bandwidths [220 Hz, 3600 Hz]
+    dg = log_gain[1:] - log_gain[:-1]
+    mask_mid = 0.5 * (formant_mask[1:] + formant_mask[:-1])
+    low_idx = min(log_gain.numel() - 2, max(1, int(200.0 * n_fft / sr)))
+    ref_idx = min(log_gain.numel() - 1, max(low_idx + 2, int(4500.0 * n_fft / sr)))
+
+    dg_damped = dg.clone()
+    dg_damped[low_idx:ref_idx] = dg[low_idx:ref_idx] * (1.0 - alpha_prot * mask_mid[low_idx:ref_idx])
+
+    # Rescale the damped increments in [low_idx, ref_idx] so the total tilt at ref_idx is 100% preserved
+    orig_span = float(torch.sum(dg[low_idx:ref_idx]).item())
+    damped_span = float(torch.sum(dg_damped[low_idx:ref_idx]).item())
+    if abs(damped_span) > 1e-5:
+        dg_damped[low_idx:ref_idx] = dg_damped[low_idx:ref_idx] * (orig_span / damped_span)
+
+    log_gain_prot = torch.zeros_like(log_gain)
+    log_gain_prot[0] = log_gain[0]
+    log_gain_prot[1:] = log_gain[0] + torch.cumsum(dg_damped, dim=0)
+
+    return log_gain_prot
+
+
 def pre_emphasis_base_tension(wave, b):
     """
+    Clean-room minimum-phase LF glottal spectral tilt filter with wide dynamic range,
+    adaptive source-f0 anchoring, and formant-preserving cepstral liftering (Option C),
+    based on Fant (1995) and Doval et al. (2006).
+
     Args:
-        wave: [1, 1, t]
+        wave: [1, 1, t] periodic harmonic waveform tensor
+        b: float tension parameter (-Ht / 50, in [-2.0, 2.0]; b < 0 is higher tension)
     """
+    if abs(float(b)) < 1e-6:
+        return wave
+
     orig_dtype = wave.dtype
     wave = wave.float()
     original_length = wave.size(-1)
@@ -221,7 +358,7 @@ def pre_emphasis_base_tension(wave, b):
         wave, (0, pad_length), mode='constant', value=0)
     wave = wave.squeeze(1)
 
-    window, arange_bins, fft_bin = _get_pre_emphasis_tensors(wave.device)
+    window, arange_bins, _ = _get_pre_emphasis_tensors(wave.device)
     spec = torch.stft(
         wave,
         CONFIG.n_fft,
@@ -231,23 +368,83 @@ def pre_emphasis_base_tension(wave, b):
         return_complex=True
     )
 
-    x0 = fft_bin / ((CONFIG.sample_rate / 2) / 1500)
-    freq_filter = (-b / x0) * arange_bins + b
-    gain = torch.exp(torch.clamp(freq_filter, min=-2, max=2)).unsqueeze(0).unsqueeze(2)
+    b_clamped = float(np.clip(b, -2.0, 2.0))
+
+    # Compute energy-weighted mean power spectrum across frames for adaptive f0_src and formant liftering
+    power_spec = spec.real ** 2 + spec.imag ** 2  # [1, F, T]
+    frame_energy = torch.sum(power_spec, dim=1, keepdim=True)  # [1, 1, T]
+    total_energy = torch.sum(frame_energy)
+    if float(total_energy.item()) > 1e-10:
+        mean_power = torch.sum(power_spec * frame_energy, dim=2).squeeze(0) / (total_energy + 1e-12)
+    else:
+        mean_power = torch.mean(power_spec, dim=2).squeeze(0)
+
+    f0_src = _estimate_harmonic_f0(mean_power, int(CONFIG.sample_rate), int(CONFIG.n_fft))
+
+    # Wide-range physiological Rd mapping in [0.25, 3.00] around neutral Rd0 = 1.0
+    rd0 = 1.0
+    rd_target = float(np.clip(3.0 ** (b_clamped / 2.0), 0.25, 3.00))
+
+    fa0, _, oq0 = _fant_lf_poles(rd0, f0_ref=f0_src)
+    fa_t, fg_t, oq_t = _fant_lf_poles(rd_target, f0_ref=f0_src)
+
+    freqs = arange_bins * (float(CONFIG.sample_rate) / float(CONFIG.n_fft))
+
+    # 1. Cascade return-phase & open-asymmetry spectral tilt pole ratio (Doval et al. 2006)
+    # Wide dynamic range cascade order for dramatic yet smooth +/-100 excursion
+    tilt_order = 1.85 if b_clamped < 0.0 else 2.25
+    gain_return = torch.pow(
+        (1.0 + (freqs / fa0) ** 2) / (1.0 + (freqs / fa_t) ** 2),
+        0.5 * tilt_order,
+    )
+
+    # 2. Open-phase glottal formant H1-H2 shelf, anchored to unity (0 dB) at DC
+    oq_ratio = (oq_t / oq0) ** 2.8
+    shelf_corner = 2.2 * fg_t
+    gain_open_raw = torch.sqrt(
+        (oq_ratio ** 2 + (freqs / shelf_corner) ** 2) / (1.0 + (freqs / shelf_corner) ** 2)
+    )
+    dc_weight = (freqs ** 2) / (freqs ** 2 + 45.0 ** 2)
+    gain_open = 1.0 + dc_weight * (gain_open_raw - 1.0)
+
+    # 3. High-frequency (>8.5 kHz) ultra-treble protection to prevent boosting >10 kHz hiss
+    log_gain = torch.log(torch.clamp(gain_return * gain_open, min=1e-4))
+    hf_taper = 1.0 / (1.0 + (freqs / 8500.0) ** 2)
+    log_gain = torch.where(
+        log_gain > 0.0,
+        log_gain * (0.72 + 0.28 * hf_taper),
+        log_gain,
+    )
+
+    # 4. Option C: Formant-preserving slope-damped plateau on vowel formants F1/F2/F3
+    log_gain = _apply_formant_plateau_protection(
+        log_gain, mean_power, freqs, int(CONFIG.sample_rate), int(CONFIG.n_fft), alpha_prot=0.50
+    )
+
+    # 5. Minimum-phase complex transfer function via causal real cepstrum folding
+    cepstrum = torch.fft.irfft(log_gain, n=CONFIG.n_fft)
+    cep_min = torch.zeros_like(cepstrum)
+    half_n = CONFIG.n_fft // 2
+    cep_min[0] = cepstrum[0]
+    cep_min[1:half_n] = 2.0 * cepstrum[1:half_n]
+    cep_min[half_n] = cepstrum[half_n]
+    gain = torch.exp(torch.fft.rfft(cep_min, n=CONFIG.n_fft)).unsqueeze(0).unsqueeze(2)
 
     filtered_wave = torch.istft(
         spec * gain,
         n_fft=CONFIG.n_fft,
         hop_length=CONFIG.hop_size,
         win_length=CONFIG.win_size,
-        window=window
+        window=window,
+        length=wave.size(-1),
     )
 
-    original_max = torch.max(torch.abs(wave))
-    filtered_max = torch.max(torch.abs(filtered_wave))
-    if filtered_max > 1e-8:
-        filtered_wave = filtered_wave * \
-            (original_max / filtered_max) * (np.clip(b/(-15), 0, 0.33) + 1)
+    original_rms = torch.sqrt(torch.mean(wave ** 2))
+    filtered_rms = torch.sqrt(torch.mean(filtered_wave ** 2))
+    if filtered_rms > 1e-8:
+        # Equal-loudness glottal flow compensation across spectral tilt
+        loudness_comp = float(10.0 ** (b_clamped * 0.5 / 20.0))
+        filtered_wave = filtered_wave * (original_rms / filtered_rms) * loudness_comp
     else:
         filtered_wave = torch.zeros_like(filtered_wave)
     filtered_wave = filtered_wave.unsqueeze(1)
