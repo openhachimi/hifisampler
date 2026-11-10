@@ -10,4 +10,4 @@ resampy>=0.4.3
 ruamel.yaml>=0.18.10
 scipy>=1.15.2
 soundfile>=0.13.1
-torch>=2.13.0
+torch>=2.6.0

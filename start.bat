@@ -2,8 +2,8 @@
 setlocal
 cd /d "%~dp0"
 
-rem --- Fast path: if .venv already exists, start hifiserver.py directly ---
-if exist ".venv\Scripts\python.exe" (
+rem --- Fast path: if .venv is fully initialized, start hifiserver.py directly ---
+if exist ".venv\Scripts\python.exe" if exist ".venv\Lib\site-packages\aiohttp" (
     ".venv\Scripts\python.exe" hifiserver.py %*
     goto :eof
 )
@@ -30,7 +30,7 @@ where nvidia-smi >nul 2>&1 && nvidia-smi -L >nul 2>&1
 if %errorlevel% equ 0 (
     echo --- NVIDIA GPU detected. Installing PyTorch with CUDA support...
     set "TORCH_EXTRA_INDEX=--extra-index-url https://download.pytorch.org/whl/cu129"
-    uv pip install --python .venv "torch>=2.13.0" --index-url https://download.pytorch.org/whl/cu129
+    uv pip install --python .venv "torch>=2.6.0" --index-url https://download.pytorch.org/whl/cu129
     if errorlevel 1 (
         echo Error: Failed to install PyTorch with CUDA support.
         pause
@@ -47,6 +47,7 @@ if %errorlevel% neq 0 (
     pause
     goto :eof
 )
+echo ok > ".venv\.hifisampler_ready"
 
 ".venv\Scripts\python.exe" hifiserver.py %*
 
