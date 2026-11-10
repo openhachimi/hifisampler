@@ -230,3 +230,49 @@ class TestResamplerPipeline:
         assert r.tempo == 1.0
         r.render()
         assert out_path.exists()
+
+    def test_lf_tension_invariants_and_cache_versioning(self, synthetic_wav_pair):
+        import torch
+        from util.audio import pre_emphasis_base_tension
+
+        # 1. Pure silence safety (no NaN / zero division)
+        silent_wav = torch.zeros(1, 1, 4096, dtype=torch.float32, device=CONFIG.device)
+        silent_out = pre_emphasis_base_tension(silent_wav, -2.0)
+        assert torch.all(torch.isfinite(silent_out))
+        assert torch.max(torch.abs(silent_out)).item() == 0.0
+
+        # 2. Monotonic spectral tilt across b in [+2.0, +1.0, 0.0, -1.0, -2.0] (Ht from -100 to +100)
+        sr = CONFIG.sample_rate
+        t = torch.arange(0, sr // 2, dtype=torch.float32, device=CONFIG.device) / sr
+        harmonic_sig = torch.zeros_like(t)
+        for k in range(1, 16):
+            harmonic_sig = harmonic_sig + (1.0 / k) * torch.sin(2.0 * np.pi * 220.0 * k * t)
+        harmonic_wav = (0.2 * harmonic_sig).unsqueeze(0).unsqueeze(0)
+
+        hf_ratios = []
+        for b_val in [2.0, 1.0, 0.0, -1.0, -2.0]:
+            out = pre_emphasis_base_tension(harmonic_wav, b_val)
+            assert out.shape == harmonic_wav.shape
+            assert torch.all(torch.isfinite(out))
+            spec = torch.abs(torch.fft.rfft(out.squeeze())) ** 2
+            freqs = torch.fft.rfftfreq(out.numel(), d=1.0 / sr, device=CONFIG.device)
+            e_low = torch.sum(spec[(freqs >= 150.0) & (freqs < 800.0)]).item()
+            e_high = torch.sum(spec[(freqs >= 1500.0) & (freqs < 6000.0)]).item()
+            hf_ratios.append(e_high / (e_low + 1e-12))
+
+        for i in range(len(hf_ratios) - 1):
+            assert hf_ratios[i + 1] > hf_ratios[i]
+
+        # 3. Non-zero Ht appends v2 version tag in cache filename
+        in_path, out_path = synthetic_wav_pair
+        Resampler(
+            in_file=str(in_path),
+            out_file=str(out_path),
+            pitch="A4",
+            velocity=100,
+            flags="Ht50",
+            length=200,
+            tempo="!120",
+        )
+        v2_caches = list(in_path.parent.glob("*Ht50v2*.hifi.npz"))
+        assert len(v2_caches) == 1
