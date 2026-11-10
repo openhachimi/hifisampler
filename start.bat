@@ -25,31 +25,33 @@ if %errorlevel% neq 0 (
     goto :eof
 )
 
-echo --- Creating Python 3.11 virtual environment (.venv)...
-uv venv .venv --python 3.11
-if %errorlevel% neq 0 (
-    echo Error: Failed to create virtual environment.
-    pause
-    goto :eof
-)
-
-set "TORCH_EXTRA_INDEX="
-where nvidia-smi >nul 2>&1 && nvidia-smi -L >nul 2>&1
-if %errorlevel% equ 0 (
-    echo --- NVIDIA GPU detected. Installing PyTorch with CUDA support...
-    set "TORCH_EXTRA_INDEX=--extra-index-url https://download.pytorch.org/whl/cu129"
-    uv pip install --python .venv "torch>=2.6.0" --index-url https://download.pytorch.org/whl/cu129
+if not exist ".venv\Scripts\python.exe" (
+    echo --- Creating Python 3.11 virtual environment ^(.venv^)...
+    uv venv .venv --python 3.11
     if errorlevel 1 (
-        echo Error: Failed to install PyTorch with CUDA support.
+        echo Error: Failed to create virtual environment.
         pause
         goto :eof
     )
-) else (
-    echo --- No NVIDIA GPU detected. Installing lightweight PyTorch ^(CPU^) + DirectML support...
+)
+
+if not exist ".venv\Lib\site-packages\torch" (
+    where nvidia-smi >nul 2>&1 && nvidia-smi -L >nul 2>&1
+    if not errorlevel 1 (
+        echo --- NVIDIA GPU detected. Installing PyTorch with CUDA support...
+        uv pip install --python .venv "torch>=2.6.0" --index-url https://download.pytorch.org/whl/cu129
+        if errorlevel 1 (
+            echo Error: Failed to install PyTorch with CUDA support.
+            pause
+            goto :eof
+        )
+    ) else (
+        echo --- No NVIDIA GPU detected. Installing lightweight PyTorch ^(CPU^) + DirectML support...
+    )
 )
 
 echo --- Installing HifiSampler dependencies...
-uv pip install --python .venv %TORCH_EXTRA_INDEX% -r requirements.txt
+uv pip install --python .venv -r requirements.txt
 if %errorlevel% neq 0 (
     echo Error: Failed to install dependencies.
     pause

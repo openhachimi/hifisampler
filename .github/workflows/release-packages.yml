@@ -66,6 +66,7 @@ jobs:
               Copy-Item -Recurse -Force $item $stage
             }
           }
+          Copy-Item -Force (Join-Path $stage "config.default.yaml") (Join-Path $stage "config.yaml")
 
           # Extract models.7z and place into stage
           7z x "models.7z" -o"_models_extract" -y | Out-Null
@@ -103,21 +104,21 @@ jobs:
             # Configure config.yaml for CUDA (PyTorch ckpt + fp16)
             $cfgPath = Join-Path $stage "config.yaml"
             $cfg = Get-Content $cfgPath -Raw
-            $cfg = $cfg -replace 'vocoder_path:\s*"\.\/pc_nsf_hifigan_44\.1k_hop512_128bin_2025\.02\/model\.onnx"', 'vocoder_path: "./pc_nsf_hifigan_44.1k_hop512_128bin_2025.02/model.ckpt"'
-            $cfg = $cfg -replace 'model_type:\s*"onnx"', 'model_type: "ckpt"'
-            $cfg = $cfg -replace 'fp16:\s*false', 'fp16: true'
-            Set-Content -Path $cfgPath -Value $cfg -Encoding UTF8
+            $cfg = $cfg -replace '(?m)^(\s*)vocoder_path:\s*"\.\/pc_nsf_hifigan_44\.1k_hop512_128bin_2025\.02\/model\.onnx"', '$1vocoder_path: "./pc_nsf_hifigan_44.1k_hop512_128bin_2025.02/model.ckpt"'
+            $cfg = $cfg -replace '(?m)^(\s*)model_type:\s*"onnx"', '$1model_type: "ckpt"'
+            $cfg = $cfg -replace '(?m)^(\s*)fp16:\s*false', '$1fp16: true'
+            [System.IO.File]::WriteAllText($cfgPath, $cfg, (New-Object System.Text.UTF8Encoding $false))
 
             Write-Host "Installing CUDA PyTorch (cu129) + dependencies..."
             & uv pip install --python $envPy --system --break-system-packages --no-cache "torch>=2.6.0" --index-url https://download.pytorch.org/whl/cu129
             if ($LASTEXITCODE -ne 0) { throw "Failed to install CUDA torch" }
-            & uv pip install --python $envPy --system --break-system-packages --no-cache --extra-index-url https://download.pytorch.org/whl/cu129 -r requirements.txt
+            & uv pip install --python $envPy --system --break-system-packages --no-cache -r requirements.txt
             if ($LASTEXITCODE -ne 0) { throw "Failed to install requirements" }
           } else {
             Write-Host "Installing CPU PyTorch + DirectML dependencies..."
             & uv pip install --python $envPy --system --break-system-packages --no-cache "torch>=2.6.0" --index-url https://download.pytorch.org/whl/cpu
             if ($LASTEXITCODE -ne 0) { throw "Failed to install CPU torch" }
-            & uv pip install --python $envPy --system --break-system-packages --no-cache --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt
+            & uv pip install --python $envPy --system --break-system-packages --no-cache -r requirements.txt
             if ($LASTEXITCODE -ne 0) { throw "Failed to install requirements" }
           }
 
