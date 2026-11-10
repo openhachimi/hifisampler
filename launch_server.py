@@ -5,7 +5,7 @@ import subprocess
 import sys
 import yaml
 
-from hifiserver import PROJECT_ROOT, get_venv_python, write_locator_beacon
+from hifiserver import PROJECT_ROOT, get_venv_python
 
 
 def get_default_conda_base_path():
@@ -43,7 +43,6 @@ def start_in_venv(venv_path: Path, python_script_path: Path) -> bool:
     if not python_script_path.exists():
         raise FileNotFoundError(f"Target Python script not found: {python_script_path}")
 
-    write_locator_beacon(python_exe=str(python_exe))
     command = [str(python_exe), str(python_script_path)]
     print(f"Starting server with venv: {' '.join(command)}")
     subprocess.run(command, check=True)
@@ -108,7 +107,6 @@ def start_environment(config: dict) -> bool:
 
 if __name__ == "__main__":
     os.chdir(PROJECT_ROOT)
-    write_locator_beacon()
 
     config_file_path = PROJECT_ROOT / "config.yaml"
     default_config_file_path = PROJECT_ROOT / "config.default.yaml"

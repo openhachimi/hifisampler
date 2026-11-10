@@ -25,10 +25,12 @@ if %errorlevel% neq 0 (
     goto :eof
 )
 
+set "TORCH_EXTRA_INDEX="
 where nvidia-smi >nul 2>&1 && nvidia-smi -L >nul 2>&1
 if %errorlevel% equ 0 (
     echo --- NVIDIA GPU detected. Installing PyTorch with CUDA support...
-    uv pip install --python .venv "torch>=2.6.0" --index-url https://download.pytorch.org/whl/cu129
+    set "TORCH_EXTRA_INDEX=--extra-index-url https://download.pytorch.org/whl/cu129"
+    uv pip install --python .venv "torch>=2.13.0" --index-url https://download.pytorch.org/whl/cu129
     if errorlevel 1 (
         echo Error: Failed to install PyTorch with CUDA support.
         pause
@@ -39,7 +41,7 @@ if %errorlevel% equ 0 (
 )
 
 echo --- Installing HifiSampler dependencies...
-uv pip install --python .venv -r requirements.txt
+uv pip install --python .venv %TORCH_EXTRA_INDEX% -r requirements.txt
 if %errorlevel% neq 0 (
     echo Error: Failed to install dependencies.
     pause

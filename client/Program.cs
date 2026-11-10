@@ -11,8 +11,27 @@ using System.Threading.Tasks;
 
 class Program
 {
-    static readonly HttpClient PostClient = new HttpClient() { Timeout = TimeSpan.FromSeconds(180) };
-    static readonly Func<HttpClient> CheckClientFactory = () => new HttpClient() { Timeout = TimeSpan.FromSeconds(2) };
+    static readonly HttpClient PostClient = new HttpClient(new SocketsHttpHandler
+    {
+        ConnectTimeout = TimeSpan.FromMilliseconds(300),
+        PooledConnectionLifetime = TimeSpan.FromMinutes(2),
+        UseProxy = false,
+        UseCookies = false,
+    })
+    {
+        Timeout = TimeSpan.FromSeconds(180)
+    };
+
+    static readonly HttpClient CheckClient = new HttpClient(new SocketsHttpHandler
+    {
+        ConnectTimeout = TimeSpan.FromMilliseconds(500),
+        PooledConnectionLifetime = TimeSpan.FromMinutes(2),
+        UseProxy = false,
+        UseCookies = false,
+    })
+    {
+        Timeout = TimeSpan.FromSeconds(2)
+    };
 
     static int TargetPort = 8572;
     static readonly string LauncherScriptName = OperatingSystem.IsWindows() ? "start.bat" : "start.sh";
@@ -33,81 +52,174 @@ class Program
             Environment.Exit(1);
         }
 
-        var location = ResolveServerLocation();
+        ResolveTargetPortFast();
+        string jsonPayload = BuildJsonPayload(args);
 
+        // --- Fast Path: Optimistic single-trip POST / ---
+        var (fastSuccess, shouldEnsureServer) = await TryOptimisticPostAsync(jsonPayload);
+        if (fastSuccess)
+        {
+            return;
+        }
+        if (!shouldEnsureServer)
+        {
+            Environment.Exit(1);
+        }
+
+        // --- Slow Path: Server is down or still warming up (503) ---
+        var location = ResolveServerLocation();
+        await EnsureServerRunningAsync(location);
+        await CommunicateWithServer(jsonPayload);
+    }
+
+    static async Task<(bool Succeeded, bool ShouldEnsureServer)> TryOptimisticPostAsync(string jsonPayload)
+    {
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            using var content = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
+            using HttpResponseMessage response = await PostClient.PostAsync($"http://127.0.0.1:{TargetPort}/", content);
+            if (response.IsSuccessStatusCode)
+            {
+                return (true, false);
+            }
+
+            if (response.StatusCode == HttpStatusCode.ServiceUnavailable)
+            {
+                return (false, true);
+            }
+
+            string responseBody = response.Content == null ? "[No Body]" : await response.Content.ReadAsStringAsync();
+            Console.Error.WriteLine($"[Communicate] Error: Status {(int)response.StatusCode} {response.ReasonPhrase} - {responseBody}");
+            return (false, false);
+        }
+        catch (HttpRequestException ex) when (IsConnectionRefusedOrUnreachable(ex) || sw.ElapsedMilliseconds < 1500)
+        {
+            return (false, true);
+        }
+        catch (TaskCanceledException) when (sw.ElapsedMilliseconds < 1500)
+        {
+            // ConnectTimeout (300ms) fired before TCP connection was established
+            return (false, true);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[Communicate] Request failed after {sw.ElapsedMilliseconds}ms: {ex.Message}");
+            return (false, false);
+        }
+    }
+
+    static bool IsConnectionRefusedOrUnreachable(HttpRequestException ex)
+    {
+        if (ex.InnerException is SocketException sockEx)
+        {
+            return sockEx.SocketErrorCode == SocketError.ConnectionRefused
+                || sockEx.SocketErrorCode == SocketError.TimedOut
+                || sockEx.SocketErrorCode == SocketError.NetworkUnreachable
+                || sockEx.SocketErrorCode == SocketError.HostUnreachable;
+        }
+        return false;
+    }
+
+    static void ResolveTargetPortFast()
+    {
+        string? portEnv = Environment.GetEnvironmentVariable("HIFISAMPLER_PORT");
+        if (!string.IsNullOrWhiteSpace(portEnv) && int.TryParse(portEnv, out int parsedPort) && parsedPort > 0)
+        {
+            TargetPort = parsedPort;
+            return;
+        }
+
+        try
+        {
+            string userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            string beaconPath = Path.Combine(userHome, ".hifisampler", "server.json");
+            if (File.Exists(beaconPath))
+            {
+                string jsonText = File.ReadAllText(beaconPath, Encoding.UTF8);
+                using JsonDocument doc = JsonDocument.Parse(jsonText);
+                if (doc.RootElement.TryGetProperty("port", out JsonElement portEl) && portEl.TryGetInt32(out int beaconPort) && beaconPort > 0)
+                {
+                    TargetPort = beaconPort;
+                }
+            }
+        }
+        catch
+        {
+            // Ignore fast-path beacon read errors; full fallback handles reporting
+        }
+    }
+
+    static async Task EnsureServerRunningAsync(ServerLocation location)
+    {
         bool proceedToCommunication = false;
         bool errorOccurred = false;
         string errorMessage = "";
 
-        // --- Phase 1: Quick Readiness Check (No Lock) ---
         if (await IsServerReady(TargetPort))
         {
-            proceedToCommunication = true;
+            return;
         }
-        else
-        {
-            Console.WriteLine("[Main] Server not ready. Acquiring startup lock...");
 
-            // --- Phase 2: Cross-Platform File Lock and Double-Check ---
-            using var lockStream = await TryAcquireStartupLockAsync(TargetPort, TimeSpan.FromSeconds(5));
-            if (lockStream != null)
+        Console.WriteLine("[Main] Server not ready. Acquiring startup lock...");
+
+        using var lockStream = await TryAcquireStartupLockAsync(TargetPort, TimeSpan.FromSeconds(5));
+        if (lockStream != null)
+        {
+            try
             {
-                try
+                if (await IsServerReady(TargetPort))
                 {
-                    if (await IsServerReady(TargetPort))
+                    proceedToCommunication = true;
+                }
+                else if (!IsPortInUse(TargetPort))
+                {
+                    Console.WriteLine($"[Main] Port {TargetPort} is free. Launching HifiSampler server...");
+                    if (string.IsNullOrEmpty(location.ServerRoot))
                     {
-                        proceedToCommunication = true;
-                    }
-                    else if (!IsPortInUse(TargetPort))
-                    {
-                        Console.WriteLine($"[Main] Port {TargetPort} is free. Launching HifiSampler server...");
-                        if (string.IsNullOrEmpty(location.ServerRoot))
-                        {
-                            errorMessage =
-                                "Could not locate HifiSampler server directory. " +
-                                "Please run start.bat / start.sh (or uv run hifiserver.py) once in the server folder to register ~/.hifisampler/server.json, " +
-                                "or set the HIFISAMPLER_HOME environment variable.";
-                            errorOccurred = true;
-                        }
-                        else
-                        {
-                            try
-                            {
-                                LaunchServerProcess(location);
-                                // Wait up to 45s (staying safely under OpenUtau's 60s process kill timeout)
-                                bool initialWaitOk = await WaitForServerToStart(TargetPort, 45, "[InitialWait]");
-                                if (initialWaitOk)
-                                {
-                                    proceedToCommunication = true;
-                                }
-                                else
-                                {
-                                    errorMessage = "Server launched (warming up in background), but did not become ready within 45s.";
-                                    errorOccurred = true;
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-                                errorMessage = $"Error during server launch execution: {ex.Message}";
-                                errorOccurred = true;
-                            }
-                        }
+                        errorMessage =
+                            "Could not locate HifiSampler server directory. " +
+                            "Please run start.bat / start.sh (or uv run hifiserver.py) once in the server folder to register ~/.hifisampler/server.json, " +
+                            "or set the HIFISAMPLER_HOME environment variable.";
+                        errorOccurred = true;
                     }
                     else
                     {
-                        Console.WriteLine($"[Main] Port {TargetPort} is in use; waiting for server initialization...");
+                        try
+                        {
+                            LaunchServerProcess(location);
+                            bool initialWaitOk = await WaitForServerToStart(TargetPort, 45, "[InitialWait]");
+                            if (initialWaitOk)
+                            {
+                                proceedToCommunication = true;
+                            }
+                            else
+                            {
+                                errorMessage = "Server launched (warming up in background), but did not become ready within 45s.";
+                                errorOccurred = true;
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            errorMessage = $"Error during server launch execution: {ex.Message}";
+                            errorOccurred = true;
+                        }
                     }
                 }
-                catch (Exception ex)
+                else
                 {
-                    errorMessage = $"Unexpected error during startup checks: {ex.Message}";
-                    errorOccurred = true;
+                    Console.WriteLine($"[Main] Port {TargetPort} is in use; waiting for server initialization...");
                 }
             }
-            else
+            catch (Exception ex)
             {
-                Console.WriteLine("[Main] Another client instance holds the startup lock; waiting for server...");
+                errorMessage = $"Unexpected error during startup checks: {ex.Message}";
+                errorOccurred = true;
             }
+        }
+        else
+        {
+            Console.WriteLine("[Main] Another client instance holds the startup lock; waiting for server...");
         }
 
         if (errorOccurred)
@@ -124,12 +236,6 @@ class Program
                 Console.Error.WriteLine("[Main] Error: Server failed readiness check within timeout.");
                 Environment.Exit(1);
             }
-            proceedToCommunication = true;
-        }
-
-        if (proceedToCommunication)
-        {
-            await CommunicateWithServer(args);
         }
     }
 
@@ -243,6 +349,38 @@ class Program
         location.ScriptPath = File.Exists(scriptPath) ? scriptPath : "";
         location.LauncherScript = File.Exists(launcherPath) ? launcherPath : "";
         location.PythonExe = File.Exists(venvPython) ? venvPython : "";
+
+        if (string.IsNullOrEmpty(location.PythonExe))
+        {
+            try
+            {
+                string userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                string beaconPath = Path.Combine(userHome, ".hifisampler", "server.json");
+                if (File.Exists(beaconPath))
+                {
+                    string jsonText = File.ReadAllText(beaconPath, Encoding.UTF8);
+                    using JsonDocument doc = JsonDocument.Parse(jsonText);
+                    JsonElement root = doc.RootElement;
+                    string? beaconRoot = root.TryGetProperty("server_root", out JsonElement srEl) ? srEl.GetString() : null;
+                    string? beaconPy = root.TryGetProperty("python_exe", out JsonElement pyEl) ? pyEl.GetString() : null;
+                    if (!string.IsNullOrWhiteSpace(beaconRoot) && !string.IsNullOrWhiteSpace(beaconPy) && File.Exists(beaconPy))
+                    {
+                        StringComparison cmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+                        string normBeaconRoot = Path.GetFullPath(beaconRoot).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                        string normFullDir = fullDir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                        if (string.Equals(normBeaconRoot, normFullDir, cmp))
+                        {
+                            location.PythonExe = beaconPy;
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // Ignore beacon fallback errors during probing
+            }
+        }
+
         return true;
     }
 
@@ -307,12 +445,11 @@ class Program
         return sb.ToString();
     }
 
-    static async Task CommunicateWithServer(string[] args)
+    static async Task CommunicateWithServer(string jsonPayload)
     {
         int maxRetries = 2;
         int retryDelayMs = 800;
         bool requestSucceeded = false;
-        string jsonPayload = BuildJsonPayload(args);
 
         for (int attempt = 1; attempt <= maxRetries + 1; attempt++)
         {
@@ -331,7 +468,6 @@ class Program
                 {
                     string responseBody = response.Content == null ? "[No Body]" : await response.Content.ReadAsStringAsync();
                     Console.Error.WriteLine($"[Communicate] Error (Attempt {attempt}): Status {(int)response.StatusCode} {response.ReasonPhrase} - {responseBody}");
-                    // Only retry on 503 ServiceUnavailable (do not retry on 400 Bad Request, 404 Not Found, or 500 Internal Error)
                     if (response.StatusCode == HttpStatusCode.ServiceUnavailable && attempt <= maxRetries)
                     {
                         Console.WriteLine("[Communicate] Server still initializing (503), retrying...");
@@ -374,8 +510,7 @@ class Program
     {
         try
         {
-            using HttpClient checkClient = CheckClientFactory();
-            using HttpResponseMessage response = await checkClient.GetAsync($"http://127.0.0.1:{port}/");
+            using HttpResponseMessage response = await CheckClient.GetAsync($"http://127.0.0.1:{port}/");
             return response.StatusCode == HttpStatusCode.OK;
         }
         catch
@@ -444,7 +579,7 @@ class Program
             string arguments =
                 $"/C start \"HifiSampler Server\" /D \"{workingDir}\" cmd /C \"title HifiSampler Server & echo Starting HifiSampler Server... & {innerCmd} & echo. & echo Server process finished. & pause\"";
 
-            Process.Start(new ProcessStartInfo
+            using var winProc = Process.Start(new ProcessStartInfo
             {
                 FileName = "cmd.exe",
                 Arguments = arguments,
@@ -508,7 +643,7 @@ class Program
                             {
                                 psi.ArgumentList.Add(arg);
                             }
-                            Process.Start(psi);
+                            using var termProc = Process.Start(psi);
                             Console.WriteLine($"[LaunchServer] Launched server in detached GUI terminal: {term.Name}");
                             return;
                         }
@@ -536,7 +671,7 @@ class Program
             bgPsi.ArgumentList.Add("bash");
             bgPsi.ArgumentList.Add("-c");
             bgPsi.ArgumentList.Add(bgCmd);
-            Process.Start(bgPsi);
+            using var bgProc = Process.Start(bgPsi);
             Console.WriteLine($"[LaunchServer] Launched detached background server (log: {logFile}).");
             return;
         }
@@ -551,24 +686,34 @@ class Program
 
     static bool CommandExistsPosix(string commandName)
     {
-        try
-        {
-            var psi = new ProcessStartInfo("sh")
-            {
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-            };
-            psi.ArgumentList.Add("-c");
-            psi.ArgumentList.Add($"command -v \"{commandName}\" >/dev/null 2>&1");
-            using var proc = Process.Start(psi);
-            proc?.WaitForExit(500);
-            return proc?.ExitCode == 0;
-        }
-        catch
+        if (string.IsNullOrWhiteSpace(commandName))
         {
             return false;
         }
+        if (commandName.Contains('/'))
+        {
+            return File.Exists(commandName);
+        }
+        string? pathEnv = Environment.GetEnvironmentVariable("PATH");
+        if (string.IsNullOrWhiteSpace(pathEnv))
+        {
+            return false;
+        }
+        foreach (string dir in pathEnv.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+        {
+            try
+            {
+                string candidate = Path.Combine(dir, commandName);
+                if (File.Exists(candidate))
+                {
+                    return true;
+                }
+            }
+            catch
+            {
+                // Ignore invalid PATH entries
+            }
+        }
+        return false;
     }
 }

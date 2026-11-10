@@ -5,8 +5,37 @@
 
 set -e
 
-PORT="${HIFISAMPLER_PORT:-8572}"
 BEACON_FILE="$HOME/.hifisampler/server.json"
+BEACON_SERVER_ROOT=""
+BEACON_PYTHON_EXE=""
+BEACON_PORT=""
+
+if [ -f "$BEACON_FILE" ]; then
+    # Lightweight extraction of port, server_root, and python_exe without spawning Python on the hot path
+    while IFS= read -r line; do
+        case "$line" in
+            *'"port"'*)
+                val="${line#*:}"
+                val="${val//[^0-9]/}"
+                [ -n "$val" ] && BEACON_PORT="$val"
+                ;;
+            *'"server_root"'*)
+                val="${line#*\"server_root\"*:}"
+                val="${val#*\"}"
+                val="${val%\"*}"
+                [ -n "$val" ] && BEACON_SERVER_ROOT="$val"
+                ;;
+            *'"python_exe"'*)
+                val="${line#*\"python_exe\"*:}"
+                val="${val#*\"}"
+                val="${val%\"*}"
+                [ -n "$val" ] && BEACON_PYTHON_EXE="$val"
+                ;;
+        esac
+    done < "$BEACON_FILE"
+fi
+
+PORT="${HIFISAMPLER_PORT:-${BEACON_PORT:-8572}}"
 
 if [ $# -lt 1 ]; then
     echo "[hifisampler.sh] Error: No UTAU arguments provided." >&2
@@ -55,10 +84,8 @@ resolve_server_root() {
     fi
 
     # 4. Global Locator Beacon ~/.hifisampler/server.json
-    if [ -f "$BEACON_FILE" ] && command -v python3 >/dev/null 2>&1; then
-        local beacon_root
-        beacon_root="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1], encoding="utf-8")); print(d.get("server_root",""))' "$BEACON_FILE" 2>/dev/null || true)"
-        if probe_server_dir "$beacon_root"; then
+    if [ -n "$BEACON_SERVER_ROOT" ]; then
+        if probe_server_dir "$BEACON_SERVER_ROOT"; then
             return 0
         fi
     fi
@@ -67,7 +94,7 @@ resolve_server_root() {
 }
 
 is_server_ready() {
-    curl -sf --max-time 2 "http://127.0.0.1:${PORT}/" >/dev/null 2>&1
+    curl -sf --noproxy "127.0.0.1,localhost" --connect-timeout 0.5 --max-time 2 "http://127.0.0.1:${PORT}/" >/dev/null 2>&1
 }
 
 launch_server() {
@@ -77,6 +104,8 @@ launch_server() {
     local launch_cmd=""
     if [ -x "$server_root/.venv/bin/python" ] && [ -f "$server_root/hifiserver.py" ]; then
         launch_cmd="$(shell_quote "$server_root/.venv/bin/python") $(shell_quote "$server_root/hifiserver.py")"
+    elif [ -n "$BEACON_PYTHON_EXE" ] && [ -x "$BEACON_PYTHON_EXE" ] && [ -f "$server_root/hifiserver.py" ] && [ "$(probe_server_dir "$BEACON_SERVER_ROOT" || true)" = "$server_root" ]; then
+        launch_cmd="$(shell_quote "$BEACON_PYTHON_EXE") $(shell_quote "$server_root/hifiserver.py")"
     else
         launch_cmd="bash $(shell_quote "$server_root/start.sh")"
     fi
@@ -113,11 +142,13 @@ launch_server() {
         done
     fi
 
-    # Fallback: background daemon via setsid logging to logs/hifiserver.log (close FD 9 so lock is not inherited)
+    # Fallback: background daemon via setsid/nohup logging to logs/hifiserver.log (close FD 9 so lock is not inherited)
     mkdir -p "$server_root/logs"
-    local q_log
-    q_log="$(shell_quote "$server_root/logs/hifiserver.log")"
-    setsid bash -c "cd $q_root && exec $launch_cmd" >> "$server_root/logs/hifiserver.log" 2>&1 < /dev/null 9>&- &
+    if command -v setsid >/dev/null 2>&1; then
+        setsid bash -c "cd $q_root && exec $launch_cmd" >> "$server_root/logs/hifiserver.log" 2>&1 < /dev/null 9>&- &
+    else
+        nohup bash -c "cd $q_root && exec $launch_cmd" >> "$server_root/logs/hifiserver.log" 2>&1 < /dev/null &
+    fi
 }
 
 wait_for_server() {
@@ -133,7 +164,11 @@ wait_for_server() {
     return 1
 }
 
-if ! is_server_ready; then
+ensure_server_running() {
+    if is_server_ready; then
+        return 0
+    fi
+
     SERVER_ROOT="$(resolve_server_root || true)"
     if [ -z "$SERVER_ROOT" ]; then
         echo "[hifisampler.sh] Error: Cannot find HifiSampler server root. Run ./start.sh once in the HifiSampler folder to register ~/.hifisampler/server.json, or set HIFISAMPLER_HOME." >&2
@@ -151,40 +186,68 @@ if ! is_server_ready; then
             fi
         ) 9>"$LOCK_FILE"
     else
-        launch_server "$SERVER_ROOT"
+        LOCK_DIR="${LOCK_FILE}.d"
+        if mkdir "$LOCK_DIR" 2>/dev/null; then
+            trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+            if ! is_server_ready; then
+                echo "[hifisampler.sh] Launching HifiSampler server from: $SERVER_ROOT"
+                launch_server "$SERVER_ROOT"
+                wait_for_server 45 || true
+            fi
+            rmdir "$LOCK_DIR" 2>/dev/null || true
+        fi
     fi
 
     if ! wait_for_server 45; then
         echo "[hifisampler.sh] Error: Server did not become ready within 45s." >&2
         exit 1
     fi
-fi
+}
 
-# Build JSON array payload {"args": [...]}
-if command -v python3 >/dev/null 2>&1; then
-    JSON_PAYLOAD="$(python3 -c 'import json,sys; print(json.dumps({"args": sys.argv[1:]}))' "$@")"
-else
-    JSON_PAYLOAD='{"args":['
-    first=1
-    for arg in "$@"; do
-        escaped="${arg//\\/\\\\}"
-        escaped="${escaped//\"/\\\"}"
-        if [ "$first" -eq 1 ]; then
-            JSON_PAYLOAD="${JSON_PAYLOAD}\"${escaped}\""
-            first=0
-        else
-            JSON_PAYLOAD="${JSON_PAYLOAD},\"${escaped}\""
-        fi
-    done
-    JSON_PAYLOAD="${JSON_PAYLOAD}]}"
-fi
+# Build JSON array payload {"args": [...]} in pure bash (zero subprocess overhead)
+JSON_PAYLOAD='{"args":['
+first=1
+for arg in "$@"; do
+    escaped="${arg//\\/\\\\}"
+    escaped="${escaped//\"/\\\"}"
+    escaped="${escaped//$'\n'/\\n}"
+    escaped="${escaped//$'\r'/\\r}"
+    escaped="${escaped//$'\t'/\\t}"
+    if [ "$first" -eq 1 ]; then
+        JSON_PAYLOAD="${JSON_PAYLOAD}\"${escaped}\""
+        first=0
+    else
+        JSON_PAYLOAD="${JSON_PAYLOAD},\"${escaped}\""
+    fi
+done
+JSON_PAYLOAD="${JSON_PAYLOAD}]}"
 
-HTTP_CODE="$(curl -sS -o /tmp/hifisampler-resp-$$.txt -w "%{http_code}" --max-time 180 -H "Content-Type: application/json" -d "$JSON_PAYLOAD" "http://127.0.0.1:${PORT}/" || true)"
-if [ "$HTTP_CODE" = "200" ]; then
-    rm -f "/tmp/hifisampler-resp-$$.txt"
+# Fast Path: Optimistic POST / with 300ms connect timeout (in-memory capture, zero /tmp file I/O)
+set +e
+RESP_AND_CODE="$(curl -sS --noproxy "127.0.0.1,localhost" -w $'\n%{http_code}' --connect-timeout 0.3 --max-time 180 -H "Content-Type: application/json" -d "$JSON_PAYLOAD" "http://127.0.0.1:${PORT}/" 2>/dev/null)"
+CURL_EXIT=$?
+set -e
+
+HTTP_CODE="${RESP_AND_CODE##*$'\n'}"
+RESP_BODY="${RESP_AND_CODE%$'\n'*}"
+
+if [ "$CURL_EXIT" -eq 0 ] && [ "$HTTP_CODE" = "200" ]; then
     exit 0
-else
-    cat "/tmp/hifisampler-resp-$$.txt" >&2 2>/dev/null || true
-    rm -f "/tmp/hifisampler-resp-$$.txt"
-    exit 1
 fi
+
+# Only auto-start / retry if connection failed (exit 7 or 28 with HTTP 000) or server returned 503 warming up
+if [ "$CURL_EXIT" -eq 7 ] || { [ "$CURL_EXIT" -eq 28 ] && [ "$HTTP_CODE" = "000" ]; } || [ "$HTTP_CODE" = "503" ]; then
+    ensure_server_running
+    set +e
+    RESP_AND_CODE="$(curl -sS --noproxy "127.0.0.1,localhost" -w $'\n%{http_code}' --connect-timeout 2 --max-time 180 -H "Content-Type: application/json" -d "$JSON_PAYLOAD" "http://127.0.0.1:${PORT}/" 2>/dev/null)"
+    CURL_EXIT=$?
+    set -e
+    HTTP_CODE="${RESP_AND_CODE##*$'\n'}"
+    RESP_BODY="${RESP_AND_CODE%$'\n'*}"
+    if [ "$CURL_EXIT" -eq 0 ] && [ "$HTTP_CODE" = "200" ]; then
+        exit 0
+    fi
+fi
+
+[ -n "$RESP_BODY" ] && echo "$RESP_BODY" >&2
+exit 1

@@ -6,7 +6,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-version = '0.0.6-hifisampler'
+version = '0.1.0'
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 
@@ -59,15 +59,16 @@ def ensure_runtime_env():
         return
 
     venv_py = get_venv_python(PROJECT_ROOT)
+    venv_dir = PROJECT_ROOT / ".venv"
     if venv_py.exists():
         try:
-            curr_py = Path(sys.executable).resolve()
-            target_py = venv_py.resolve()
+            curr_prefix = Path(sys.prefix).resolve()
+            target_prefix = venv_dir.resolve()
         except OSError:
-            curr_py = Path(sys.executable)
-            target_py = venv_py
+            curr_prefix = Path(sys.prefix)
+            target_prefix = venv_dir
 
-        if curr_py != target_py:
+        if curr_prefix != target_prefix:
             os.environ["HIFISAMPLER_BOOTSTRAPPED"] = "1"
             cmd = [str(venv_py), str(PROJECT_ROOT / "hifiserver.py"), *sys.argv[1:]]
             if sys.platform != "win32":
@@ -88,9 +89,9 @@ def get_lock_file_path(port: int = 8572) -> Path:
 if __name__ == '__main__':
     ensure_runtime_env()
     port = int(os.environ.get("HIFISAMPLER_PORT", "8572"))
-    write_locator_beacon(port=port)
 
     if "--register-only" in sys.argv:
+        write_locator_beacon(port=port)
         print(f"Registered hifisampler locator beacon at: {Path.home() / '.hifisampler' / 'server.json'}")
         sys.exit(0)
 
@@ -102,6 +103,7 @@ if __name__ == '__main__':
 
     try:
         with FileLock(str(lock_file_path), timeout=0.5):
+            write_locator_beacon(port=port)
             logging.info(f"hifisampler {version} (root: {PROJECT_ROOT})")
             logging.info(f"Successfully acquired server lock: {lock_file_path}")
             models.initialize_models()

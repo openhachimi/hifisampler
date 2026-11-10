@@ -37,7 +37,10 @@ def translate_wine_path(path_str: str) -> str:
     rest = m.group(2).replace("\\", "/")
     if drive == "z":
         return "/" + rest.lstrip("/")
-    wine_dosdevice = Path.home() / ".wine" / "dosdevices" / f"{drive}:"
+    env_prefix = os.environ.get("WINEPREFIX")
+    home = Path.home()
+    wine_prefix = (home / os.path.expanduser(env_prefix)) if env_prefix else (home / ".wine")
+    wine_dosdevice = wine_prefix / "dosdevices" / f"{drive}:"
     if wine_dosdevice.exists():
         return str(wine_dosdevice / rest)
     return path_str
@@ -152,8 +155,8 @@ async def _idle_watchdog(app: web.Application):
             await asyncio.sleep(5)
             if active_jobs == 0 and (time.monotonic() - last_activity_time) >= timeout_sec:
                 logging.info(f"Server idle for {timeout_sec}s with no active jobs. Shutting down to free GPU VRAM...")
-                os.kill(os.getpid(), signal.SIGINT)
-                break
+                asyncio.get_running_loop().call_soon(signal.raise_signal, signal.SIGINT)
+                return
     except asyncio.CancelledError:
         pass
 
@@ -168,10 +171,10 @@ async def _on_cleanup(app: web.Application):
         idle_task.cancel()
         try:
             await idle_task
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, BaseException):
             pass
     if infer_executor is not None:
-        infer_executor.shutdown(wait=False)
+        infer_executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _resolve_max_workers() -> int:
