@@ -11,6 +11,10 @@ on:
         description: 'Release tag containing models.7z'
         required: true
         default: 'v0.0.6'
+      flavor:
+        description: 'Package flavor to build (all, dml, cuda)'
+        required: true
+        default: 'all'
 
 permissions:
   contents: write
@@ -109,8 +113,8 @@ jobs:
             $cfg = $cfg -replace '(?m)^(\s*)fp16:\s*false', '$1fp16: true'
             [System.IO.File]::WriteAllText($cfgPath, $cfg, (New-Object System.Text.UTF8Encoding $false))
 
-            Write-Host "Installing CUDA PyTorch (cu129) + dependencies..."
-            & uv pip install --python $envPy --system --break-system-packages --no-cache "torch>=2.6.0" --index-url https://download.pytorch.org/whl/cu129
+            Write-Host "Installing CUDA PyTorch (cu128) + dependencies..."
+            & uv pip install --python $envPy --system --break-system-packages --no-cache "torch>=2.6.0" --index-url https://download.pytorch.org/whl/cu128
             if ($LASTEXITCODE -ne 0) { throw "Failed to install CUDA torch" }
             & uv pip install --python $envPy --system --break-system-packages --no-cache -r requirements.txt
             if ($LASTEXITCODE -ne 0) { throw "Failed to install requirements" }
@@ -122,10 +126,17 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "Failed to install requirements" }
           }
 
-          # Strip C++ compile-time headers, static .lib import libraries, and __pycache__ to reduce size
+          # Strip C++ compile-time headers, static .lib import libraries, Tk/Idle/Ensurepip bloat, and __pycache__
           $torchDir = Join-Path $stage "env\Lib\site-packages\torch"
-          if (Test-Path (Join-Path $torchDir "include")) { Remove-Item -Recurse -Force (Join-Path $torchDir "include") }
-          if (Test-Path (Join-Path $torchDir "test")) { Remove-Item -Recurse -Force (Join-Path $torchDir "test") }
+          foreach ($rel in @(
+            "env\include", "env\libs", "env\tcl",
+            "env\Lib\ensurepip", "env\Lib\idlelib", "env\Lib\tkinter", "env\Lib\turtledemo", "env\Lib\test",
+            "env\DLLs\tcl86t.dll", "env\DLLs\tk86t.dll",
+            "env\Lib\site-packages\torch\include", "env\Lib\site-packages\torch\test", "env\Lib\site-packages\torch\bin\protoc.exe"
+          )) {
+            $target = Join-Path $stage $rel
+            if (Test-Path $target) { Remove-Item -Recurse -Force $target }
+          }
           Get-ChildItem (Join-Path $torchDir "lib") -Filter "*.lib" -ErrorAction SilentlyContinue | Remove-Item -Force
           Get-ChildItem $stage -Recurse -Directory -Filter "__pycache__" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
 
@@ -155,7 +166,7 @@ jobs:
 
           Push-Location "stage"
           if ($ext -eq "7z") {
-            7z a -t7z -mx=5 -md=64m -mmt=on $archivePath "hifisampler"
+            7z a -t7z -mx=7 -md=128m -mmt=on $archivePath "hifisampler"
           } else {
             7z a -tzip -mx=7 -mmt=on $archivePath "hifisampler"
           }
