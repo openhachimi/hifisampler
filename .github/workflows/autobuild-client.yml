@@ -1,9 +1,7 @@
-name: Build clients for multiple platforms when released
+name: Build clients for multiple platforms
 
-# triggers when a new release is created or manually dispatched
+# triggers when manually dispatched
 on:
-  release:
-    types: [created]
   workflow_dispatch:
 
 jobs:
@@ -71,10 +69,3 @@ jobs:
       with:
         name: client-${{ matrix.rid }}
         path: ./client/release_assets/*
-
-    # upload to release
-    - name: Upload to release
-      uses: softprops/action-gh-release@v2
-      if: github.event_name == 'release' && github.ref_type == 'tag'
-      with:
-        files: ./client/release_assets/*
