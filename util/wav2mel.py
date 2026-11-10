@@ -5,9 +5,8 @@ import threading
 import numpy as np
 import torch
 import torch.nn.functional as F
-import torch.utils.data
 
-from librosa.filters import mel as librosa_mel_fn
+from util.utils import slaney_mel_filterbank
 
 MAX_WINDOW_CACHE_SIZE = 32
 
@@ -50,7 +49,7 @@ class PitchAdjustableMelSpectrogram:
         with self._cache_lock:
             mel_basis = self.mel_basis.get(mel_basis_key)
             if mel_basis is None:
-                mel = librosa_mel_fn(
+                mel = slaney_mel_filterbank(
                     sr=self.sample_rate,
                     n_fft=self.n_fft,
                     n_mels=self.n_mels,
@@ -68,12 +67,15 @@ class PitchAdjustableMelSpectrogram:
                 window = torch.hann_window(win_size_new, device=y.device, dtype=torch.float32)
                 self.hann_window[hann_window_key] = window
 
+        pad_left = int((win_size_new - hop_length) // 2)
+        pad_right = int((win_size_new - hop_length + 1) // 2)
+        max_pad = max(pad_left, pad_right)
+        if y.size(-1) <= max_pad:
+            y = torch.nn.functional.pad(y, (0, max_pad - y.size(-1) + 1), mode="constant", value=0.0)
+
         y = torch.nn.functional.pad(
             y.unsqueeze(1),
-            (
-                int((win_size_new - hop_length) // 2),
-                int((win_size_new - hop_length + 1) // 2),
-            ),
+            (pad_left, pad_right),
             mode="reflect",
         )
         y = y.squeeze(1)
@@ -89,7 +91,7 @@ class PitchAdjustableMelSpectrogram:
             normalized=False,
             onesided=True,
             return_complex=True,
-        ).abs()
+        )
 
         if key_shift != 0:
             size = self.n_fft // 2 + 1
@@ -97,11 +99,10 @@ class PitchAdjustableMelSpectrogram:
             if resize < size:
                 spec = F.pad(spec, (0, 0, 0, size - resize))
 
-            spec = spec[:, :size, :] * self.win_size / win_size_new
+            spec = spec[:, :size, :].abs() * (self.win_size / win_size_new)
+        else:
+            spec = spec.abs()
 
         spec = torch.matmul(mel_basis, spec)
 
         return spec
-
-    def dynamic_range_compression_torch(self, x, C=1, clip_val=1e-5):
-        return torch.log(torch.clamp(x, min=clip_val) * C)

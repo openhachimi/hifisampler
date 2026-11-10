@@ -1,11 +1,13 @@
 import logging
 import os
 from pathlib import Path
+import threading
 import uuid
 import numpy as np
 import resampy
 import torch
 from config import CONFIG
+from util.cache_manager import cache_manager
 import soundfile as sf
 
 if CONFIG.wave_norm:
@@ -17,6 +19,21 @@ if CONFIG.wave_norm:
             "pyloudnorm not found, wave normalization disabled.")
         CONFIG.wave_norm = False  # Disable if import fails
 
+_METER_CACHE = {}
+_METER_LOCK = threading.Lock()
+_PRE_EMPHASIS_CACHE = {}
+_PRE_EMPHASIS_LOCK = threading.Lock()
+
+
+def _get_loudness_meter(rate: int, block_size: float):
+    key = (int(rate), float(block_size))
+    with _METER_LOCK:
+        meter = _METER_CACHE.get(key)
+        if meter is None:
+            meter = pyln.Meter(rate, block_size=block_size)
+            _METER_CACHE[key] = meter
+        return meter
+
 
 class DotDict(dict):
     def __getattr__(*args):
@@ -25,6 +42,10 @@ class DotDict(dict):
 
     __setattr__ = dict.__setitem__
     __delattr__ = dict.__delitem__
+
+
+def _peak_abs(x: np.ndarray) -> float:
+    return max(-float(x.min()), float(x.max())) if x.size > 0 else 0.0
 
 
 def dynamic_range_compression_torch(x, C=1, clip_val=1e-9):
@@ -48,7 +69,7 @@ def loudness_norm(
     Returns:
         loudness normalized audio
     """
-    if len(audio) == 0 or np.max(np.abs(audio)) < 1e-8:
+    if len(audio) == 0 or _peak_abs(audio) < 1e-8:
         return audio
 
     original_length = len(audio)
@@ -58,26 +79,19 @@ def loudness_norm(
     hop_length = int(rate * 0.01)
 
     if CONFIG.trim_silence:
-        def get_rms_db(audio_segment):
-            if len(audio_segment) == 0:
-                return -np.inf
-            rms = np.sqrt(np.mean(np.square(audio_segment)))
-            if rms < 1e-10:  # 避免log(0)错误
-                return -np.inf
-            return 20 * np.log10(rms)
-
         frame_length = int(rate * 0.02)  # 20ms窗口
         hop_length = int(rate * 0.01)    # 10ms步长
 
-        rms_values = []
-        for i in range(0, len(audio) - frame_length, hop_length):
-            frame = audio[i:i+frame_length]
-            rms_db = get_rms_db(frame)
-            rms_values.append(rms_db)
-
-        # 使用阈值检测有声帧
-        voiced_frames = [i for i, rms in enumerate(
-            rms_values) if rms > CONFIG.silence_threshold]
+        # Match range(0, len(audio) - frame_length, hop_length) frame count exactly
+        num_frames = max(0, (len(audio) - frame_length + hop_length - 1) // hop_length)
+        if num_frames > 0:
+            cs = np.empty(len(audio) + 1, dtype=np.float64)
+            cs[0] = 0.0
+            np.cumsum(np.square(audio, dtype=np.float64), out=cs[1:])
+            starts = np.arange(num_frames) * hop_length
+            mean_sq = (cs[starts + frame_length] - cs[starts]) / frame_length
+            thresh_sq = max(1e-20, float(10.0 ** (CONFIG.silence_threshold / 10.0)))
+            voiced_frames = np.flatnonzero(mean_sq > thresh_sq).tolist()
 
         if voiced_frames:
             first_voiced = voiced_frames[0]
@@ -97,19 +111,23 @@ def loudness_norm(
 
             # 使用截取后的音频进行响度标准化
             audio = trimmed_audio
+        elif num_frames > 0:
+            return original_audio
 
-    if len(audio) == 0 or np.max(np.abs(audio)) < 1e-8:
+    if len(audio) == 0 or _peak_abs(audio) < 1e-8:
         return original_audio
 
-    # 如果音频长度小于最小块大小，进行填充
+    # 如果音频长度小于最小块大小，仅对测量副本进行填充，避免反射回声混入输出尾部
     min_samples = int(rate * block_size)
     if len(audio) < min_samples:
         padding_length = min_samples - len(audio)
-        audio = np.pad(audio, (0, padding_length), mode='reflect')
+        measure_audio = np.pad(audio, (0, padding_length), mode='reflect')
+    else:
+        measure_audio = audio
 
-    # Measure the loudness first
-    meter = pyln.Meter(rate, block_size=block_size)  # create BS.1770 meter
-    _loudness = meter.integrated_loudness(audio)
+    # Measure the loudness first using cached BS.1770 meter
+    meter = _get_loudness_meter(rate, block_size)
+    _loudness = meter.integrated_loudness(measure_audio)
     if not np.isfinite(_loudness):
         return original_audio
 
@@ -173,6 +191,19 @@ def loudness_norm(
     return audio
 
 
+def _get_pre_emphasis_tensors(device: torch.device):
+    key = (CONFIG.win_size, CONFIG.n_fft, str(device))
+    with _PRE_EMPHASIS_LOCK:
+        cached = _PRE_EMPHASIS_CACHE.get(key)
+        if cached is None:
+            window = torch.hann_window(CONFIG.win_size, device=device, dtype=torch.float32)
+            fft_bin = CONFIG.n_fft // 2 + 1
+            arange_bins = torch.arange(0, fft_bin, device=device, dtype=torch.float32)
+            cached = (window, arange_bins, fft_bin)
+            _PRE_EMPHASIS_CACHE[key] = cached
+        return cached
+
+
 def pre_emphasis_base_tension(wave, b):
     """
     Args:
@@ -183,11 +214,14 @@ def pre_emphasis_base_tension(wave, b):
     original_length = wave.size(-1)
     pad_length = (CONFIG.hop_size - (original_length %
                   CONFIG.hop_size)) % CONFIG.hop_size
+    min_stft_len = CONFIG.n_fft // 2 + 1
+    if original_length + pad_length < min_stft_len:
+        pad_length = min_stft_len - original_length
     wave = torch.nn.functional.pad(
         wave, (0, pad_length), mode='constant', value=0)
     wave = wave.squeeze(1)
 
-    window = torch.hann_window(CONFIG.win_size, device=wave.device, dtype=torch.float32)
+    window, arange_bins, fft_bin = _get_pre_emphasis_tensors(wave.device)
     spec = torch.stft(
         wave,
         CONFIG.n_fft,
@@ -197,9 +231,8 @@ def pre_emphasis_base_tension(wave, b):
         return_complex=True
     )
 
-    fft_bin = CONFIG.n_fft // 2 + 1
     x0 = fft_bin / ((CONFIG.sample_rate / 2) / 1500)
-    freq_filter = (-b / x0) * torch.arange(0, fft_bin, device=wave.device, dtype=torch.float32) + b
+    freq_filter = (-b / x0) * arange_bins + b
     gain = torch.exp(torch.clamp(freq_filter, min=-2, max=2)).unsqueeze(0).unsqueeze(2)
 
     filtered_wave = torch.istft(
@@ -263,14 +296,21 @@ def read_wav(loc):
     if not exists:
         raise FileNotFoundError(f"No supported audio file was found for: {loc}")
 
-    x, fs = sf.read(str(loc))
+    resolved_loc = Path(os.path.normcase(os.path.abspath(str(loc))))
+
+    cached_wav = cache_manager.load_wav_cache(resolved_loc)
+    if cached_wav is not None:
+        return cached_wav
+
+    x, fs = sf.read(str(loc), dtype='float32')
     if len(x.shape) == 2:
         # Average all channels... Probably not too good for formats bigger than stereo
-        x = np.mean(x, axis=1)
+        x = np.mean(x, axis=1, dtype=np.float32)
 
     if fs != CONFIG.sample_rate:
-        x = resampy.resample(x, fs, CONFIG.sample_rate)
+        x = resampy.resample(x, fs, CONFIG.sample_rate).astype(np.float32, copy=False)
 
+    cache_manager.save_wav_cache(resolved_loc, x)
     return x
 
 
