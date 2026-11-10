@@ -62,8 +62,11 @@ class Resampler:
         self.flags['Ht'] = int(np.clip(0 if ht_val is None else ht_val, -100, 100))
         self.flags['g'] = int(np.clip(0 if g_val is None else g_val, -100, 100))
 
-        flag_suffix = '_'.join(f"{k}{v if v is not None else ''}" for k, v in sorted(
-            self.flags.items()) if k in ['Hb', 'Hv', 'Ht', 'g'])
+        flag_suffix = '_'.join(
+            f"{k}{v}v2" if (k == 'Ht' and v) else f"{k}{v if v is not None else ''}"
+            for k, v in sorted(self.flags.items())
+            if k in ['Hb', 'Hv', 'Ht', 'g']
+        )
         if flag_suffix:
             features_path = features_path.with_name(
                 f'{self.in_file.stem}_{flag_suffix}{cache_ext}')
