@@ -5,8 +5,6 @@ from pathlib import Path
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap, CommentedSeq
 
-logging.basicConfig(format='%(message)s', level=logging.INFO)
-
 
 def load_config_from_yaml(script_path: Path):
     def decorator(cls):

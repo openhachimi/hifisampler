@@ -50,10 +50,10 @@ class Config:
     vocoder_path: str = "./pc_nsf_hifigan_44.1k_hop512_128bin_2025.02/model.onnx"
     model_type: str = 'onnx'  # or 'ckpt'
     hnsep_model_path: str = "./hnsep/vr/model_fp16.onnx"
-    wave_norm: bool = False
+    wave_norm: bool = True
     trim_silence: bool = True  # 是否在响度标准化前截取无声部分
     silence_threshold: float = -52.0
-    loop_mode: bool = False
+    loop_mode: bool = True
     peak_limit: float = 1.0
     # max_workers can be an int or 'auto' (resolved to physical cores at runtime)
     max_workers: Any = 2
@@ -63,6 +63,9 @@ class Config:
     device_preference: str = dataclasses.field(default="auto", init=False)
 
     def __post_init__(self):
+        for field_name in ("sample_rate", "win_size", "hop_size", "origin_hop_size", "n_mels", "n_fft"):
+            if int(getattr(self, field_name, 0)) <= 0:
+                raise ValueError(f"Config '{field_name}' must be > 0, got {getattr(self, field_name)!r}")
         self.device_preference = str(self.device or "auto").strip().lower()
         self.device = _resolve_device(self.device_preference)
         is_rocm = bool(getattr(torch.version, "hip", None))
@@ -70,7 +73,7 @@ class Config:
             if is_rocm:
                 # Avoid slow MIOpen exhaustive kernel search on dynamic note lengths
                 os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
-                torch.backends.cudnn.benchmark = True
+                torch.backends.cudnn.benchmark = False
                 try:
                     dev_name = torch.cuda.get_device_name(0)
                 except Exception:
@@ -79,7 +82,7 @@ class Config:
                     f"ROCm backend active: {dev_name} (HIP {torch.version.hip}, MIOPEN_FIND_MODE={os.environ.get('MIOPEN_FIND_MODE')})"
                 )
             else:
-                torch.backends.cudnn.benchmark = True
+                torch.backends.cudnn.benchmark = False
                 try:
                     dev_name = torch.cuda.get_device_name(0)
                 except Exception:

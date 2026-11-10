@@ -26,6 +26,7 @@ publish/
 .venv/
 venv/
 __pycache__/
+.pytest_cache/
 config.yaml
 uv.exe
 hnsep/vr/
