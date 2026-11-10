@@ -12,7 +12,13 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 
 def get_venv_python(root: Path) -> Path:
     if sys.platform == "win32":
+        env_py = root / "env" / "python.exe"
+        if env_py.exists():
+            return env_py
         return root / ".venv" / "Scripts" / "python.exe"
+    env_py = root / "env" / "bin" / "python"
+    if env_py.exists():
+        return env_py
     return root / ".venv" / "bin" / "python"
 
 
@@ -59,7 +65,7 @@ def ensure_runtime_env():
         return
 
     venv_py = get_venv_python(PROJECT_ROOT)
-    venv_dir = PROJECT_ROOT / ".venv"
+    venv_dir = (PROJECT_ROOT / "env") if (PROJECT_ROOT / "env" / "python.exe").exists() else (PROJECT_ROOT / ".venv")
     if venv_py.exists():
         try:
             curr_prefix = Path(sys.prefix).resolve()

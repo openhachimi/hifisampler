@@ -5,10 +5,10 @@ env:
   conda_env_name: "hifisampler"
   python_script_path: "./hifiserver.py"
 model:
-  # Recommended onnx for CPU users.
+  # Recommended onnx for DirectML (AMD / Intel / NVIDIA) and CPU users.
   vocoder_path: "./pc_nsf_hifigan_44.1k_hop512_128bin_2025.02/model.onnx"
   model_type: "onnx"
-  hnsep_model_path: "./hnsep/vr/model_fp16.onnx"
+  hnsep_model_path: "./hnsep/vr/model.pt"
   # GPU users (NVIDIA CUDA / AMD ROCm) can also use PyTorch models:
   # vocoder_path: "./pc_nsf_hifigan_44.1k_hop512_128bin_2025.02/model.ckpt"
   # model_type: "ckpt"

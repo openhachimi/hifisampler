@@ -96,9 +96,10 @@ def start_in_conda_env(config: dict) -> bool:
 def start_environment(config: dict) -> bool:
     os.chdir(PROJECT_ROOT)
     python_script_path = (PROJECT_ROOT / config.get("python_script_path", "./hifiserver.py")).resolve()
+    env_path = PROJECT_ROOT / "env"
     venv_path = PROJECT_ROOT / ".venv"
 
-    if venv_path.exists() and venv_path.is_dir():
+    if (env_path / "python.exe").exists() or (venv_path.exists() and venv_path.is_dir()):
         return start_in_venv(venv_path, python_script_path)
     else:
         print(".venv folder not found. Falling back to Conda environment...")

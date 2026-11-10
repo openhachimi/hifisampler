@@ -2,7 +2,13 @@
 setlocal
 cd /d "%~dp0"
 
-rem --- Fast path: if .venv is fully initialized, start hifiserver.py directly ---
+rem --- Fast path 1: bundled portable environment (env\python.exe) ---
+if exist "env\python.exe" if exist "env\Lib\site-packages\aiohttp" (
+    "env\python.exe" hifiserver.py %*
+    goto :eof
+)
+
+rem --- Fast path 2: if .venv is fully initialized, start hifiserver.py directly ---
 if exist ".venv\Scripts\python.exe" if exist ".venv\Lib\site-packages\aiohttp" (
     ".venv\Scripts\python.exe" hifiserver.py %*
     goto :eof
