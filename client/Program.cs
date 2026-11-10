@@ -572,12 +572,12 @@ class Program
 
         if (OperatingSystem.IsWindows())
         {
-            string innerCmd = hasDirectVenv
-                ? $"\"\"{loc.PythonExe}\" \"{loc.ScriptPath}\"\""
-                : $"\"\"{loc.LauncherScript}\"\"";
+            string targetCmd = hasDirectVenv
+                ? $"\"{loc.PythonExe}\" \"{loc.ScriptPath}\""
+                : $"\"{loc.LauncherScript}\"";
 
             string arguments =
-                $"/C start \"HifiSampler Server\" /D \"{workingDir}\" cmd /C \"title HifiSampler Server & echo Starting HifiSampler Server... & {innerCmd} & echo. & echo Server process finished. & pause\"";
+                $"/C start \"HifiSampler Server\" /D \"{workingDir}\" {targetCmd}";
 
             using var winProc = Process.Start(new ProcessStartInfo
             {
