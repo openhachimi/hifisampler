@@ -1,0 +1,174 @@
+name: Build and Upload Release All-in-One Packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to upload assets to'
+        required: true
+        default: 'v0.1.0'
+      models_tag:
+        description: 'Release tag containing models.7z'
+        required: true
+        default: 'v0.0.6'
+
+permissions:
+  contents: write
+
+jobs:
+  package-win64:
+    name: Package Windows x64 (${{ matrix.flavor }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: dml
+            ext: zip
+          - flavor: cuda
+            ext: 7z
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv and standalone Python 3.12
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download models.7z from ${{ inputs.models_tag }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release download "${{ inputs.models_tag }}" -p "models.7z" --clobber
+          if ("${{ matrix.flavor }}" -eq "dml" -and "${{ inputs.tag }}" -ne "${{ inputs.models_tag }}") {
+            Write-Host "Uploading models.7z to release ${{ inputs.tag }}..."
+            gh release upload "${{ inputs.tag }}" "models.7z" --clobber
+          }
+
+      - name: Assemble portable All-in-One directory (${{ matrix.flavor }})
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $stage = Join-Path $PWD "stage\hifisampler"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          $items = @(
+            "backend", "client", "util", "hnsep",
+            "config.default.yaml", "config.yaml", "hifisampler.exe", "hifisampler.sh", "hifisampler.yaml",
+            "hifiserver.py", "launch_server.py", "LICENSE", "pyproject.toml",
+            "README.md", "README_zh_cn.md", "requirements.txt", "start.bat", "start.sh"
+          )
+          foreach ($item in $items) {
+            if (Test-Path $item) {
+              Copy-Item -Recurse -Force $item $stage
+            }
+          }
+
+          # Extract models.7z and place into stage
+          7z x "models.7z" -o"_models_extract" -y | Out-Null
+          $onnxFile = Get-ChildItem "_models_extract" -Recurse -Filter "model.onnx" | Select-Object -First 1
+          if (-not $onnxFile) { throw "model.onnx not found in models.7z" }
+          $vocoderDst = Join-Path $stage "pc_nsf_hifigan_44.1k_hop512_128bin_2025.02"
+          New-Item -ItemType Directory -Force -Path $vocoderDst | Out-Null
+          Copy-Item -Recurse -Force "$($onnxFile.Directory.FullName)\*" $vocoderDst
+
+          $ptFile = Get-ChildItem "_models_extract" -Recurse -Filter "model.pt" | Select-Object -First 1
+          if (-not $ptFile) { throw "model.pt not found in models.7z" }
+          $vrDst = Join-Path $stage "hnsep\vr"
+          New-Item -ItemType Directory -Force -Path $vrDst | Out-Null
+          Copy-Item -Recurse -Force "$($ptFile.Directory.FullName)\*" $vrDst
+          Remove-Item -Recurse -Force "_models_extract"
+
+          # Bundle uv.exe
+          $uvCmd = Get-Command uv.exe
+          Copy-Item -Force $uvCmd.Source (Join-Path $stage "uv.exe")
+
+          # Copy standalone Python 3.12 into stage\hifisampler\env
+          & uv python install 3.12 --managed-python
+          if ($LASTEXITCODE -ne 0) { throw "uv python install 3.12 failed" }
+          $pyExe = (& uv python find 3.12 --managed-python --system).Trim()
+          $pyRoot = Split-Path -Parent $pyExe
+          Write-Host "Copying standalone Python from: $pyRoot"
+          robocopy $pyRoot (Join-Path $stage "env") /E /NFL /NDL /NJH /NJS /NC /NS /NP | Out-Null
+          if ($LASTEXITCODE -ge 8) { throw "robocopy failed with exit code $LASTEXITCODE" }
+          $global:LASTEXITCODE = 0
+          $extManaged = Join-Path $stage "env\Lib\EXTERNALLY-MANAGED"
+          if (Test-Path $extManaged) { Remove-Item -Force $extManaged }
+
+          $envPy = Join-Path $stage "env\python.exe"
+          if ("${{ matrix.flavor }}" -eq "cuda") {
+            # Configure config.yaml for CUDA (PyTorch ckpt + fp16)
+            $cfgPath = Join-Path $stage "config.yaml"
+            $cfg = Get-Content $cfgPath -Raw
+            $cfg = $cfg -replace 'vocoder_path:\s*"\.\/pc_nsf_hifigan_44\.1k_hop512_128bin_2025\.02\/model\.onnx"', 'vocoder_path: "./pc_nsf_hifigan_44.1k_hop512_128bin_2025.02/model.ckpt"'
+            $cfg = $cfg -replace 'model_type:\s*"onnx"', 'model_type: "ckpt"'
+            $cfg = $cfg -replace 'fp16:\s*false', 'fp16: true'
+            Set-Content -Path $cfgPath -Value $cfg -Encoding UTF8
+
+            Write-Host "Installing CUDA PyTorch (cu129) + dependencies..."
+            & uv pip install --python $envPy --system --break-system-packages --no-cache "torch>=2.6.0" --index-url https://download.pytorch.org/whl/cu129
+            if ($LASTEXITCODE -ne 0) { throw "Failed to install CUDA torch" }
+            & uv pip install --python $envPy --system --break-system-packages --no-cache --extra-index-url https://download.pytorch.org/whl/cu129 -r requirements.txt
+            if ($LASTEXITCODE -ne 0) { throw "Failed to install requirements" }
+          } else {
+            Write-Host "Installing CPU PyTorch + DirectML dependencies..."
+            & uv pip install --python $envPy --system --break-system-packages --no-cache "torch>=2.6.0" --index-url https://download.pytorch.org/whl/cpu
+            if ($LASTEXITCODE -ne 0) { throw "Failed to install CPU torch" }
+            & uv pip install --python $envPy --system --break-system-packages --no-cache --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt
+            if ($LASTEXITCODE -ne 0) { throw "Failed to install requirements" }
+          }
+
+          # Strip C++ compile-time headers, static .lib import libraries, and __pycache__ to reduce size
+          $torchDir = Join-Path $stage "env\Lib\site-packages\torch"
+          if (Test-Path (Join-Path $torchDir "include")) { Remove-Item -Recurse -Force (Join-Path $torchDir "include") }
+          if (Test-Path (Join-Path $torchDir "test")) { Remove-Item -Recurse -Force (Join-Path $torchDir "test") }
+          Get-ChildItem (Join-Path $torchDir "lib") -Filter "*.lib" -ErrorAction SilentlyContinue | Remove-Item -Force
+          Get-ChildItem $stage -Recurse -Directory -Filter "__pycache__" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
+
+      - name: Verify portable environment (${{ matrix.flavor }})
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $envPy = Join-Path $PWD "stage\hifisampler\env\python.exe"
+          if ("${{ matrix.flavor }}" -eq "cuda") {
+            & $envPy -c "import sys, torch, onnxruntime as ort, aiohttp, soundfile, pyloudnorm, numba; print('Python:', sys.executable); print('Torch:', torch.__version__, 'CUDA:', torch.version.cuda); assert torch.version.cuda, 'CUDA version empty!'"
+          } else {
+            & $envPy -c "import sys, torch, onnxruntime as ort, aiohttp, soundfile, pyloudnorm, numba; print('Python:', sys.executable); print('ORT providers:', ort.get_available_providers()); assert 'DmlExecutionProvider' in ort.get_available_providers(), 'DmlExecutionProvider missing!'"
+          }
+          if ($LASTEXITCODE -ne 0) { throw "Environment verification failed!" }
+
+      - name: Compress and Upload Release Asset (${{ matrix.flavor }})
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = "${{ inputs.tag }}"
+          $flavor = "${{ matrix.flavor }}"
+          $ext = "${{ matrix.ext }}"
+          $archiveName = "hifisampler-$tag-win64-$flavor.$ext"
+          $archivePath = Join-Path $PWD $archiveName
+
+          Push-Location "stage"
+          if ($ext -eq "7z") {
+            7z a -t7z -mx=5 -md=64m -mmt=on $archivePath "hifisampler"
+          } else {
+            7z a -tzip -mx=7 -mmt=on $archivePath "hifisampler"
+          }
+          if ($LASTEXITCODE -ne 0) { throw "7z compression failed!" }
+          Pop-Location
+
+          $item = Get-Item $archivePath
+          Write-Host ("Created {0}: {1:N2} MB ({2} bytes)" -f $item.Name, ($item.Length / 1MB), $item.Length)
+
+          # Rebuild lightweight source zip at latest commit as well on the dml runner
+          if ($flavor -eq "dml") {
+            $srcZip = "hifisampler-$tag.zip"
+            git archive --format=zip --prefix=hifisampler/ -o $srcZip HEAD
+            gh release upload $tag $srcZip --clobber
+          }
+
+          gh release upload $tag $archivePath --clobber

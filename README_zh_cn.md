@@ -20,10 +20,13 @@ pc-nsf-hifigan 采用神经网络对输入特征进行上采样，音质比传�
 
 提供以下安装方式，您可以根据自己的操作系统和习惯任选其一。
 
-### 方式一：使用环境整合包（Windows 最简方式）
+### 方式一：使用环境整合一键包（Windows 最简方式，免装 Python / 依赖 / 模型）
 
-1. 下载最新的 [Release](https://github.com/openhachimi/hifisampler/releases) 压缩包并解压，**首次使用时双击运行一次 `start.bat`**（会自动记录服务端路径并启动服务）。
-2. 将客户端接入 OpenUtau（以下方法任选其一）：
+1. 前往 [Release](https://github.com/openhachimi/hifisampler/releases) 根据显卡下载对应的一键整合包并解压：
+   - **`hifisampler-v*-win64-dml.zip`（通用推荐 / A卡 / I卡 / 核显 / CPU）**：内置完整 Python 环境、全部模型与 DirectML 硬件加速，体积小巧，所有 Windows 显卡开箱即用。
+   - **`hifisampler-v*-win64-cuda.7z`（NVIDIA 独立显卡专属）**：内置完整 Python 环境、全部模型与 CUDA 版 PyTorch（支持 RTX 20/30/40/50 系显卡），默认开启 `ckpt + fp16` 半精度加速。
+2. **首次使用时双击运行一次解压目录中的 `start.bat`**（会自动记录服务端路径并启动服务，无需联网下载依赖）。
+3. 将客户端接入 OpenUtau（以下方法任选其一）：
    - **方法 A（推荐，直接复制 + 自动拉起服务端）**：将解压目录里的 `hifisampler.exe` 和 `hifisampler.yaml` **复制**到 OpenUtau 的 `Resamplers` 文件夹即可。
      - **服务端自启动说明**：只要首次运行过一次 `start.bat`，以后打开 OpenUtau 渲染时**无需再手动运行 `start.bat`**——当 `hifisampler.exe` 检测到后台服务未启动时，会自动为您拉起服务端控制台窗口并在就绪后继续渲染。（若日后移动了服务端文件夹位置，只需在新位置重新运行一次 `start.bat` 即可更新路径。）
    - **方法 B（使用 OpenUtau 内置工具）**：保持 `start.bat` 窗口运行，直接在 OpenUtau 中选择内置的 `hifisampler` 重采样器（注：内置重采样器不支持自动拉起服务端，需手动先开 `start.bat`）。

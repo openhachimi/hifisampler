@@ -20,10 +20,13 @@ pc-nsf-hifigan uses neural networks to upsample acoustic features, producing cle
 
 Choose any of the installation methods below based on your operating system and preference.
 
-### Method 1: All-in-One Package (Easiest on Windows)
+### Method 1: All-in-One Package (Easiest on Windows — Includes Python, Dependencies & Models)
 
-1. Download the latest [Release](https://github.com/openhachimi/hifisampler/releases) zip package, extract it, and **double-click `start.bat` once on first use** (this registers the server location and starts the server).
-2. Connect to OpenUtau (choose any option):
+1. Download the matching All-in-One package from [Releases](https://github.com/openhachimi/hifisampler/releases) and extract it:
+   - **`hifisampler-v*-win64-dml.zip` (General / AMD / Intel / iGPU / CPU)**: Bundles portable Python, models, and DirectML GPU acceleration in a compact archive that works out of the box on any Windows GPU or CPU.
+   - **`hifisampler-v*-win64-cuda.7z` (NVIDIA GPU Dedicated)**: Bundles portable Python, models, and CUDA PyTorch (supports RTX 20/30/40/50 series), pre-configured with `ckpt + fp16` acceleration.
+2. **Double-click `start.bat` once on first use** (registers the server location and starts the server directly without downloading dependencies).
+3. Connect to OpenUtau (choose any option):
    - **Option A (Recommended — Direct Copy + Server Auto-Start)**: Simply **copy** `hifisampler.exe` and `hifisampler.yaml` into OpenUtau's `Resamplers` folder.
      - **How Auto-Start Works**: Once you have run `start.bat` at least once, you **no longer need to start `start.bat` manually** in daily use. Whenever OpenUtau renders a note and the server is not running, `hifisampler.exe` will automatically launch the server console in the background and render once ready. (If you ever move the server folder to a new path, just run `start.bat` once from the new folder to update its registered path.)
    - **Option B (OpenUtau Built-in Tool)**: Keep `start.bat` running and select the built-in `hifisampler` resampler directly inside OpenUtau (Note: the built-in tool requires starting `start.bat` manually).
