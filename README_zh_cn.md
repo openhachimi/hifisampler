@@ -22,10 +22,11 @@ pc-nsf-hifigan 采用神经网络对输入特征进行上采样，音质比传�
 
 ### 方式一：使用环境整合包（Windows 最简方式）
 
-1. 下载最新的 [Release](https://github.com/openhachimi/hifisampler/releases) 整合包并解压，双击运行一次 `start.bat` 启动渲染服务。
+1. 下载最新的 [Release](https://github.com/openhachimi/hifisampler/releases) 压缩包并解压，**首次使用时双击运行一次 `start.bat`**（会自动记录服务端路径并启动服务）。
 2. 将客户端接入 OpenUtau（以下方法任选其一）：
-   - **方法 A（推荐，直接复制）**：运行过一次 `start.bat` 后，直接把解压目录里的 `hifisampler.exe` 和 `hifisampler.yaml` **复制**到 OpenUtau 的 `Resamplers` 文件夹即可（无需管理员权限，也支持由 OpenUtau 自动拉起服务端）。
-   - **方法 B（使用 OpenUtau 内置工具）**：保持 `start.bat` 窗口运行，直接在 OpenUtau 中选择内置的 `hifisampler` 重采样器。
+   - **方法 A（推荐，直接复制 + 自动拉起服务端）**：将解压目录里的 `hifisampler.exe` 和 `hifisampler.yaml` **复制**到 OpenUtau 的 `Resamplers` 文件夹即可。
+     - **服务端自启动说明**：只要首次运行过一次 `start.bat`，以后打开 OpenUtau 渲染时**无需再手动运行 `start.bat`**——当 `hifisampler.exe` 检测到后台服务未启动时，会自动为您拉起服务端控制台窗口并在就绪后继续渲染。（若日后移动了服务端文件夹位置，只需在新位置重新运行一次 `start.bat` 即可更新路径。）
+   - **方法 B（使用 OpenUtau 内置工具）**：保持 `start.bat` 窗口运行，直接在 OpenUtau 中选择内置的 `hifisampler` 重采样器（注：内置重采样器不支持自动拉起服务端，需手动先开 `start.bat`）。
    - **方法 C（创建软链接）**：
      ```cmd
      mklink "C:\[OpenUtau路径]\Resamplers\hifisampler.exe" "C:\[项目路径]\hifisampler.exe"
@@ -38,12 +39,12 @@ pc-nsf-hifigan 采用神经网络对输入特征进行上采样，音质比传�
 
 1. 安装 [uv](https://docs.astral.sh/uv/getting-started/installation/)。
 2. 下载 [Release](https://github.com/openhachimi/hifisampler/releases) 中的源码与模型文件，解压并放入同一项目文件夹内。
-3. **启动服务**：
-   - **Windows**：双击运行 `start.bat`（首次运行会自动按您的显卡类型创建 `.venv` 并安装依赖）。
-   - **Linux / macOS**：在项目目录终端执行 `./start.sh`。首次运行会自动检测显卡（NVIDIA CUDA / AMD ROCm / CPU）并完成环境与 `config.yaml` 配置。
-4. **接入 OpenUtau**：
-   - **Windows**：将 `hifisampler.exe` 和 `hifisampler.yaml` 复制到 `OpenUtau\Resamplers\` 目录。
-   - **Linux / macOS**：可以直接使用 OpenUtau 内置的 `hifisampler`；或者将项目目录下的 `hifisampler.sh`（或 `hifisampler-linux-x64`）与 `hifisampler.yaml` 复制到 `~/.local/share/OpenUtau/Resamplers/`（复制 `hifisampler.yaml` 时若配合脚本使用，可重命名为 `hifisampler.sh.yaml` 以自动加载表情参数）：
+3. **首次启动服务**：
+   - **Windows**：双击运行一次 `start.bat`（首次运行会自动按您的显卡类型创建 `.venv`、安装依赖并注册服务端路径）。
+   - **Linux / macOS**：在项目目录终端执行一次 `./start.sh`（首次运行会自动检测 NVIDIA CUDA / AMD ROCm / CPU、配置环境并注册服务端路径）。
+4. **接入 OpenUtau（支持自动拉起服务端）**：
+   - **Windows**：将 `hifisampler.exe` 和 `hifisampler.yaml` 复制到 `OpenUtau\Resamplers\` 目录，后续在 OpenUtau 中渲染时会自动拉起服务端。
+   - **Linux / macOS**：将项目目录下的 `hifisampler.sh` 与 `hifisampler.yaml` 复制到 `~/.local/share/OpenUtau/Resamplers/`（复制 `hifisampler.yaml` 时重命名为 `hifisampler.sh.yaml` 以自动加载表情参数），后续渲染时同样支持自动拉起服务端：
      ```bash
      cp hifisampler.sh ~/.local/share/OpenUtau/Resamplers/hifisampler.sh
      cp hifisampler.yaml ~/.local/share/OpenUtau/Resamplers/hifisampler.sh.yaml

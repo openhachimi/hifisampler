@@ -22,10 +22,11 @@ Choose any of the installation methods below based on your operating system and 
 
 ### Method 1: All-in-One Package (Easiest on Windows)
 
-1. Download the latest [Release](https://github.com/openhachimi/hifisampler/releases) package, extract it, and double-click `start.bat` once to start the rendering server.
+1. Download the latest [Release](https://github.com/openhachimi/hifisampler/releases) zip package, extract it, and **double-click `start.bat` once on first use** (this registers the server location and starts the server).
 2. Connect to OpenUtau (choose any option):
-   - **Option A (Recommended — Direct Copy)**: After running `start.bat` at least once, simply **copy** `hifisampler.exe` and `hifisampler.yaml` into OpenUtau's `Resamplers` folder (no administrator privileges or symbolic links required; OpenUtau can also auto-start the server when needed).
-   - **Option B (OpenUtau Built-in Tool)**: Keep `start.bat` running and select the built-in `hifisampler` resampler directly inside OpenUtau.
+   - **Option A (Recommended — Direct Copy + Server Auto-Start)**: Simply **copy** `hifisampler.exe` and `hifisampler.yaml` into OpenUtau's `Resamplers` folder.
+     - **How Auto-Start Works**: Once you have run `start.bat` at least once, you **no longer need to start `start.bat` manually** in daily use. Whenever OpenUtau renders a note and the server is not running, `hifisampler.exe` will automatically launch the server console in the background and render once ready. (If you ever move the server folder to a new path, just run `start.bat` once from the new folder to update its registered path.)
+   - **Option B (OpenUtau Built-in Tool)**: Keep `start.bat` running and select the built-in `hifisampler` resampler directly inside OpenUtau (Note: the built-in tool requires starting `start.bat` manually).
    - **Option C (Symbolic Link)**:
      ```cmd
      mklink "C:\[OpenUtau Path]\Resamplers\hifisampler.exe" "C:\[Project Path]\hifisampler.exe"
@@ -38,12 +39,12 @@ Choose any of the installation methods below based on your operating system and 
 
 1. Install [`uv`](https://docs.astral.sh/uv/getting-started/installation/).
 2. Download the source code and model files from [Releases](https://github.com/openhachimi/hifisampler/releases) and extract them into the project folder.
-3. **Start the server**:
-   - **Windows**: Double-click `start.bat` (on first launch, it automatically detects your GPU and sets up `.venv`).
-   - **Linux / macOS**: Run `./start.sh` in the project directory. On first launch, it automatically detects your hardware (NVIDIA CUDA / AMD ROCm / CPU), installs dependencies, and generates `config.yaml`.
-4. **Connect to OpenUtau**:
-   - **Windows**: Copy `hifisampler.exe` and `hifisampler.yaml` into `OpenUtau\Resamplers\`.
-   - **Linux / macOS**: Either select OpenUtau's built-in `hifisampler` while the server is running, or copy `hifisampler.sh` (or `hifisampler-linux-x64`) and `hifisampler.yaml` into `~/.local/share/OpenUtau/Resamplers/`:
+3. **First-time server setup**:
+   - **Windows**: Double-click `start.bat` once (on first launch, it automatically detects your GPU, sets up `.venv`, and registers the server location).
+   - **Linux / macOS**: Run `./start.sh` once in the project directory (automatically detects NVIDIA CUDA / AMD ROCm / CPU, installs dependencies, generates `config.yaml`, and registers the server location).
+4. **Connect to OpenUtau (with Auto-Start support)**:
+   - **Windows**: Copy `hifisampler.exe` and `hifisampler.yaml` into `OpenUtau\Resamplers\`. Subsequent renders in OpenUtau will auto-start the server when needed.
+   - **Linux / macOS**: Copy `hifisampler.sh` and `hifisampler.yaml` into `~/.local/share/OpenUtau/Resamplers/` (rename `hifisampler.yaml` to `hifisampler.sh.yaml` so OpenUtau loads the expression flags automatically):
      ```bash
      cp hifisampler.sh ~/.local/share/OpenUtau/Resamplers/hifisampler.sh
      cp hifisampler.yaml ~/.local/share/OpenUtau/Resamplers/hifisampler.sh.yaml
