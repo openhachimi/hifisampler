@@ -97,7 +97,7 @@ By default, hifisampler uses **ONNX mode**, which works out of the box across al
 
 ## Implemented Flags
 
-Placing `hifisampler.yaml` in OpenUtau's `Resamplers` folder alongside the client allows OpenUtau to automatically display all supported expression flags:
+After placing `hifisampler.yaml` in OpenUtau's `Resamplers` folder alongside the client and restarting OpenUtau, click **`⚙` (Configure Expressions) -> "Add all expressions suggested by renderers" -> "Apply"** in the bottom-left of the Piano Roll to import all supported expression flags:
 
 - **g (`gen`):** Adjust gender / formants (aligned with standard UTAU resamplers: positive values = deeper/masculine, negative values = brighter/feminine).
   - Range: `-100` to `100` | Default: `0`
