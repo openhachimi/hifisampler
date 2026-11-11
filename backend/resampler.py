@@ -9,7 +9,15 @@ from pathlib import Path
 from config import CONFIG
 from backend import models
 from util.growl import growl
-from util.audio import _peak_abs, dynamic_range_compression_torch, loudness_norm, pre_emphasis_base_tension, read_wav, save_wav
+from util.audio import (
+    _peak_abs,
+    couple_aperiodic_to_tension,
+    dynamic_range_compression_torch,
+    loudness_norm,
+    pre_emphasis_base_tension,
+    read_wav,
+    save_wav,
+)
 from util.parse_utau import flag_re, midi_to_hz, note_to_midi, pitch_string_to_cents
 from util.cache_manager import cache_manager
 
@@ -63,7 +71,7 @@ class Resampler:
         self.flags['g'] = int(np.clip(0 if g_val is None else g_val, -100, 100))
 
         flag_suffix = '_'.join(
-            f"{k}{v}v2" if (k == 'Ht' and v) else f"{k}{v if v is not None else ''}"
+            f"{k}{v}v3" if (k == 'Ht' and v) else f"{k}{v if v is not None else ''}"
             for k, v in sorted(self.flags.items())
             if k in ['Hb', 'Hv', 'Ht', 'g']
         )
@@ -142,9 +150,19 @@ class Resampler:
             with _gpu_lock(torch_gpu), torch.inference_mode():
                 if tension != 0:
                     tension = np.clip(tension, -100, 100)
-                    wave = (breath/100)*(wave - seg_output) + \
-                        pre_emphasis_base_tension(
-                            (voicing/100)*seg_output, -tension/50)
+                    b_tension = -tension / 50.0
+                    aperiodic_raw = wave - seg_output
+                    if voicing > 0 or breath > 0:
+                        seg_mod = pre_emphasis_base_tension(seg_output, b_tension)
+                    else:
+                        seg_mod = torch.zeros_like(seg_output)
+                    if breath > 0:
+                        aperiodic_mod = couple_aperiodic_to_tension(
+                            aperiodic_raw, seg_output, seg_mod, b_tension
+                        )
+                    else:
+                        aperiodic_mod = aperiodic_raw
+                    wave = (breath / 100.0) * aperiodic_mod + (voicing / 100.0) * seg_mod
                 else:
                     wave = (breath/100)*(wave - seg_output) + \
                         (voicing/100)*seg_output
