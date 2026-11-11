@@ -1,8 +1,9 @@
 # OpenUtau Resampler Manifest for HifiSampler
 # Copy this file alongside hifisampler.exe or hifisampler.sh in OpenUtau's Resamplers folder
-# (matching the executable filename, e.g. hifisampler.yaml or hifisampler.sh.yaml).
+# (matching the executable filename, e.g. hifisampler.yaml on Windows, or hifisampler.sh.yaml on Linux/macOS).
 expressions:
-  - name: gender
+  gen:
+    name: gender
     abbr: gen
     type: Numerical
     min: -100
@@ -10,7 +11,9 @@ expressions:
     default_value: 0
     is_flag: true
     flag: g
-  - name: breathiness (hifi)
+    skip_output_if_default: false
+  Hb:
+    name: breathiness (hifi)
     abbr: Hb
     type: Numerical
     min: 0
@@ -18,7 +21,9 @@ expressions:
     default_value: 100
     is_flag: true
     flag: Hb
-  - name: voicing (hifi)
+    skip_output_if_default: true
+  Hv:
+    name: voicing (hifi)
     abbr: Hv
     type: Numerical
     min: 0
@@ -26,7 +31,9 @@ expressions:
     default_value: 100
     is_flag: true
     flag: Hv
-  - name: tension (hifi)
+    skip_output_if_default: true
+  Ht:
+    name: tension (hifi)
     abbr: Ht
     type: Numerical
     min: -100
@@ -34,7 +41,9 @@ expressions:
     default_value: 0
     is_flag: true
     flag: Ht
-  - name: growl (hifi)
+    skip_output_if_default: true
+  HG:
+    name: growl (hifi)
     abbr: HG
     type: Numerical
     min: 0
@@ -42,15 +51,19 @@ expressions:
     default_value: 0
     is_flag: true
     flag: HG
-  - name: loudness norm (hifi)
+    skip_output_if_default: true
+  norm:
+    name: normalize
     abbr: norm
     type: Numerical
     min: 0
     max: 100
-    default_value: 100
+    default_value: 86
     is_flag: true
     flag: P
-  - name: pitch shift (10 cents) (hifi)
+    skip_output_if_default: false
+  t:
+    name: pitch shift (10 cents) (hifi)
     abbr: t
     type: Numerical
     min: -120
@@ -58,7 +71,9 @@ expressions:
     default_value: 0
     is_flag: true
     flag: t
-  - name: amplitude modulation (hifi)
+    skip_output_if_default: true
+  A:
+    name: amplitude modulation (hifi)
     abbr: A
     type: Numerical
     min: -100
@@ -66,7 +81,9 @@ expressions:
     default_value: 0
     is_flag: true
     flag: A
-  - name: force regenerate cache (hifi)
+    skip_output_if_default: true
+  G:
+    name: force regenerate cache (hifi)
     abbr: G
     type: Options
     min: 0
@@ -76,8 +93,10 @@ expressions:
     flag: G
     options:
       - ""
-      - "G"
-  - name: loop mode (hifi)
+      - G
+    skip_output_if_default: true
+  He:
+    name: loop mode (hifi)
     abbr: He
     type: Options
     min: 0
@@ -87,4 +106,5 @@ expressions:
     flag: He
     options:
       - ""
-      - "He"
+      - He
+    skip_output_if_default: true

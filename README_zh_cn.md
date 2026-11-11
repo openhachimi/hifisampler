@@ -97,7 +97,7 @@ pc-nsf-hifigan 采用神经网络对输入特征进行上采样，音质比传�
 
 ## 已实现的 Flags 参数
 
-将 `hifisampler.yaml` 一并放入 OpenUtau 的 `Resamplers` 文件夹后，OpenUtau 会自动识别并显示以下全部表情参数：
+将 `hifisampler.yaml` 一并放入 OpenUtau 的 `Resamplers` 文件夹并重启 OpenUtau 后，在钢琴卷帘左下角点击 **`⚙`（表情设置） ->「添加渲染器建议的所有表情」->「应用」**，即可一键导入以下全部表情参数：
 
 - **g (`gen`):** 调整性别 / 共振峰（与其他主流采样器一致：正值偏成熟/男声，负值偏幼态/女声）。
   - 范围: `-100` 到 `100` | 默认: `0`
