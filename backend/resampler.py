@@ -9,6 +9,7 @@ from pathlib import Path
 from config import CONFIG
 from backend import models
 from util.growl import growl
+from util.vocal_fry import apply_lf_vocal_fry, prepare_vocal_fry_excitation
 from util.audio import (
     _peak_abs,
     couple_aperiodic_to_tension,
@@ -353,9 +354,11 @@ class Resampler:
         logging.debug('Calculating pitch.')
         # Calculate pitch in MIDI note number terms
         pitch = self.pitchbend / 100 + self.pitch
+        t_val_fry = 0.0
         if "t" in self.flags.keys() and self.flags["t"]:
             t_val = np.clip(self.flags["t"], -120, 120)
             pitch = pitch + t_val / 10
+            t_val_fry = float(t_val)
         t_pitch = 60 * np.arange(len(pitch)) / (self.tempo * 96) + new_start
         if len(pitch) < 2 or np.all(pitch == pitch[0]):
             const_pitch = float(pitch[0]) if len(pitch) else float(self.pitch)
@@ -366,6 +369,30 @@ class Resampler:
             pitch_render = pitch_interp(np.clip(t, new_start, t_pitch[-1]))
             f0_render = midi_to_hz(pitch_render)
         logging.debug(f'f0_render: {f0_render.shape}')
+
+        hg_strength_chk = self.flags.get("HG")
+        hg_active = hg_strength_chk is not None and hg_strength_chk > 0
+        fry_ctx = None
+        if getattr(CONFIG, "auto_vocal_fry", True) and not hg_active:
+            fry_ctx = prepare_vocal_fry_excitation(
+                pitchbend=self.pitchbend,
+                base_pitch_midi=self.pitch,
+                t_flag_val=t_val_fry,
+                tempo=self.tempo,
+                new_start=new_start,
+                new_end=new_end,
+                t_mel=t,
+                f0_render=f0_render,
+                mel_render=mel_render,
+                sr=CONFIG.sample_rate,
+                n_fft=CONFIG.n_fft,
+                mel_fmin=CONFIG.mel_fmin,
+                mel_fmax=CONFIG.mel_fmax,
+                new_con=new_end - length_req,
+            )
+            if fry_ctx is not None:
+                mel_render = fry_ctx["mel_render"]
+                f0_render = fry_ctx["f0_render"]
 
         logging.debug('Cutting mel and f0.')
 
@@ -475,6 +502,9 @@ class Resampler:
                 else:
                     render = loudness_norm(
                         render, CONFIG.sample_rate, peak=-1, loudness=-16.0, block_size=0.400)
+
+        if fry_ctx is not None:
+            render = apply_lf_vocal_fry(render, fry_ctx, CONFIG.sample_rate)
 
         volume_scale = self.volume / 100.0
         raw_peak = _peak_abs(render)

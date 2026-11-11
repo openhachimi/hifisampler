@@ -27,6 +27,7 @@ processing:
   trim_silence: true  # Trim silence for better wave normalization.
   silence_threshold: -52.0  # dB
   loop_mode: true
+  auto_vocal_fry: true  # Automatically synthesize vocal fry on deep relative-pit scoops
   peak_limit: 1.0
   fill: 6
 performance:

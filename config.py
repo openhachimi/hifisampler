@@ -54,6 +54,7 @@ class Config:
     trim_silence: bool = True  # 是否在响度标准化前截取无声部分
     silence_threshold: float = -52.0
     loop_mode: bool = True
+    auto_vocal_fry: bool = True
     peak_limit: float = 1.0
     # max_workers can be an int or 'auto' (resolved to physical cores at runtime)
     max_workers: Any = 2
