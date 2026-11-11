@@ -6,7 +6,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-version = '0.1.0'
+version = '0.1.1'
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 

@@ -1,6 +1,6 @@
 [project]
 name = "hifisampler"
-version = "0.1.0"
+version = "0.1.1"
 description = "A new UTAU resampler based on pc-nsf-hifigan and straycatresampler for virtual singer."
 readme = "README.md"
 requires-python = ">=3.11, <3.13"
