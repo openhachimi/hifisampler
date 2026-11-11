@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 from pathlib import Path
 import threading
@@ -23,6 +24,8 @@ _METER_CACHE = {}
 _METER_LOCK = threading.Lock()
 _PRE_EMPHASIS_CACHE = {}
 _PRE_EMPHASIS_LOCK = threading.Lock()
+_LF_GLOTTAL_TABLE = None
+_LF_GLOTTAL_LOCK = threading.Lock()
 
 
 def _get_loudness_meter(rate: int, block_size: float):
@@ -191,37 +194,155 @@ def loudness_norm(
     return audio
 
 
+def _middle_ear_loudness_weight(freqs: torch.Tensor) -> torch.Tensor:
+    """
+    Psychoacoustic middle-ear / equal-loudness frequency weighting W(f)
+    with 300 Hz low-frequency floor, 400 Hz double pole, 1200 Hz presence zero,
+    3100 Hz upper pole, and 0.33 Stevens compression exponent.
+    """
+    fc = torch.clamp(freqs, min=300.0)
+    fc2 = fc * fc
+    num = (fc2 * fc2) * (fc2 + 1200.0 ** 2)
+    den = ((fc2 + 400.0 ** 2) ** 2) * (fc2 + 3100.0 ** 2)
+    return torch.pow(num / torch.clamp(den, min=1e-20), 0.33)
+
+
 def _get_pre_emphasis_tensors(device: torch.device):
-    key = (CONFIG.win_size, CONFIG.n_fft, str(device))
+    key = (CONFIG.win_size, CONFIG.n_fft, CONFIG.sample_rate, str(device))
     with _PRE_EMPHASIS_LOCK:
         cached = _PRE_EMPHASIS_CACHE.get(key)
         if cached is None:
             window = torch.hann_window(CONFIG.win_size, device=device, dtype=torch.float32)
             fft_bin = CONFIG.n_fft // 2 + 1
             arange_bins = torch.arange(0, fft_bin, device=device, dtype=torch.float32)
-            cached = (window, arange_bins, fft_bin)
+            freqs = arange_bins * (float(CONFIG.sample_rate) / float(CONFIG.n_fft))
+            ear_weight = _middle_ear_loudness_weight(freqs)
+            cached = (window, arange_bins, fft_bin, freqs, ear_weight)
             _PRE_EMPHASIS_CACHE[key] = cached
         return cached
 
 
-def _fant_lf_poles(rd: float, f0_ref: float = 240.0):
+def _solve_lf_unit_period_params(rd: float):
     """
-    Compute analytical LF glottal spectral poles (fa, Fg) and open quotient Oq
-    from Fant (1995) 'The LF-model revisited: Transformations and frequency domain analysis'
-    and Doval et al. (2006) 'The spectrum of glottal flow models'.
-    Valid physiological range: Rd in [0.25, 3.00].
+    Solve normalized continuous-time Fant (1995) LF glottal pulse parameters on unit period T0 = 1.0
+    for Rd in [0.06, 3.00], using a C^inf-smooth softplus return-phase corner near Rd = 0.21
+    so Te + Ta < 1.0 and parameter derivatives remain strictly continuous everywhere.
     """
-    rd = float(np.clip(rd, 0.25, 3.00))
-    ra = (-1.0 + 4.8 * rd) / 100.0
-    rk = (22.4 + 11.8 * rd) / 100.0
-    # Fant (1995) Eq. 4: 0.11 * Rd = (0.5 + 1.2 * Rk) * (Rk / (4 * Rg) + Ra)
-    rg_denom = 4.0 * (0.11 * rd - ra * (0.5 + 1.2 * rk))
-    rg = (rk * (0.5 + 1.2 * rk)) / max(rg_denom, 1e-4)
-    oq = (1.0 + rk) / (2.0 * rg)
+    rd = float(np.clip(rd, 0.06, 3.00))
+    tau = 0.035
+    x_s = (rd - 0.2083333) / tau
+    softplus_val = tau * (max(x_s, 0.0) + math.log1p(math.exp(-abs(x_s))))
+    ra = 0.0008 + 0.048 * softplus_val
+    rk = 0.224 + 0.118 * rd
+    denom = (0.11 * rd) / (0.5 + 1.2 * rk) - ra
+    rg = (0.25 * rk) / max(denom, 1e-4)
 
-    fa = f0_ref / (2.0 * np.pi * ra)
-    fg = f0_ref / (2.0 * oq)
-    return fa, fg, oq
+    tp = 1.0 / (2.0 * rg)
+    ta = ra
+    te = min(tp * (1.0 + rk), 1.0 - ta - 1e-4)
+    wg = math.pi / tp
+    tc = max(1.0 - te, 1e-5)
+
+    # 1. Return-phase decay rate eps: 1 - eps * ta - exp(-eps * tc) = 0
+    if tc <= ta + 1e-7:
+        eps = 1.0 / max(ta, 1e-6)
+    else:
+        lo = 1e-4
+        hi = 1.0 / max(ta, 1e-6)
+        for _ in range(40):
+            mid = 0.5 * (lo + hi)
+            if 1.0 - mid * ta - math.exp(-mid * tc) > 0.0:
+                lo = mid
+            else:
+                hi = mid
+        eps = 0.5 * (lo + hi)
+
+    exp_ret = math.exp(-eps * tc)
+    i_ret = (1.0 - exp_ret) / (eps * eps * ta) - (tc * exp_ret) / (eps * ta)
+
+    # 2. Opening-phase growth rate alpha: strictly decreasing A_open(alpha) == i_ret
+    sin_wte = math.sin(wg * te)
+    cos_wte = math.cos(wg * te)
+
+    def a_open(a: float) -> float:
+        exp_neg = math.exp(-a * te) if a >= -50.0 else math.exp(min(-a * te, 60.0))
+        return (-wg * exp_neg - a * sin_wte + wg * cos_wte) / (sin_wte * (a * a + wg * wg))
+
+    a_lo = -1.0
+    while a_open(a_lo) < i_ret and a_lo > -500.0:
+        a_lo *= 2.0
+    a_hi = 1.0
+    while a_open(a_hi) > i_ret and a_hi < 1e6:
+        a_hi *= 2.0
+    for _ in range(52):
+        a_mid = 0.5 * (a_lo + a_hi)
+        if a_open(a_mid) > i_ret:
+            a_lo = a_mid
+        else:
+            a_hi = a_mid
+    alpha = 0.5 * (a_lo + a_hi)
+    return te, ta, wg, eps, alpha
+
+
+def _get_lf_glottal_table():
+    """
+    Lazily build and cache the exact closed-form continuous-time LF harmonic log-magnitude table
+    ln(g_tilde_k(Rd)) for Rd in [0.07, 3.00] (N_RD = 96) and harmonic index k = 1..256,
+    normalized strictly at the fundamental (g_tilde_1(Rd) == 1.0, i.e. 0.00 dB at H1),
+    along with its arc-length equalized perceptual tilt coordinate psi_grid in [0.0, 1.0].
+    """
+    global _LF_GLOTTAL_TABLE
+    with _LF_GLOTTAL_LOCK:
+        if _LF_GLOTTAL_TABLE is not None:
+            return _LF_GLOTTAL_TABLE
+
+        n_rd = 96
+        k_max = 256
+        rd_grid = np.linspace(0.07, 3.00, n_rd, dtype=np.float64)
+        ks = np.arange(1, k_max + 1, dtype=np.float64)
+        w = 2.0 * np.pi * ks
+        jw = 1j * w
+
+        log_table = np.zeros((n_rd, k_max), dtype=np.float64)
+        for i, rd in enumerate(rd_grid):
+            te, ta, wg, eps, alpha = _solve_lf_unit_period_params(float(rd))
+            tc = max(1.0 - te, 1e-5)
+            sin_wte = math.sin(wg * te)
+            cos_wte = math.cos(wg * te)
+            neg_inv_sin = -1.0 / sin_wte
+
+            exp_neg_ate = math.exp(-alpha * te) if alpha >= -50.0 else math.exp(min(-alpha * te, 60.0))
+            e_j_wte = np.exp(-jw * te)
+            g_open = neg_inv_sin * (
+                wg * exp_neg_ate + e_j_wte * ((alpha - jw) * sin_wte - wg * cos_wte)
+            ) / ((alpha - jw) ** 2 + wg * wg)
+
+            exp_ret = math.exp(-eps * tc)
+            e_pos_jwte = np.exp(jw * te)
+            g_ret = (e_j_wte / (eps * ta)) * (
+                (1.0 - exp_ret * e_pos_jwte) / (eps + jw) - exp_ret * (1.0 - e_pos_jwte) / jw
+            )
+
+            g_mag = np.abs(g_open + g_ret) / ks
+            g1 = max(float(g_mag[0]), 1e-12)
+            g_tilde = np.maximum(g_mag / g1, 1e-6)
+            log_table[i, :] = np.log(g_tilde)
+            log_table[i, 0] = 0.0
+
+        # Construct strictly monotonic perceptual arc-length coordinate psi_grid in [0, 1]
+        # (psi=0 at tense Rd=0.07, psi=1 at lax Rd=3.00) from harmonics k=2..24 log-slope steps
+        step_norms = np.sqrt(np.mean(np.diff(log_table[:, 1:24], axis=0) ** 2, axis=1)) + 1e-5
+        psi_cum = np.concatenate([[0.0], np.cumsum(step_norms)])
+        psi_grid = psi_cum / psi_cum[-1]
+
+        power_templates = np.exp(2.0 * log_table[:, :80])  # [N_RD, 80] for <= 8 kHz Rd0 estimation
+        _LF_GLOTTAL_TABLE = (
+            rd_grid.astype(np.float32),
+            log_table.astype(np.float32),
+            power_templates.astype(np.float32),
+            psi_grid.astype(np.float32),
+        )
+        return _LF_GLOTTAL_TABLE
 
 
 def _estimate_harmonic_f0(mean_power: torch.Tensor, sr: int, n_fft: int) -> float:
@@ -249,17 +370,18 @@ def _estimate_harmonic_f0(mean_power: torch.Tensor, sr: int, n_fft: int) -> floa
     if max_val < 0.25 * r0:
         return 240.0
 
-    # Pick the first local peak >= 0.82 * max_val to prevent subharmonic octave-down jumps
+    # Pick the first local peak >= 0.82 * max_val (including boundary lag_min) to prevent subharmonic octave-down jumps
     threshold = 0.82 * max_val
-    is_local_peak = (seg[1:-1] >= seg[:-2]) & (seg[1:-1] >= seg[2:]) & (seg[1:-1] >= threshold)
+    left_nb = autocorr[lag_min - 1:lag_max]
+    right_nb = autocorr[lag_min + 1:lag_max + 2]
+    is_local_peak = (seg >= left_nb) & (seg >= right_nb) & (seg >= threshold)
     peak_indices = torch.nonzero(is_local_peak, as_tuple=False)
     if peak_indices.numel() > 0:
-        rel_idx = int(peak_indices[0].item()) + 1
+        rel_idx = int(peak_indices[0].item())
     else:
         rel_idx = int(torch.argmax(seg).item())
 
     tau = lag_min + rel_idx
-    # 3-point parabolic interpolation for sub-sample lag accuracy
     if 1 <= tau < n_fft // 2 - 1:
         y_prev = float(autocorr[tau - 1].item())
         y_curr = float(autocorr[tau].item())
@@ -276,33 +398,102 @@ def _estimate_harmonic_f0(mean_power: torch.Tensor, sr: int, n_fft: int) -> floa
     return float(np.clip(sr / max(tau_interp, 1.0), 95.0, 580.0))
 
 
+def _estimate_baseline_rd(
+    mean_power: torch.Tensor,
+    formant_env_log: torch.Tensor,
+    freqs: torch.Tensor,
+    f0_src: float,
+    sr: int,
+    n_fft: int,
+) -> float:
+    """
+    Estimate intrinsic source glottal shape Rd0 of the recording (<= 8 kHz) free of
+    studio proximity-effect and inter-harmonic valley bias by integrating harmonic peak
+    neighborhoods around k * f0_src and matching against LF glottal templates over k >= 2
+    alongside broadband harmonic presence-to-fundamental balance.
+    Returns Rd0 in [0.45, 1.35] (low Rd0 for sharp/pressed 'edge'/'power' voices, ~1.0-1.3 for modal/lax).
+    """
+    total_p = float(torch.sum(mean_power).item())
+    if total_p < 1e-10:
+        return 1.0
+
+    # 1. Broadband harmonic presence-to-low balance directly on mean_power (avoids inter-harmonic valley division)
+    low_band = (freqs >= max(110.0, 0.80 * f0_src)) & (freqs <= max(850.0, 3.2 * f0_src))
+    pres_band = (freqs >= 1500.0) & (freqs <= 6500.0)
+    e_low = float(torch.sum(mean_power[low_band]).item()) + 1e-12
+    e_pres = float(torch.sum(mean_power[pres_band]).item()) + 1e-12
+    pres_ratio_db = 10.0 * math.log10(e_pres / e_low)
+
+    # 2. Harmonic-peak k >= 2 Itakura-Saito slope against LF templates
+    k_est = min(56, int(8000.0 / max(f0_src, 95.0)))
+    rd_is = 1.0
+    if k_est >= 5:
+        mp_np = mean_power.detach().cpu().numpy()
+        bin_hz = float(sr) / float(n_fft)
+        half_bw_bins = max(1, int(round(0.32 * f0_src / bin_hz)))
+        n_bins = mp_np.shape[0]
+        q_obs = np.empty(k_est - 1, dtype=np.float64)
+        for k in range(2, k_est + 1):
+            fk = k * f0_src
+            x_lip2 = (max(fk, 350.0) / 4250.0) ** 2
+            lip_p = (2.0765167 * x_lip2) / (2.0765167 + x_lip2)
+            c_bin = int(round(fk / bin_hz))
+            lo_b = max(1, c_bin - half_bw_bins)
+            hi_b = min(n_bins, c_bin + half_bw_bins + 1)
+            peak_p = float(np.max(mp_np[lo_b:hi_b])) if hi_b > lo_b else 1e-10
+            q_obs[k - 2] = max(peak_p / max(lip_p, 1e-4), 1e-10)
+
+        q_sum = float(np.sum(q_obs))
+        if q_sum > 1e-10:
+            q_norm = np.maximum(q_obs / q_sum, 1e-8)
+            rd_grid, _, p_templates, _ = _get_lf_glottal_table()
+            tpl = p_templates[:, 1:k_est].astype(np.float64)
+            tpl_norm = np.maximum(tpl / np.maximum(np.sum(tpl, axis=1, keepdims=True), 1e-12), 1e-8)
+            ratio = q_norm[np.newaxis, :] / tpl_norm
+            is_div = np.mean(ratio - np.log(ratio) - 1.0, axis=1)
+            rd_is = float(rd_grid[int(np.argmin(is_div))])
+
+    # Map presence ratio [-24 dB (lax/mellow) .. +8 dB (sharp/edge)] smoothly to [1.32 .. 0.45]
+    u_bright = float(np.clip((pres_ratio_db + 24.0) / 32.0, 0.0, 1.0))
+    rd_bright = 1.32 - 0.87 * u_bright
+    rd_blend = 0.65 * rd_bright + 0.35 * float(np.clip(rd_is, 0.40, 1.60))
+    return float(np.clip(rd_blend, 0.45, 1.35))
+
+
+def _extract_cepstral_formant_envelope(
+    mean_power: torch.Tensor, sr: int, n_fft: int
+) -> torch.Tensor:
+    """
+    Extract zero-macroscopic-tilt vocal-tract formant log-envelope (quefrency q in [3, sr/1150])
+    used both for formant-free baseline Rd0 estimation and formant plateau protection.
+    """
+    if float(torch.sum(mean_power).item()) < 1e-10:
+        return torch.zeros_like(mean_power)
+
+    log_spec_mean = 0.5 * torch.log(torch.clamp(mean_power, min=1e-12))
+    cep = torch.fft.irfft(log_spec_mean, n=n_fft)
+
+    q_low = 3
+    q_high = min(n_fft // 2 - 1, max(12, int(sr / 1150.0)))
+    cep_bp = torch.zeros_like(cep)
+    cep_bp[q_low:q_high] = cep[q_low:q_high]
+    cep_bp[-q_high + 1:-q_low + 1] = cep[-q_high + 1:-q_low + 1]
+    return torch.fft.rfft(cep_bp, n=n_fft).real
+
+
 def _apply_formant_plateau_protection(
     log_gain: torch.Tensor,
-    mean_power: torch.Tensor,
+    formant_prominence: torch.Tensor,
     freqs: torch.Tensor,
     sr: int,
     n_fft: int,
     alpha_prot: float = 0.50,
 ) -> torch.Tensor:
     """
-    Formant-Preserving Slope-Damped Plateau (Option C):
-    Extracts vowel formant peaks (F1, F2, F3) via band-pass cepstral liftering
-    (quefrency q in [4, sr/1200]) and damps the local slope of log_gain across
-    formant peaks while preserving the full macroscopic LF spectral tilt.
+    Formant-Preserving Slope-Damped Plateau:
+    Damps the local derivative d(log_gain)/df across vowel formant peaks (F1, F2, F3)
+    in [220 Hz, 3600 Hz] while preserving 100% of the macroscopic LF glottal spectral tilt.
     """
-    if float(torch.sum(mean_power).item()) < 1e-10:
-        return log_gain
-
-    log_spec_mean = 0.5 * torch.log(torch.clamp(mean_power, min=1e-12))
-    cep = torch.fft.irfft(log_spec_mean, n=n_fft)
-
-    q_low = 4
-    q_high = min(n_fft // 2 - 1, max(12, int(sr / 1200.0)))
-    cep_bp = torch.zeros_like(cep)
-    cep_bp[q_low:q_high] = cep[q_low:q_high]
-    cep_bp[-q_high + 1:-q_low + 1] = cep[-q_high + 1:-q_low + 1]
-
-    formant_prominence = torch.fft.rfft(cep_bp, n=n_fft).real
     vowel_band = (freqs >= 220.0) & (freqs <= 3600.0)
     pos_prom = torch.relu(formant_prominence) * vowel_band.to(dtype=log_gain.dtype)
     max_prom = torch.max(pos_prom)
@@ -311,7 +502,6 @@ def _apply_formant_plateau_protection(
 
     formant_mask = torch.clamp(pos_prom / (max_prom + 1e-6), 0.0, 1.0)
 
-    # Damp local derivative d(log_gain)/df inside formant peak bandwidths [220 Hz, 3600 Hz]
     dg = log_gain[1:] - log_gain[:-1]
     mask_mid = 0.5 * (formant_mask[1:] + formant_mask[:-1])
     low_idx = min(log_gain.numel() - 2, max(1, int(200.0 * n_fft / sr)))
@@ -320,24 +510,42 @@ def _apply_formant_plateau_protection(
     dg_damped = dg.clone()
     dg_damped[low_idx:ref_idx] = dg[low_idx:ref_idx] * (1.0 - alpha_prot * mask_mid[low_idx:ref_idx])
 
-    # Rescale the damped increments in [low_idx, ref_idx] so the total tilt at ref_idx is 100% preserved
     orig_span = float(torch.sum(dg[low_idx:ref_idx]).item())
     damped_span = float(torch.sum(dg_damped[low_idx:ref_idx]).item())
     if abs(damped_span) > 1e-5:
-        dg_damped[low_idx:ref_idx] = dg_damped[low_idx:ref_idx] * (orig_span / damped_span)
+        span_scale = float(np.clip(orig_span / damped_span, 0.5, 2.0))
+        dg_damped[low_idx:ref_idx] = dg_damped[low_idx:ref_idx] * span_scale
 
     log_gain_prot = torch.zeros_like(log_gain)
     log_gain_prot[0] = log_gain[0]
     log_gain_prot[1:] = log_gain[0] + torch.cumsum(dg_damped, dim=0)
-
     return log_gain_prot
+
+
+def _interp_lf_log_spectrum(rd_val: float, f0_src: float, freqs_np: np.ndarray) -> np.ndarray:
+    """
+    Evaluate continuous ripple-free LF log-glottal spectrum ln(g_tilde(f / f0_src; Rd))
+    anchored strictly at 0.0 dB for f <= f0_src (H1 pivot invariance).
+    """
+    rd_grid, log_table, _, _ = _get_lf_glottal_table()
+    pos = float(np.clip((rd_val - rd_grid[0]) / (rd_grid[1] - rd_grid[0]), 0.0, len(rd_grid) - 1.0001))
+    i0 = int(math.floor(pos))
+    frac = pos - i0
+    row = (1.0 - frac) * log_table[i0] + frac * log_table[i0 + 1]  # [K_max]
+
+    ks = np.arange(1, len(row) + 1, dtype=np.float32)
+    nu = np.maximum(freqs_np / max(f0_src, 1.0), 1.0)
+    return np.interp(nu, ks, row).astype(np.float32)
 
 
 def pre_emphasis_base_tension(wave, b):
     """
-    Clean-room minimum-phase LF glottal spectral tilt filter with wide dynamic range,
-    adaptive source-f0 anchoring, and formant-preserving cepstral liftering (Option C),
-    based on Fant (1995) and Doval et al. (2006).
+    Clean-room v3 minimum-phase LF glottal tension engine:
+    1. Adaptive source-f0 & Itakura-Saito baseline Rd0 estimation with sharp-voice protection;
+    2. Exact closed-form continuous-time LF harmonic ratio anchored strictly at H1 (f = f0_src);
+    3. Bidirectional high-frequency counter-damping ramp (+/- 0.8 Np = +/- 6.95 dB over 8.5-11.5 kHz);
+    4. Cepstral formant plateau protection (F1/F2/F3 vowel invariance) & Hilbert minimum-phase;
+    5. Psychoacoustic middle-ear loudness preservation W(f) clamped safely in [0.45, 2.0].
 
     Args:
         wave: [1, 1, t] periodic harmonic waveform tensor
@@ -349,108 +557,240 @@ def pre_emphasis_base_tension(wave, b):
     orig_dtype = wave.dtype
     wave = wave.float()
     original_length = wave.size(-1)
-    pad_length = (CONFIG.hop_size - (original_length %
-                  CONFIG.hop_size)) % CONFIG.hop_size
+    pad_length = (CONFIG.hop_size - (original_length % CONFIG.hop_size)) % CONFIG.hop_size
     min_stft_len = CONFIG.n_fft // 2 + 1
     if original_length + pad_length < min_stft_len:
         pad_length = min_stft_len - original_length
-    wave = torch.nn.functional.pad(
-        wave, (0, pad_length), mode='constant', value=0)
+    wave = torch.nn.functional.pad(wave, (0, pad_length), mode='constant', value=0)
     wave = wave.squeeze(1)
 
-    window, arange_bins, _ = _get_pre_emphasis_tensors(wave.device)
+    window, _, _, freqs, ear_weight = _get_pre_emphasis_tensors(wave.device)
     spec = torch.stft(
         wave,
         CONFIG.n_fft,
         hop_length=CONFIG.hop_size,
         win_length=CONFIG.win_size,
         window=window,
-        return_complex=True
+        return_complex=True,
     )
 
     b_clamped = float(np.clip(b, -2.0, 2.0))
+    sr = int(CONFIG.sample_rate)
+    n_fft = int(CONFIG.n_fft)
 
-    # Compute energy-weighted mean power spectrum across frames for adaptive f0_src and formant liftering
+    # 1. Voiced-energy-weighted mean power spectrum, adaptive f0_src, and baseline Rd0
     power_spec = spec.real ** 2 + spec.imag ** 2  # [1, F, T]
     frame_energy = torch.sum(power_spec, dim=1, keepdim=True)  # [1, 1, T]
-    total_energy = torch.sum(frame_energy)
-    if float(total_energy.item()) > 1e-10:
-        mean_power = torch.sum(power_spec * frame_energy, dim=2).squeeze(0) / (total_energy + 1e-12)
+    total_energy = float(torch.sum(frame_energy).item())
+    if total_energy <= 1e-12:
+        return torch.zeros_like(wave).unsqueeze(1)[:, :, :original_length].to(dtype=orig_dtype)
+
+    mean_power = torch.sum(power_spec * frame_energy, dim=2).squeeze(0) / (total_energy + 1e-12)
+    f0_src = _estimate_harmonic_f0(mean_power, sr, n_fft)
+    formant_prominence = _extract_cepstral_formant_envelope(mean_power, sr, n_fft)
+    rd0 = _estimate_baseline_rd(mean_power, formant_prominence, freqs, f0_src, sr, n_fft)
+
+    # 2. Perceptual arc-length Rd warping with soft-knee rail protection on sharp/intense voices
+    rd_grid, _, _, psi_grid = _get_lf_glottal_table()
+
+    if b_clamped < 0.0:
+        # Positive tension (Ht > 0, b in [-2, 0]): map smoothly down to voice-adaptive tense floor
+        # Gives mellow voices (psi0 ~ 0.72) full ~13 dB upward travel while protecting sharp voices (psi0 ~ 0.38)
+        rd_base = rd0
+        psi0 = float(np.interp(rd_base, rd_grid, psi_grid))
+        u = -b_clamped / 2.0
+        psi_floor = min(psi0, 0.042 + 0.030 * max(0.0, 0.55 - psi0))
+        psi_target = psi_floor + (psi0 - psi_floor) * (1.0 - math.tanh(1.75 * u) / math.tanh(1.75))
+        tilt_scale = 1.28
     else:
-        mean_power = torch.mean(power_spec, dim=2).squeeze(0)
+        # Negative tension (Ht < 0, b in (0, +2]): guarantee full downward softening excursion
+        # even on mellow voices by capping rd_base <= 0.92 while preserving wider travel on sharp voices
+        rd_base = min(rd0, 0.92)
+        psi0 = float(np.interp(rd_base, rd_grid, psi_grid))
+        drive = (b_clamped / 2.0) * 1.65
+        psi_target = psi0 + (1.0 - psi0) * math.tanh(drive)
+        tilt_scale = 1.48
 
-    f0_src = _estimate_harmonic_f0(mean_power, int(CONFIG.sample_rate), int(CONFIG.n_fft))
+    rd_target = float(np.interp(psi_target, psi_grid, rd_grid))
 
-    # Wide-range physiological Rd mapping in [0.25, 3.00] around neutral Rd0 = 1.0
-    rd0 = 1.0
-    rd_target = float(np.clip(3.0 ** (b_clamped / 2.0), 0.25, 3.00))
+    # 3. Closed-form LF harmonic log-ratio (strictly 0 dB at and below H1 = f0_src)
+    freqs_np = freqs.detach().cpu().numpy()
+    log_g0 = _interp_lf_log_spectrum(rd_base, f0_src, freqs_np)
+    log_gt = _interp_lf_log_spectrum(rd_target, f0_src, freqs_np)
+    raw_delta_np = tilt_scale * (log_gt - log_g0)
+    log_gain = torch.from_numpy(raw_delta_np).to(device=wave.device, dtype=torch.float32)
 
-    fa0, _, oq0 = _fant_lf_poles(rd0, f0_ref=f0_src)
-    fa_t, fg_t, oq_t = _fant_lf_poles(rd_target, f0_ref=f0_src)
+    # 4. Bidirectional high-frequency counter-damping ramp (+/- 0.8 Np = +/- 6.95 dB over [8.2k, 11.5k] Hz)
+    # Prevents >9 kHz sibilant harshness on Ht > 0 AND preserves vocal "air" on Ht < 0
+    hf_ramp = torch.clamp((freqs - 8200.0) / 3300.0, min=0.0, max=1.0)
+    hf_counter = torch.clamp(-hf_ramp * log_gain, min=-0.80, max=0.80)
+    log_gain = log_gain + hf_counter
 
-    freqs = arange_bins * (float(CONFIG.sample_rate) / float(CONFIG.n_fft))
-
-    # 1. Cascade return-phase & open-asymmetry spectral tilt pole ratio (Doval et al. 2006)
-    # Wide dynamic range cascade order for dramatic yet smooth +/-100 excursion
-    tilt_order = 1.85 if b_clamped < 0.0 else 2.25
-    gain_return = torch.pow(
-        (1.0 + (freqs / fa0) ** 2) / (1.0 + (freqs / fa_t) ** 2),
-        0.5 * tilt_order,
-    )
-
-    # 2. Open-phase glottal formant H1-H2 shelf, anchored to unity (0 dB) at DC
-    oq_ratio = (oq_t / oq0) ** 2.8
-    shelf_corner = 2.2 * fg_t
-    gain_open_raw = torch.sqrt(
-        (oq_ratio ** 2 + (freqs / shelf_corner) ** 2) / (1.0 + (freqs / shelf_corner) ** 2)
-    )
-    dc_weight = (freqs ** 2) / (freqs ** 2 + 45.0 ** 2)
-    gain_open = 1.0 + dc_weight * (gain_open_raw - 1.0)
-
-    # 3. High-frequency (>8.5 kHz) ultra-treble protection to prevent boosting >10 kHz hiss
-    log_gain = torch.log(torch.clamp(gain_return * gain_open, min=1e-4))
-    hf_taper = 1.0 / (1.0 + (freqs / 8500.0) ** 2)
-    log_gain = torch.where(
-        log_gain > 0.0,
-        log_gain * (0.72 + 0.28 * hf_taper),
-        log_gain,
-    )
-
-    # 4. Option C: Formant-preserving slope-damped plateau on vowel formants F1/F2/F3
+    # 5. Formant-preserving slope-damped plateau across vowel formants F1/F2/F3
     log_gain = _apply_formant_plateau_protection(
-        log_gain, mean_power, freqs, int(CONFIG.sample_rate), int(CONFIG.n_fft), alpha_prot=0.50
+        log_gain, formant_prominence, freqs, sr, n_fft, alpha_prot=0.50
     )
 
-    # 5. Minimum-phase complex transfer function via causal real cepstrum folding
-    cepstrum = torch.fft.irfft(log_gain, n=CONFIG.n_fft)
+    # 6. Minimum-phase complex transfer function via causal real cepstrum folding
+    cepstrum = torch.fft.irfft(log_gain, n=n_fft)
     cep_min = torch.zeros_like(cepstrum)
-    half_n = CONFIG.n_fft // 2
+    half_n = n_fft // 2
     cep_min[0] = cepstrum[0]
     cep_min[1:half_n] = 2.0 * cepstrum[1:half_n]
     cep_min[half_n] = cepstrum[half_n]
-    gain = torch.exp(torch.fft.rfft(cep_min, n=CONFIG.n_fft)).unsqueeze(0).unsqueeze(2)
+    gain = torch.exp(torch.fft.rfft(cep_min, n=n_fft)).unsqueeze(0).unsqueeze(2)
 
     filtered_wave = torch.istft(
         spec * gain,
-        n_fft=CONFIG.n_fft,
+        n_fft=n_fft,
         hop_length=CONFIG.hop_size,
         win_length=CONFIG.win_size,
         window=window,
         length=wave.size(-1),
     )
 
-    original_rms = torch.sqrt(torch.mean(wave ** 2))
-    filtered_rms = torch.sqrt(torch.mean(filtered_wave ** 2))
-    if filtered_rms > 1e-8:
-        # Equal-loudness glottal flow compensation across spectral tilt
-        loudness_comp = float(10.0 ** (b_clamped * 0.5 / 20.0))
-        filtered_wave = filtered_wave * (original_rms / filtered_rms) * loudness_comp
+    # 7. Psychoacoustic middle-ear loudness preservation W(f) with full downward attenuation headroom
+    # Prevents +8 dB clipping when UTAU P-norm is inactive while lifting H1 chest warmth on negative Ht
+    mag_sq = torch.exp(2.0 * torch.clamp(log_gain, min=-8.0, max=8.0))
+    l_orig = float(torch.sum(mean_power * ear_weight).item())
+    l_mod = float(torch.sum(mean_power * mag_sq * ear_weight).item())
+    orig_rms = float(torch.sqrt(torch.mean(wave ** 2)).item())
+    filtered_rms = float(torch.sqrt(torch.mean(filtered_wave ** 2)).item())
+
+    if filtered_rms > 1e-8 and l_mod > 1e-18 and l_orig > 1e-18:
+        g_loud_w = math.sqrt(l_orig / l_mod)
+        g_rms = orig_rms / filtered_rms
+        if b_clamped < 0.0:
+            g_loud = min(0.78 * g_loud_w + 0.22 * g_rms, 1.18 * g_rms)
+            expressive_trim = float(10.0 ** (-0.30 * b_clamped / 20.0))
+        else:
+            g_loud = min(1.85, 0.72 * g_loud_w + 0.28 * g_rms, 1.22 * g_rms)
+            expressive_trim = 1.0
+        filtered_wave = filtered_wave * (g_loud * expressive_trim)
     else:
         filtered_wave = torch.zeros_like(filtered_wave)
-    filtered_wave = filtered_wave.unsqueeze(1)
-    filtered_wave = filtered_wave[:, :, :original_length]
 
+    filtered_wave = filtered_wave.unsqueeze(1)[:, :, :original_length]
     return filtered_wave.to(dtype=orig_dtype)
+
+
+def couple_aperiodic_to_tension(
+    aperiodic_wave: torch.Tensor,
+    orig_voiced_wave: torch.Tensor,
+    mod_voiced_wave: torch.Tensor,
+    b: float,
+) -> torch.Tensor:
+    """
+    Clean-room voiced aspiration noise coupling with 5-frame boundary anchor stabilization:
+    - Leaves unvoiced consonants (s, sh, t, k, ch) and silence 100% bit-identical (voiced_mask == 0);
+    - Smoothly couples high-frequency (> 1.6 kHz) voiced aspiration turbulence inside vowels
+      to track harmonic spectral energy changes induced by Ht, eliminating exposed hiss on soft Ht < 0
+      and matching glottal turbulence on bright Ht > 0.
+    """
+    if abs(float(b)) < 1e-6:
+        return aperiodic_wave
+
+    orig_dtype = aperiodic_wave.dtype
+    n_samples = aperiodic_wave.size(-1)
+    if n_samples == 0:
+        return aperiodic_wave
+
+    min_stft_len = CONFIG.n_fft // 2 + 1
+    ap = aperiodic_wave.float().squeeze(1)
+    v_orig = orig_voiced_wave.float().squeeze(1)
+    v_mod = mod_voiced_wave.float().squeeze(1)
+
+    pad_len = (CONFIG.hop_size - (n_samples % CONFIG.hop_size)) % CONFIG.hop_size
+    if n_samples + pad_len < min_stft_len:
+        pad_len = min_stft_len - n_samples
+    if pad_len > 0:
+        ap_pad = torch.nn.functional.pad(ap, (0, pad_len))
+        vo_pad = torch.nn.functional.pad(v_orig, (0, pad_len))
+        vm_pad = torch.nn.functional.pad(v_mod, (0, pad_len))
+    else:
+        ap_pad, vo_pad, vm_pad = ap, v_orig, v_mod
+
+    window, _, _, freqs, _ = _get_pre_emphasis_tensors(aperiodic_wave.device)
+    spec_ap = torch.stft(ap_pad, CONFIG.n_fft, hop_length=CONFIG.hop_size, win_length=CONFIG.win_size, window=window, return_complex=True)
+    spec_vo = torch.stft(vo_pad, CONFIG.n_fft, hop_length=CONFIG.hop_size, win_length=CONFIG.win_size, window=window, return_complex=True)
+    spec_vm = torch.stft(vm_pad, CONFIG.n_fft, hop_length=CONFIG.hop_size, win_length=CONFIG.win_size, window=window, return_complex=True)
+
+    p_ap = torch.sum(spec_ap.real ** 2 + spec_ap.imag ** 2, dim=1).squeeze(0)  # [T_f]
+    p_vo_bins = (spec_vo.real ** 2 + spec_vo.imag ** 2).squeeze(0)  # [F, T_f]
+    p_vm_bins = (spec_vm.real ** 2 + spec_vm.imag ** 2).squeeze(0)  # [F, T_f]
+    p_vo = torch.sum(p_vo_bins, dim=0)  # [T_f]
+
+    max_vo = float(torch.max(p_vo).item())
+    if max_vo < 1e-10:
+        return aperiodic_wave
+
+    # Voiced frame detector: strong harmonic energy AND harmonic dominance over fricative noise
+    harm_ratio = p_vo / (p_vo + p_ap + 1e-12)
+    rel_level = p_vo / (max_vo + 1e-12)
+    voiced_bool = ((rel_level > 3e-4) & (harm_ratio > 0.55)).detach().cpu().numpy()
+    n_frames = len(voiced_bool)
+    if not np.any(voiced_bool):
+        return aperiodic_wave
+
+    # Compute high-frequency (1.6 kHz - 9.0 kHz) harmonic log-amplitude shift per frame
+    hf_mask = ((freqs >= 1600.0) & (freqs <= 9000.0)).to(dtype=torch.float32).unsqueeze(1)
+    eh_orig = torch.sum(p_vo_bins * hf_mask, dim=0).detach().cpu().numpy()
+    eh_mod = torch.sum(p_vm_bins * hf_mask, dim=0).detach().cpu().numpy()
+    delta_l_frames = 0.5 * np.log((eh_mod + 1e-12) / (eh_orig + 1e-12))
+
+    # Apply 5-frame onset/offset boundary anchor stabilization on contiguous voiced intervals
+    stabilized_delta = np.zeros(n_frames, dtype=np.float32)
+    voiced_weight = np.zeros(n_frames, dtype=np.float32)
+    idx = 0
+    while idx < n_frames:
+        if not voiced_bool[idx]:
+            idx += 1
+            continue
+        end_idx = idx + 1
+        while end_idx < n_frames and voiced_bool[end_idx]:
+            end_idx += 1
+        seg_len = end_idx - idx
+        margin = 0 if seg_len < 4 else (seg_len // 3 if seg_len <= 10 else 5)
+        n_l = idx + margin
+        n_r = end_idx - 1 - margin
+        stabilized_delta[idx:end_idx] = delta_l_frames[idx:end_idx]
+        if margin > 0 and n_l <= n_r:
+            stabilized_delta[idx:n_l] = delta_l_frames[n_l]
+            stabilized_delta[n_r + 1:end_idx] = delta_l_frames[n_r]
+        voiced_weight[idx:end_idx] = 1.0
+        idx = end_idx
+
+    # Smooth voiced_weight with a 3-tap kernel strictly inside voiced support so unvoiced stays 0.0
+    if n_frames >= 3:
+        w_smooth = np.convolve(voiced_weight, np.array([0.25, 0.50, 0.25], dtype=np.float32), mode='same')
+        voiced_weight = np.where(voiced_bool, w_smooth, 0.0)
+
+    coupled_log = np.clip(0.48 * stabilized_delta, -0.95, 0.62) * voiced_weight  # [-8.25 dB, +5.39 dB]
+    coupled_log_t = torch.from_numpy(coupled_log).to(device=aperiodic_wave.device, dtype=torch.float32)  # [T_f]
+
+    # Zero-phase smooth high-shelf (> 1.6 kHz) on stochastic noise avoids any comb phase cancellation
+    s_hf = ((freqs / 1600.0) ** 2) / (1.0 + (freqs / 1600.0) ** 2)  # [F]
+    freq_profile = (0.22 + 0.78 * s_hf).unsqueeze(1)  # [F, 1]
+    noise_gain = torch.exp(freq_profile * coupled_log_t.unsqueeze(0)).unsqueeze(0)  # [1, F, T_f]
+
+    ap_filtered = torch.istft(
+        spec_ap * noise_gain,
+        n_fft=CONFIG.n_fft,
+        hop_length=CONFIG.hop_size,
+        win_length=CONFIG.win_size,
+        window=window,
+        length=ap_pad.size(-1),
+    )[:, :n_samples]
+
+    # Interpolate voiced_weight to sample level so unvoiced consonants & silence are 100% bit-identical
+    frame_centers = np.arange(n_frames, dtype=np.float32) * float(CONFIG.hop_size)
+    sample_idx = np.arange(n_samples, dtype=np.float32)
+    sample_mask_np = np.interp(sample_idx, frame_centers, voiced_weight, left=0.0, right=0.0).astype(np.float32)
+    sample_mask = torch.from_numpy(sample_mask_np).to(device=aperiodic_wave.device, dtype=torch.float32).unsqueeze(0)
+
+    ap_orig = ap[:, :n_samples]
+    ap_out = ap_orig + sample_mask * (ap_filtered - ap_orig)
+    return ap_out.unsqueeze(1).to(dtype=orig_dtype)
 
 
 def read_wav(loc):
