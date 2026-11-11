@@ -311,3 +311,207 @@ class TestResamplerPipeline:
         )
         v3_caches = list(in_path.parent.glob("*Ht50v3*.hifi.npz"))
         assert len(v3_caches) == 1
+
+    def test_relative_pit_vocal_fry_invariants(self, synthetic_wav_pair):
+        from util.vocal_fry import apply_lf_vocal_fry, prepare_vocal_fry_excitation
+
+        sr = CONFIG.sample_rate
+        n_frames = 60
+        thop = CONFIG.hop_size / sr
+        t_mel = np.arange(n_frames, dtype=np.float64) * thop
+        f0_flat = np.full(n_frames, 329.63, dtype=np.float32)  # E4
+        mel_voiced = np.full((CONFIG.n_mels, n_frames), -3.0, dtype=np.float32)
+        mel_voiced[:35, :] = 0.8  # strong voiced low-F1 energy
+
+        # 1. Zero-regression early exit on flat notes, <= 1-octave (-1200c) portamentos, and empty mel frames
+        assert (
+            prepare_vocal_fry_excitation(
+                pitchbend=np.full(10, -1900, dtype=np.int32),
+                base_pitch_midi=64,
+                t_flag_val=0.0,
+                tempo=120.0,
+                new_start=0.0,
+                new_end=0.1,
+                t_mel=np.zeros(0, dtype=np.float64),
+                f0_render=np.zeros(0, dtype=np.float32),
+                mel_render=np.zeros((CONFIG.n_mels, 0), dtype=np.float32),
+                sr=sr,
+                n_fft=CONFIG.n_fft,
+                mel_fmin=CONFIG.mel_fmin,
+                mel_fmax=CONFIG.mel_fmax,
+            )
+            is None
+        )
+        for safe_pb in [np.zeros(40, dtype=np.int32), np.full(40, -1200, dtype=np.int32)]:
+            ctx = prepare_vocal_fry_excitation(
+                pitchbend=safe_pb,
+                base_pitch_midi=64,
+                t_flag_val=0.0,
+                tempo=120.0,
+                new_start=0.0,
+                new_end=n_frames * thop,
+                t_mel=t_mel,
+                f0_render=f0_flat,
+                mel_render=mel_voiced,
+                sr=sr,
+                n_fft=CONFIG.n_fft,
+                mel_fmin=CONFIG.mel_fmin,
+                mel_fmax=CONFIG.mel_fmax,
+            )
+            assert ctx is None
+
+        # 2. Unvoiced fricative frame protection (high-frequency hiss dominates -> w_fry == 0)
+        mel_fric = np.full((CONFIG.n_mels, n_frames), -6.0, dtype=np.float32)
+        mel_fric[85:, :] = 1.2
+        deep_pb = np.concatenate([np.full(50, -1900, dtype=np.int32), np.zeros(1, dtype=np.int32)])
+        ctx_fric = prepare_vocal_fry_excitation(
+            pitchbend=deep_pb,
+            base_pitch_midi=64,
+            t_flag_val=0.0,
+            tempo=120.0,
+            new_start=0.0,
+            new_end=n_frames * thop,
+            t_mel=t_mel,
+            f0_render=f0_flat,
+            mel_render=mel_fric,
+            sr=sr,
+            n_fft=CONFIG.n_fft,
+            mel_fmin=CONFIG.mel_fmin,
+            mel_fmax=CONFIG.mel_fmax,
+        )
+        assert ctx_fric is None
+
+        # 3. Melodic >1-octave leap immunity ('nian C3 -> xiang F4' +1700c upward & downward portamentos)
+        # Pitch tick spacing at 120 BPM is 60 / (120 * 96) = 5.2083 ms/tick
+        # (a) VCV/CV upward leap: 35 ticks (~182 ms) at -1700c inside pre-consonant [0..0.20s],
+        #     followed by 16 ticks (~83 ms) steep S-curve climb to 0c, then steady 0c vowel body
+        s_u = np.linspace(0.0, 1.0, 16)
+        scurve_up = (-1700.0 * (1.0 - (3.0 * s_u**2 - 2.0 * s_u**3))).astype(np.int32)
+        pb_up_vcv = np.concatenate([
+            np.full(35, -1700, dtype=np.int32),
+            scurve_up,
+            np.zeros(85, dtype=np.int32),
+        ])
+        assert (
+            prepare_vocal_fry_excitation(
+                pitchbend=pb_up_vcv,
+                base_pitch_midi=65,  # F4
+                t_flag_val=0.0,
+                tempo=120.0,
+                new_start=0.0,
+                new_end=n_frames * thop,
+                t_mel=t_mel,
+                f0_render=f0_flat,
+                mel_render=mel_voiced,
+                sr=sr,
+                n_fft=CONFIG.n_fft,
+                mel_fmin=CONFIG.mel_fmin,
+                mel_fmax=CONFIG.mel_fmax,
+                new_con=0.20,
+            )
+            is None
+        )
+
+        # (b) Pure-vowel upward leap (new_con=0.0): 16 ticks (~83 ms) overlap at -1700c + 16 ticks climb to 0c
+        pb_up_vowel = np.concatenate([
+            np.full(16, -1700, dtype=np.int32),
+            scurve_up,
+            np.zeros(90, dtype=np.int32),
+        ])
+        assert (
+            prepare_vocal_fry_excitation(
+                pitchbend=pb_up_vowel,
+                base_pitch_midi=65,
+                t_flag_val=0.0,
+                tempo=120.0,
+                new_start=0.0,
+                new_end=n_frames * thop,
+                t_mel=t_mel,
+                f0_render=f0_flat,
+                mel_render=mel_voiced,
+                sr=sr,
+                n_fft=CONFIG.n_fft,
+                mel_fmin=CONFIG.mel_fmin,
+                mel_fmax=CONFIG.mel_fmax,
+                new_con=0.0,
+            )
+            is None
+        )
+
+        # (c) Large downward tail portamento (F4 -> C3, -1700c at very end of note)
+        scurve_dn = (-1700.0 * (3.0 * s_u**2 - 2.0 * s_u**3)).astype(np.int32)
+        n_total_ticks = int(round((n_frames * thop) / (60.0 / (120.0 * 96.0))))
+        pb_dn_tail = np.concatenate([
+            np.zeros(max(10, n_total_ticks - 22), dtype=np.int32),
+            scurve_dn,
+            np.full(5, -1700, dtype=np.int32),
+            np.zeros(1, dtype=np.int32),
+        ])
+        assert (
+            prepare_vocal_fry_excitation(
+                pitchbend=pb_dn_tail,
+                base_pitch_midi=65,
+                t_flag_val=0.0,
+                tempo=120.0,
+                new_start=0.0,
+                new_end=n_frames * thop,
+                t_mel=t_mel,
+                f0_render=f0_flat,
+                mel_render=mel_voiced,
+                sr=sr,
+                n_fft=CONFIG.n_fft,
+                mel_fmin=CONFIG.mel_fmin,
+                mel_fmax=CONFIG.mel_fmax,
+                new_con=0.06,
+            )
+            is None
+        )
+
+        # 4. Sustained intentional fry (-1900c inside vowel body) activates continuous-glide LF vocal fry engine
+        pb_intentional_fry = np.concatenate([
+            np.zeros(25, dtype=np.int32),
+            scurve_dn,
+            np.full(65, -1900, dtype=np.int32),
+            np.zeros(1, dtype=np.int32),
+        ])
+        ctx_fry = prepare_vocal_fry_excitation(
+            pitchbend=pb_intentional_fry,
+            base_pitch_midi=64,
+            t_flag_val=0.0,
+            tempo=120.0,
+            new_start=0.0,
+            new_end=n_frames * thop,
+            t_mel=t_mel,
+            f0_render=f0_flat,
+            mel_render=mel_voiced,
+            sr=sr,
+            n_fft=CONFIG.n_fft,
+            mel_fmin=CONFIG.mel_fmin,
+            mel_fmax=CONFIG.mel_fmax,
+            new_con=0.04,
+        )
+        assert ctx_fry is not None
+        f_fry_min = float(np.min(ctx_fry["f0_render"]))
+        assert 22.0 <= f_fry_min <= 52.0  # Continuous creaky bubble pulse rate [22..52 Hz]
+
+        dur_samples = int(round(n_frames * thop * sr))
+        audio_t = np.linspace(0.0, n_frames * thop, num=dur_samples, endpoint=False, dtype=np.float64)
+        f0_inst = np.interp(audio_t, t_mel, ctx_fry["f0_eff"])
+        ph_inst = np.cumsum(f0_inst / sr)
+        # Synthesize broadband harmonic carrier locked to f0_inst (250..3200 Hz formants)
+        carrier = (
+            0.22 * np.cos(2.0 * np.pi * 680.0 * audio_t) * (0.55 + 0.45 * np.cos(2.0 * np.pi * ph_inst))
+            + 0.16 * np.cos(2.0 * np.pi * 1650.0 * audio_t) * (0.55 + 0.45 * np.cos(2.0 * np.pi * ph_inst))
+        ).astype(np.float32)
+
+        shaped = apply_lf_vocal_fry(carrier, ctx_fry, sr)
+        assert shaped.shape == carrier.shape
+        assert np.all(np.isfinite(shaped))
+        tail_slice = slice(int(0.35 * sr), dur_samples - int(0.03 * sr))
+        win = int(0.0025 * sr)
+        env_orig = np.sqrt(np.convolve(carrier[tail_slice] ** 2, np.ones(win) / win, mode="valid") + 1e-12)
+        env_fry = np.sqrt(np.convolve(shaped[tail_slice] ** 2, np.ones(win) / win, mode="valid") + 1e-12)
+        mod_orig = np.percentile(env_orig, 95) / (np.percentile(env_orig, 15) + 1e-9)
+        mod_fry = np.percentile(env_fry, 95) / (np.percentile(env_fry, 15) + 1e-9)
+        assert mod_fry > mod_orig * 2.5
+        assert mod_fry > 4.0
