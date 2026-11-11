@@ -1,4 +1,4 @@
-version: 0.1.1
+version: 0.1.2
 env:
   # if you are using venv, you don't need to set `conda_base_path` and `conda_env_name`.
   conda_base_path: "C:/Users/YourUsername/Miniconda3"
