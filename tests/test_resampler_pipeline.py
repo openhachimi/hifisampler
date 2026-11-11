@@ -233,7 +233,12 @@ class TestResamplerPipeline:
 
     def test_lf_tension_invariants_and_cache_versioning(self, synthetic_wav_pair):
         import torch
-        from util.audio import pre_emphasis_base_tension
+        from util.audio import (
+            _estimate_baseline_rd,
+            _extract_cepstral_formant_envelope,
+            couple_aperiodic_to_tension,
+            pre_emphasis_base_tension,
+        )
 
         # 1. Pure silence safety (no NaN / zero division)
         silent_wav = torch.zeros(1, 1, 4096, dtype=torch.float32, device=CONFIG.device)
@@ -245,8 +250,8 @@ class TestResamplerPipeline:
         sr = CONFIG.sample_rate
         t = torch.arange(0, sr // 2, dtype=torch.float32, device=CONFIG.device) / sr
         harmonic_sig = torch.zeros_like(t)
-        for k in range(1, 16):
-            harmonic_sig = harmonic_sig + (1.0 / k) * torch.sin(2.0 * np.pi * 220.0 * k * t)
+        for k in range(1, 20):
+            harmonic_sig = harmonic_sig + (1.0 / (k ** 1.3)) * torch.sin(2.0 * np.pi * 220.0 * k * t)
         harmonic_wav = (0.2 * harmonic_sig).unsqueeze(0).unsqueeze(0)
 
         hf_ratios = []
@@ -263,7 +268,37 @@ class TestResamplerPipeline:
         for i in range(len(hf_ratios) - 1):
             assert hf_ratios[i + 1] > hf_ratios[i]
 
-        # 3. Non-zero Ht appends v2 version tag in cache filename
+        # 3. Adaptive baseline Rd0 distinguishes sharp/pressed voice from lax/soft voice
+        n_fft = CONFIG.n_fft
+        freqs_stft = torch.arange(0, n_fft // 2 + 1, device=CONFIG.device, dtype=torch.float32) * (sr / n_fft)
+        sharp_sig = sum((1.0 / (k ** 0.7)) * torch.sin(2.0 * np.pi * 220.0 * k * t) for k in range(1, 25))
+        lax_sig = sum((1.0 / (k ** 2.4)) * torch.sin(2.0 * np.pi * 220.0 * k * t) for k in range(1, 25))
+        p_sharp = torch.abs(torch.fft.rfft(sharp_sig[:n_fft] * torch.hann_window(n_fft, device=CONFIG.device))) ** 2
+        p_lax = torch.abs(torch.fft.rfft(lax_sig[:n_fft] * torch.hann_window(n_fft, device=CONFIG.device))) ** 2
+        rd0_sharp = _estimate_baseline_rd(
+            p_sharp, _extract_cepstral_formant_envelope(p_sharp, sr, n_fft), freqs_stft, 220.0, sr, n_fft
+        )
+        rd0_lax = _estimate_baseline_rd(
+            p_lax, _extract_cepstral_formant_envelope(p_lax, sr, n_fft), freqs_stft, 220.0, sr, n_fft
+        )
+        assert rd0_sharp < rd0_lax
+
+        # 4. Voiced aspiration coupling preserves unvoiced consonant onset bit-identically
+        n_tot = sr // 2
+        consonant_end = int(0.12 * sr)
+        gen = torch.Generator(device=CONFIG.device).manual_seed(42)
+        ap_noise = 0.05 * torch.randn(1, 1, n_tot, generator=gen, device=CONFIG.device)
+        voiced_part = torch.zeros(1, 1, n_tot, dtype=torch.float32, device=CONFIG.device)
+        voiced_part[:, :, consonant_end + 2048:] = harmonic_wav[:, :, consonant_end + 2048:]
+        voiced_soft = pre_emphasis_base_tension(voiced_part, 2.0)  # Ht = -100
+        ap_coupled = couple_aperiodic_to_tension(ap_noise, voiced_part, voiced_soft, 2.0)
+        assert torch.equal(ap_coupled[:, :, :consonant_end], ap_noise[:, :, :consonant_end])
+        # Inside voiced vowel tail, high-frequency aspiration energy is attenuated for Ht = -100
+        tail_orig = torch.sum(ap_noise[:, :, consonant_end + 4096:] ** 2).item()
+        tail_mod = torch.sum(ap_coupled[:, :, consonant_end + 4096:] ** 2).item()
+        assert tail_mod < tail_orig
+
+        # 5. Non-zero Ht appends v3 version tag in cache filename
         in_path, out_path = synthetic_wav_pair
         Resampler(
             in_file=str(in_path),
@@ -274,5 +309,5 @@ class TestResamplerPipeline:
             length=200,
             tempo="!120",
         )
-        v2_caches = list(in_path.parent.glob("*Ht50v2*.hifi.npz"))
-        assert len(v2_caches) == 1
+        v3_caches = list(in_path.parent.glob("*Ht50v3*.hifi.npz"))
+        assert len(v3_caches) == 1
