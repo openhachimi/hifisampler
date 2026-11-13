@@ -22,6 +22,7 @@ from util.audio import (
 from util.parse_utau import flag_re, midi_to_hz, note_to_midi, pitch_string_to_cents
 from util.cache_manager import cache_manager
 from util.onnx_dsp import dynamic_range_compression_np
+from backend.stats import ResampleStats, stats_collector
 
 cache_ext = '.hifi.bin'  # bare binary feature cache extension (falls back to legacy .hifi.npz)
 
@@ -49,16 +50,48 @@ class Resampler:
         parsed_tempo = float(tempo[1:]) if str(tempo).startswith('!') else float(tempo)
         self.tempo = max(1.0, parsed_tempo)
         self.pitchbend = pitch_string_to_cents(pitch_string)
+        self._feature_cache_hit = False
+        self._hnsep_cache_hit = False
+        self._input_samples = 0
+        self._output_samples = 0
+        self._synthesis_ms = 0.0
+        self._postprocess_ms = 0.0
 
         if auto_render:
             self.render()
 
     def render(self):
         t0 = time.perf_counter()
+        self._feature_cache_hit = False
+        self._hnsep_cache_hit = False
+        self._input_samples = 0
+        self._output_samples = 0
+        self._synthesis_ms = 0.0
+        self._postprocess_ms = 0.0
+
+        t_feat0 = time.perf_counter()
         features = self.get_features()
+        feature_ms = (time.perf_counter() - t_feat0) * 1000.0
+
         self.resample(features)
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
-        logging.info(f"Render finished in {elapsed_ms:.1f} ms: {self.in_file.name} -> {Path(self.out_file).name}")
+        total_ms = (time.perf_counter() - t0) * 1000.0
+        is_null_output = str(self.out_file).strip().lower() in ('nul', '/dev/null')
+        if not is_null_output:
+            stats_collector.record(
+                ResampleStats(
+                    note_name=self.in_file.stem,
+                    feature_ms=feature_ms,
+                    synthesis_ms=self._synthesis_ms,
+                    postprocess_ms=self._postprocess_ms,
+                    total_ms=total_ms,
+                    cache_hit=self._feature_cache_hit,
+                    hnsep_cache_hit=self._hnsep_cache_hit,
+                    input_samples=self._input_samples,
+                    output_samples=self._output_samples,
+                    success=True,
+                )
+            )
+        logging.info(f"Render finished in {total_ms:.1f} ms: {self.in_file.name} -> {Path(self.out_file).name}")
 
     def get_features(self):
         features_path = self.in_file.with_suffix(cache_ext)
@@ -92,7 +125,9 @@ class Resampler:
         with cache_manager.get_lock(features_path):
             features = cache_manager.load_features_cache(features_path, force_generate, source_path=self.in_file)
             if features is not None:
+                self._feature_cache_hit = True
                 return features
+            self._feature_cache_hit = False
             logging.info(f'{features_path.name} not found or forcing generation. Generating features.')
             features = self.generate_features(features_path)
             return cache_manager.save_features_cache(
@@ -114,6 +149,7 @@ class Resampler:
 
     def generate_features(self, features_path):
         wave_np = read_wav(self.in_file)
+        self._input_samples = int(len(wave_np))
 
         breath = self.flags.get("Hb", 100)
         voicing = self.flags.get("Hv", 100)
@@ -157,6 +193,7 @@ class Resampler:
                         hnsep_cache_path, 'cpu', force_generate, source_path=self.in_file
                     )
                     if seg_output is None:
+                        self._hnsep_cache_hit = False
                         logging.info(f'Generating hnsep features (NumPy ONNX) for {hnsep_cache_path.name}')
                         with _gpu_lock(hnsep_gpu):
                             seg_np = numpy_hnsep.predict_from_audio(wave_np)
@@ -170,6 +207,7 @@ class Resampler:
                         )
                         seg_np = saved_tensor.squeeze(0).squeeze(0).cpu().numpy()
                     else:
+                        self._hnsep_cache_hit = True
                         seg_np = seg_output.squeeze(0).squeeze(0).cpu().numpy()
 
                 breath = float(np.clip(breath, 0, 500))
@@ -208,6 +246,7 @@ class Resampler:
                 )
 
                 if seg_output is None:
+                    self._hnsep_cache_hit = False
                     logging.info(f'Generating hnsep features for {hnsep_cache_path.name}')
                     with _gpu_lock(hnsep_gpu), torch.inference_mode():
                         seg_output = models.hnsep_model.predict_fromaudio(wave)
@@ -218,6 +257,8 @@ class Resampler:
                         force_generate=force_generate,
                         source_path=self.in_file,
                     )
+                else:
+                    self._hnsep_cache_hit = True
 
             breath = np.clip(breath, 0, 500)
             voicing = np.clip(voicing, 0, 150)
@@ -479,6 +520,7 @@ class Resampler:
             or getattr(models, 'torch_uses_gpu', CONFIG.device.type != 'cpu')
         )
 
+        t_synth0 = time.perf_counter()
         if CONFIG.model_type == "ckpt":
 
             mel_render = torch.from_numpy(
@@ -530,6 +572,8 @@ class Resampler:
             logging.debug(f'render: {render.shape}')
         else:
             raise ValueError(f"Unsupported model type: {CONFIG.model_type}")
+        self._synthesis_ms = (time.perf_counter() - t_synth0) * 1000.0
+        t_post0 = time.perf_counter()
 
         # 添加幅度调制
         A_flag = self.flags.get('A') or 0
@@ -593,4 +637,6 @@ class Resampler:
         if final_gain != 1.0:
             render = render * np.float32(final_gain)
 
+        self._output_samples = int(len(render))
         save_wav(self.out_file, render)
+        self._postprocess_ms = (time.perf_counter() - t_post0) * 1000.0

@@ -10,12 +10,14 @@ import signal
 import time
 from aiohttp import web
 from backend.resampler import Resampler
+from backend.stats import handle_health, handle_stats, stats_collector
 from config import CONFIG
 
 server_ready = False
 infer_executor = None
 last_activity_time = time.monotonic()
 active_jobs = 0
+_server_start_time = time.monotonic()
 
 _AUDIO_EXT_SPLIT_RE = re.compile(
     r"^(.+?\.(?:wav|flac|ogg|mp3|aiff|aif))\s+(.+)$",
@@ -119,6 +121,8 @@ async def handle_post(request: web.Request):
         return web.Response(text=err, status=400)
 
     active_jobs += 1
+    req_t0 = time.perf_counter()
+    note = post_data_string[:64]
     try:
         in_file_path, out_file_path = Path(sliced[0]), Path(sliced[1])
         note = f"'{in_file_path.stem}' -> '{out_file_path.name}'"
@@ -133,11 +137,13 @@ async def handle_post(request: web.Request):
     except FileNotFoundError as e:
         err = f"Error processing: Input file not found ({e})."
         logging.error(err)
+        stats_collector.record_error(note, err, (time.perf_counter() - req_t0) * 1000.0)
         return web.Response(text=err, status=404)
 
     except Exception as e:
         err = f"Error processing note: {type(e).__name__}: {e}"
         logging.error(err, exc_info=True)
+        stats_collector.record_error(note, err, (time.perf_counter() - req_t0) * 1000.0)
         return web.Response(text=err, status=500)
 
     finally:
@@ -187,11 +193,30 @@ def _resolve_max_workers() -> int:
         return 2
 
 
+async def _stats_route(request: web.Request) -> web.Response:
+    return await handle_stats(
+        request,
+        collector=stats_collector,
+        active_jobs_fn=lambda: active_jobs,
+        ready_fn=lambda: server_ready,
+    )
+
+
+async def _health_route(request: web.Request) -> web.Response:
+    return await handle_health(
+        request,
+        active_jobs_fn=lambda: active_jobs,
+        ready_fn=lambda: server_ready,
+    )
+
+
 def run(port: int = 8572, host: str = "127.0.0.1"):
-    global server_ready, infer_executor, last_activity_time
+    global server_ready, infer_executor, last_activity_time, _server_start_time
     workers = _resolve_max_workers()
     infer_executor = ThreadPoolExecutor(max_workers=workers)
     last_activity_time = time.monotonic()
+    _server_start_time = last_activity_time
+    stats_collector.reset_start_time()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
@@ -199,6 +224,8 @@ def run(port: int = 8572, host: str = "127.0.0.1"):
     app.add_routes([
         web.get("/", handle_get),
         web.post("/", handle_post),
+        web.get("/stats", _stats_route),
+        web.get("/health", _health_route),
     ])
     app.on_startup.append(_on_startup)
     app.on_cleanup.append(_on_cleanup)
