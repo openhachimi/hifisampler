@@ -85,6 +85,7 @@ class Program
     };
 
     static int TargetPort = 8572;
+    private const int MANAGED_IDLE_TIMEOUT_SECS = 600;
     static readonly string LauncherScriptName = OperatingSystem.IsWindows() ? "start.bat" : "start.sh";
 
     sealed class ServerLocation
@@ -104,10 +105,10 @@ class Program
         }
 
         ResolveTargetPortFast();
-        string jsonPayload = BuildJsonPayload(args);
+        var (payload, mediaType) = BuildRequestPayload(args);
 
         // --- Fast Path: Optimistic single-trip POST / ---
-        var (fastSuccess, shouldEnsureServer) = await TryOptimisticPostAsync(jsonPayload);
+        var (fastSuccess, shouldEnsureServer) = await TryOptimisticPostAsync(payload, mediaType);
         if (fastSuccess)
         {
             return;
@@ -120,15 +121,15 @@ class Program
         // --- Slow Path: Server is down or still warming up (503) ---
         var location = ResolveServerLocation();
         await EnsureServerRunningAsync(location);
-        await CommunicateWithServer(jsonPayload);
+        await CommunicateWithServer(payload, mediaType);
     }
 
-    static async Task<(bool Succeeded, bool ShouldEnsureServer)> TryOptimisticPostAsync(string jsonPayload)
+    static async Task<(bool Succeeded, bool ShouldEnsureServer)> TryOptimisticPostAsync(string payload, string mediaType)
     {
         var sw = Stopwatch.StartNew();
         try
         {
-            using var content = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
+            using var content = new StringContent(payload, Encoding.UTF8, mediaType);
             using HttpResponseMessage response = await PostClient.PostAsync($"http://127.0.0.1:{TargetPort}/", content);
             if (response.IsSuccessStatusCode)
             {
@@ -392,6 +393,9 @@ class Program
             return false;
         }
 
+        string portablePython = OperatingSystem.IsWindows()
+            ? Path.Combine(fullDir, "env", "python.exe")
+            : Path.Combine(fullDir, "env", "bin", "python");
         string venvPython = OperatingSystem.IsWindows()
             ? Path.Combine(fullDir, ".venv", "Scripts", "python.exe")
             : Path.Combine(fullDir, ".venv", "bin", "python");
@@ -399,7 +403,7 @@ class Program
         location.ServerRoot = fullDir;
         location.ScriptPath = File.Exists(scriptPath) ? scriptPath : "";
         location.LauncherScript = File.Exists(launcherPath) ? launcherPath : "";
-        location.PythonExe = File.Exists(venvPython) ? venvPython : "";
+        location.PythonExe = File.Exists(portablePython) ? portablePython : (File.Exists(venvPython) ? venvPython : "");
 
         if (string.IsNullOrEmpty(location.PythonExe))
         {
@@ -462,6 +466,56 @@ class Program
         return null;
     }
 
+    // Protocol selection rationale:
+    // - Default ("json"): Uses JSON {"args":[...]} so backend/server.py::split_arguments() receives
+    //   unambiguous argument boundaries, avoiding filename-with-spaces splitting edge cases (e.g. <= 12
+    //   tokens or non-13-arg invocations), quotes, newlines, or paths beginning with '{' / '['.
+    // - HIFISAMPLER_PROTOCOL=text: Opt-in lightweight text/plain space-joined payload (falls back to JSON
+    //   if newlines, quotes, empty args, or leading '{'/'[' would break split_arguments).
+    // - HIFISAMPLER_PROTOCOL=auto: Uses lightweight text/plain when args contain no whitespace/quotes/newlines,
+    //   falling back to JSON whenever any arg contains spaces or special characters.
+    static (string Payload, string MediaType) BuildRequestPayload(string[] args)
+    {
+        string? protocolEnv = Environment.GetEnvironmentVariable("HIFISAMPLER_PROTOCOL")?.Trim().ToLowerInvariant();
+        if ((protocolEnv == "text" || protocolEnv == "auto") && CanSendAsPlainText(args, allowSpaces: false))
+        {
+            return (string.Join(" ", args), "text/plain");
+        }
+        return (BuildJsonPayload(args), "application/json");
+    }
+
+    static bool CanSendAsPlainText(string[] args, bool allowSpaces)
+    {
+        if (args.Length == 0)
+        {
+            return false;
+        }
+        string first = args[0];
+        if (string.IsNullOrEmpty(first) || first[0] == '{' || first[0] == '[')
+        {
+            return false;
+        }
+        foreach (string raw in args)
+        {
+            if (string.IsNullOrEmpty(raw))
+            {
+                return false;
+            }
+            foreach (char c in raw)
+            {
+                if (c == '\r' || c == '\n' || c == '\t' || c == '"' || c == '\'' || char.IsControl(c))
+                {
+                    return false;
+                }
+                if (!allowSpaces && char.IsWhiteSpace(c))
+                {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
     static string BuildJsonPayload(string[] args)
     {
         var sb = new StringBuilder(256);
@@ -496,7 +550,7 @@ class Program
         return sb.ToString();
     }
 
-    static async Task CommunicateWithServer(string jsonPayload)
+    static async Task CommunicateWithServer(string payload, string mediaType)
     {
         int maxRetries = 2;
         int retryDelayMs = 800;
@@ -506,7 +560,7 @@ class Program
         {
             try
             {
-                using var content = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
+                using var content = new StringContent(payload, Encoding.UTF8, mediaType);
                 Console.WriteLine($"[Communicate] Sending POST (Attempt {attempt}/{maxRetries + 1})...");
                 using HttpResponseMessage response = await PostClient.PostAsync($"http://127.0.0.1:{TargetPort}/", content);
                 if (response.IsSuccessStatusCode)
@@ -620,12 +674,13 @@ class Program
         string workingDir = loc.ServerRoot;
         bool hasDirectVenv = !string.IsNullOrEmpty(loc.PythonExe) && File.Exists(loc.PythonExe)
                              && !string.IsNullOrEmpty(loc.ScriptPath) && File.Exists(loc.ScriptPath);
+        string managedServerArgs = $"--managed --idle-timeout {MANAGED_IDLE_TIMEOUT_SECS} --port {TargetPort}";
 
         if (OperatingSystem.IsWindows())
         {
             string cmdLine = hasDirectVenv
-                ? $"\"{loc.PythonExe}\" \"{loc.ScriptPath}\""
-                : $"cmd.exe /C \"\"{loc.LauncherScript}\"\"";
+                ? $"\"{loc.PythonExe}\" \"{loc.ScriptPath}\" {managedServerArgs}"
+                : $"cmd.exe /C \"\"{loc.LauncherScript}\" {managedServerArgs}\"";
 
             var si = new STARTUPINFOW
             {
@@ -669,8 +724,8 @@ class Program
         if (OperatingSystem.IsLinux() || OperatingSystem.IsMacOS())
         {
             string targetExec = hasDirectVenv
-                ? $"{QuotePosixSingle(loc.PythonExe)} {QuotePosixSingle(loc.ScriptPath)}"
-                : $"bash {QuotePosixSingle(loc.LauncherScript)}";
+                ? $"{QuotePosixSingle(loc.PythonExe)} {QuotePosixSingle(loc.ScriptPath)} {managedServerArgs}"
+                : $"bash {QuotePosixSingle(loc.LauncherScript)} {managedServerArgs}";
 
             string interactiveCmd =
                 $"cd {QuotePosixSingle(workingDir)} && echo 'Starting HifiSampler Server...' && {targetExec} ; echo ; echo 'Server exited. Press Enter to close.' ; read -r _";
