@@ -131,7 +131,7 @@ class TestResamplerPipeline:
         assert out_path1.exists()
 
         # Check that cache file was generated
-        cache_files = list(in_path.parent.glob("*.hifi.npz"))
+        cache_files = list(in_path.parent.glob("*.hifi.bin"))
         assert len(cache_files) >= 1
 
         # 2nd run: loads from cache
@@ -309,7 +309,7 @@ class TestResamplerPipeline:
             length=200,
             tempo="!120",
         )
-        v3_caches = list(in_path.parent.glob("*Ht50v3*.hifi.npz"))
+        v3_caches = list(in_path.parent.glob("*Ht50v3*.hifi.bin"))
         assert len(v3_caches) == 1
 
     def test_ho_and_hr_resonators_and_cache(self, synthetic_wav_pair):
@@ -370,7 +370,7 @@ class TestResamplerPipeline:
             tempo="!120",
         )
         assert out_path.exists()
-        assert len(list(in_path.parent.glob("*Ho50*Hr-30*.hifi.npz"))) == 1
+        assert len(list(in_path.parent.glob("*Ho50*Hr-30*.hifi.bin"))) == 1
 
     def test_relative_pit_vocal_fry_invariants(self, synthetic_wav_pair):
         from util.vocal_fry import apply_lf_vocal_fry, prepare_vocal_fry_excitation

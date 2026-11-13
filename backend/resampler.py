@@ -23,7 +23,7 @@ from util.parse_utau import flag_re, midi_to_hz, note_to_midi, pitch_string_to_c
 from util.cache_manager import cache_manager
 from util.onnx_dsp import dynamic_range_compression_np
 
-cache_ext = '.hifi.npz'  # cache file extension
+cache_ext = '.hifi.bin'  # bare binary feature cache extension (falls back to legacy .hifi.npz)
 
 
 def _gpu_lock(use_gpu: bool):
