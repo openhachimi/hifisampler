@@ -65,16 +65,20 @@ class Resampler:
         hb_val = self.flags.get('Hb', 100)
         hv_val = self.flags.get('Hv', 100)
         ht_val = self.flags.get('Ht', 0)
+        ho_val = self.flags.get('Ho', 0)
+        hr_val = self.flags.get('Hr', 0)
         g_val = self.flags.get('g', 0)
         self.flags['Hb'] = int(np.clip(100 if hb_val is None else hb_val, 0, 500))
         self.flags['Hv'] = int(np.clip(100 if hv_val is None else hv_val, 0, 150))
         self.flags['Ht'] = int(np.clip(0 if ht_val is None else ht_val, -100, 100))
+        self.flags['Ho'] = int(np.clip(0 if ho_val is None else ho_val, -100, 100))
+        self.flags['Hr'] = int(np.clip(0 if hr_val is None else hr_val, -100, 100))
         self.flags['g'] = int(np.clip(0 if g_val is None else g_val, -100, 100))
 
         flag_suffix = '_'.join(
             f"{k}{v}v3" if (k == 'Ht' and v) else f"{k}{v if v is not None else ''}"
             for k, v in sorted(self.flags.items())
-            if k in ['Hb', 'Hv', 'Ht', 'g']
+            if k in ['Hb', 'Hv', 'Ht', 'g'] or (k in ['Ho', 'Hr'] and v != 0)
         )
         if flag_suffix:
             features_path = features_path.with_name(
@@ -94,8 +98,8 @@ class Resampler:
                 features_path, features, force_generate=force_generate, source_path=self.in_file
             )
 
-    def _needs_hnsep_separation(self, breath, voicing, tension):
-        if tension != 0:
+    def _needs_hnsep_separation(self, breath, voicing, tension, openness=0, singer_formant=0):
+        if tension != 0 or openness != 0 or singer_formant != 0:
             return True
         elif breath == voicing:
             return False
@@ -116,13 +120,15 @@ class Resampler:
         breath = self.flags.get("Hb", 100)
         voicing = self.flags.get("Hv", 100)
         tension = self.flags.get("Ht", 0)
-        logging.debug(f'breath: {breath}, voicing: {voicing}, tension: {tension}')
+        openness = self.flags.get("Ho", 0)
+        singer_formant = self.flags.get("Hr", 0)
+        logging.debug(f'breath: {breath}, voicing: {voicing}, tension: {tension}, openness: {openness}, singer_formant: {singer_formant}')
 
         torch_gpu = getattr(models, 'torch_uses_gpu', CONFIG.device.type != 'cpu')
         hnsep_gpu = getattr(models, 'hnsep_uses_gpu', False) or torch_gpu
 
-        if self._needs_hnsep_separation(breath, voicing, tension):
-            logging.debug('Hb, Hv, or Ht flag requires hnsep separation. Split audio into breath, voicing')
+        if self._needs_hnsep_separation(breath, voicing, tension, openness, singer_formant):
+            logging.debug('Hb, Hv, Ht, Ho, or Hr flag requires hnsep separation. Split audio into breath, voicing')
 
             hnsep_cache_path = self.in_file.with_name(
                 f'{self.in_file.stem}_hnsep')
@@ -149,17 +155,21 @@ class Resampler:
             breath = np.clip(breath, 0, 500)
             voicing = np.clip(voicing, 0, 150)
             with _gpu_lock(torch_gpu), torch.inference_mode():
-                if tension != 0:
+                if tension != 0 or openness != 0 or singer_formant != 0:
                     tension = np.clip(tension, -100, 100)
+                    openness = np.clip(openness, -100, 100)
+                    singer_formant = np.clip(singer_formant, -100, 100)
                     b_tension = -tension / 50.0
                     aperiodic_raw = wave - seg_output
                     if voicing > 0 or breath > 0:
-                        seg_mod = pre_emphasis_base_tension(seg_output, b_tension)
+                        seg_mod = pre_emphasis_base_tension(
+                            seg_output, b_tension, ho=openness, hr=singer_formant
+                        )
                     else:
                         seg_mod = torch.zeros_like(seg_output)
                     if breath > 0:
                         aperiodic_mod = couple_aperiodic_to_tension(
-                            aperiodic_raw, seg_output, seg_mod, b_tension
+                            aperiodic_raw, seg_output, seg_mod, b_tension, ho=openness, hr=singer_formant
                         )
                     else:
                         aperiodic_mod = aperiodic_raw

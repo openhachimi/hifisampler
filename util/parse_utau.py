@@ -12,7 +12,7 @@ notes = {
 }  # Note names lol
 note_re = re.compile(r'^([A-G][#b]?)(-?\d+)$')  # Note Regex for conversion
 flags = ['fe', 'fl', 'fo', 'fv', 'fp', 've', 'vo', 'g', 't',
-         'A', 'B', 'G', 'P', 'S', 'p', 'R', 'D', 'C', 'Z', 'Hv', 'Hb', 'Ht', 'He', 'HG']
+         'A', 'B', 'G', 'P', 'S', 'p', 'R', 'D', 'C', 'Z', 'Hv', 'Hb', 'Ht', 'Ho', 'Hr', 'He', 'HG']
 flag_re = re.compile(f"({'|'.join(sorted(flags, key=len, reverse=True))})([+-]?\\d+)?")
 
 

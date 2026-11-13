@@ -107,6 +107,10 @@ After placing `hifisampler.yaml` in OpenUtau's `Resamplers` folder alongside the
   - Range: `0` to `150` | Default: `100`
 - **Ht:** Adjust vocal tension.
   - Range: `-100` to `100` | Default: `0`
+- **Ho:** Adjust vocal tract openness (positive values open and brighten upper formants without losing fundamental warmth; negative values create a darker, covered tone).
+  - Range: `-100` to `100` | Default: `0`
+- **Hr:** Adjust singer's formant resonance around 3.2 kHz (positive values add cutting brilliance and projection; negative values soften harsh 3 kHz glare).
+  - Range: `-100` to `100` | Default: `0`
 - **HG:** Vocal fry / growl effect.
   - Range: `0` to `100` | Default: `0`
 - **P (`norm`):** Note-level loudness normalization strength targeting -16 LUFS (requires `wave_norm: true` in `config.yaml`).

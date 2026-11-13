@@ -42,6 +42,26 @@ expressions:
     is_flag: true
     flag: Ht
     skip_output_if_default: true
+  Ho:
+    name: openness (hifi)
+    abbr: Ho
+    type: Numerical
+    min: -100
+    max: 100
+    default_value: 0
+    is_flag: true
+    flag: Ho
+    skip_output_if_default: true
+  Hr:
+    name: singer's formant (hifi)
+    abbr: Hr
+    type: Numerical
+    min: -100
+    max: 100
+    default_value: 0
+    is_flag: true
+    flag: Hr
+    skip_output_if_default: true
   HG:
     name: growl (hifi)
     abbr: HG

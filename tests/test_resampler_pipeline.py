@@ -312,6 +312,66 @@ class TestResamplerPipeline:
         v3_caches = list(in_path.parent.glob("*Ht50v3*.hifi.npz"))
         assert len(v3_caches) == 1
 
+    def test_ho_and_hr_resonators_and_cache(self, synthetic_wav_pair):
+        import torch
+        from util.audio import couple_aperiodic_to_tension, pre_emphasis_base_tension
+
+        sr = CONFIG.sample_rate
+        t = torch.arange(0, sr // 2, dtype=torch.float32, device=CONFIG.device) / sr
+        harmonic_sig = torch.zeros_like(t)
+        for k in range(1, 25):
+            harmonic_sig = harmonic_sig + (1.0 / (k ** 1.1)) * torch.sin(2.0 * np.pi * 220.0 * k * t)
+        harmonic_wav = (0.2 * harmonic_sig).unsqueeze(0).unsqueeze(0)
+
+        freqs = torch.fft.rfftfreq(harmonic_wav.numel(), d=1.0 / sr, device=CONFIG.device)
+        low_mask = (freqs >= 150.0) & (freqs < 500.0)
+        sf_mask = (freqs >= 2700.0) & (freqs < 3700.0)
+        high_mask = (freqs >= 1500.0) & (freqs < 6000.0)
+
+        def band_ratio(wav, num_mask, den_mask):
+            spec = torch.abs(torch.fft.rfft(wav.squeeze())) ** 2
+            return torch.sum(spec[num_mask]).item() / (torch.sum(spec[den_mask]).item() + 1e-12)
+
+        # 1. Ho monotonicity across [-80, 0, +80] with Ht=0
+        ho_ratios = [
+            band_ratio(pre_emphasis_base_tension(harmonic_wav, 0.0, ho=ho_v), high_mask, low_mask)
+            for ho_v in (-80.0, 0.0, 80.0)
+        ]
+        assert ho_ratios[0] < ho_ratios[1] < ho_ratios[2]
+
+        # 2. Hr resonance at ~3.2 kHz across [-80, 0, +80] with Ht=0
+        hr_ratios = [
+            band_ratio(pre_emphasis_base_tension(harmonic_wav, 0.0, hr=hr_v), sf_mask, low_mask)
+            for hr_v in (-80.0, 0.0, 80.0)
+        ]
+        assert hr_ratios[0] < hr_ratios[1] < hr_ratios[2]
+
+        # 3. Voiced-only aspiration coupling activates when Ht=0 and Ho!=0 / Hr!=0, keeping consonants bit-identical
+        n_tot = harmonic_wav.size(-1)
+        consonant_end = int(0.12 * sr)
+        gen = torch.Generator(device=CONFIG.device).manual_seed(7)
+        ap_noise = 0.05 * torch.randn(1, 1, n_tot, generator=gen, device=CONFIG.device)
+        voiced_part = torch.zeros_like(harmonic_wav)
+        voiced_part[:, :, consonant_end + 2048:] = harmonic_wav[:, :, consonant_end + 2048:]
+        voiced_closed = pre_emphasis_base_tension(voiced_part, 0.0, ho=-80.0, hr=-50.0)
+        ap_coupled = couple_aperiodic_to_tension(ap_noise, voiced_part, voiced_closed, 0.0, ho=-80.0, hr=-50.0)
+        assert torch.equal(ap_coupled[:, :, :consonant_end], ap_noise[:, :, :consonant_end])
+        assert torch.sum(ap_coupled[:, :, consonant_end + 4096:] ** 2).item() < torch.sum(ap_noise[:, :, consonant_end + 4096:] ** 2).item()
+
+        # 4. End-to-end render and cache separation for Ho / Hr
+        in_path, out_path = synthetic_wav_pair
+        Resampler(
+            in_file=str(in_path),
+            out_file=str(out_path),
+            pitch="A4",
+            velocity=100,
+            flags="Ho50Hr-30",
+            length=200,
+            tempo="!120",
+        )
+        assert out_path.exists()
+        assert len(list(in_path.parent.glob("*Ho50*Hr-30*.hifi.npz"))) == 1
+
     def test_relative_pit_vocal_fry_invariants(self, synthetic_wav_pair):
         from util.vocal_fry import apply_lf_vocal_fry, prepare_vocal_fry_excitation
 

@@ -538,20 +538,40 @@ def _interp_lf_log_spectrum(rd_val: float, f0_src: float, freqs_np: np.ndarray) 
     return np.interp(nu, ks, row).astype(np.float32)
 
 
-def pre_emphasis_base_tension(wave, b):
+def _klatt_resonator_response(
+    freqs: torch.Tensor, center_hz: float, bandwidth_hz: float, sr: int
+) -> torch.Tensor:
     """
-    Clean-room v3 minimum-phase LF glottal tension engine:
+    Unit-peak Klatt real-pole second-order resonator magnitude response in (0, 1],
+    strictly equal to 1.0 (0.00 dB) at freqs == center_hz.
+    """
+    r = math.exp(-math.pi * float(bandwidth_hz) / float(sr))
+    num = (1.0 - r) ** 2
+    den = 1.0 - 2.0 * r * torch.cos(2.0 * math.pi * (freqs - float(center_hz)) / float(sr)) + r * r
+    return num / torch.clamp(den, min=1e-12)
+
+
+def pre_emphasis_base_tension(wave, b, ho=0.0, hr=0.0):
+    """
+    Clean-room v3 minimum-phase LF glottal tension & vocal-tract timbre engine:
     1. Adaptive source-f0 & Itakura-Saito baseline Rd0 estimation with sharp-voice protection;
     2. Exact closed-form continuous-time LF harmonic ratio anchored strictly at H1 (f = f0_src);
-    3. Bidirectional high-frequency counter-damping ramp (+/- 0.8 Np = +/- 6.95 dB over 8.5-11.5 kHz);
-    4. Cepstral formant plateau protection (F1/F2/F3 vowel invariance) & Hilbert minimum-phase;
-    5. Psychoacoustic middle-ear loudness preservation W(f) clamped safely in [0.45, 2.0].
+    3. Bidirectional high-frequency counter-damping ramp (+/- 0.8 Np = +/- 6.95 dB over 8.2-11.5 kHz);
+    4. Cepstral formant plateau protection (F1/F2/F3 vowel invariance);
+    5. Clean-room Klatt second-order resonators for Ho (Openness, anchored at f0_src)
+       and Hr (Singer's Formant at 3200 Hz) + Hilbert minimum-phase folding;
+    6. Psychoacoustic middle-ear loudness preservation W(f).
 
     Args:
         wave: [1, 1, t] periodic harmonic waveform tensor
         b: float tension parameter (-Ht / 50, in [-2.0, 2.0]; b < 0 is higher tension)
+        ho: float openness parameter (Ho in [-100, 100]; > 0 opens upper F1/F2/F3 clarity)
+        hr: float singer's formant parameter (Hr in [-100, 100]; > 0 boosts 3.2 kHz resonance)
     """
-    if abs(float(b)) < 1e-6:
+    b_val = float(b)
+    ho_val = float(ho)
+    hr_val = float(hr)
+    if abs(b_val) < 1e-6 and abs(ho_val) < 1e-6 and abs(hr_val) < 1e-6:
         return wave
 
     orig_dtype = wave.dtype
@@ -574,11 +594,13 @@ def pre_emphasis_base_tension(wave, b):
         return_complex=True,
     )
 
-    b_clamped = float(np.clip(b, -2.0, 2.0))
+    b_clamped = float(np.clip(b_val, -2.0, 2.0))
+    ho_clamped = float(np.clip(ho_val, -100.0, 100.0))
+    hr_clamped = float(np.clip(hr_val, -100.0, 100.0))
     sr = int(CONFIG.sample_rate)
     n_fft = int(CONFIG.n_fft)
 
-    # 1. Voiced-energy-weighted mean power spectrum, adaptive f0_src, and baseline Rd0
+    # 1. Voiced-energy-weighted mean power spectrum and adaptive f0_src
     power_spec = spec.real ** 2 + spec.imag ** 2  # [1, F, T]
     frame_energy = torch.sum(power_spec, dim=1, keepdim=True)  # [1, 1, T]
     total_energy = float(torch.sum(frame_energy).item())
@@ -587,49 +609,67 @@ def pre_emphasis_base_tension(wave, b):
 
     mean_power = torch.sum(power_spec * frame_energy, dim=2).squeeze(0) / (total_energy + 1e-12)
     f0_src = _estimate_harmonic_f0(mean_power, sr, n_fft)
-    formant_prominence = _extract_cepstral_formant_envelope(mean_power, sr, n_fft)
-    rd0 = _estimate_baseline_rd(mean_power, formant_prominence, freqs, f0_src, sr, n_fft)
 
-    # 2. Perceptual arc-length Rd warping with soft-knee rail protection on sharp/intense voices
-    rd_grid, _, _, psi_grid = _get_lf_glottal_table()
+    if abs(b_clamped) >= 1e-6:
+        formant_prominence = _extract_cepstral_formant_envelope(mean_power, sr, n_fft)
+        rd0 = _estimate_baseline_rd(mean_power, formant_prominence, freqs, f0_src, sr, n_fft)
 
-    if b_clamped < 0.0:
-        # Positive tension (Ht > 0, b in [-2, 0]): map smoothly down to voice-adaptive tense floor
-        # Gives mellow voices (psi0 ~ 0.72) full ~13 dB upward travel while protecting sharp voices (psi0 ~ 0.38)
-        rd_base = rd0
-        psi0 = float(np.interp(rd_base, rd_grid, psi_grid))
-        u = -b_clamped / 2.0
-        psi_floor = min(psi0, 0.042 + 0.030 * max(0.0, 0.55 - psi0))
-        psi_target = psi_floor + (psi0 - psi_floor) * (1.0 - math.tanh(1.75 * u) / math.tanh(1.75))
-        tilt_scale = 1.28
+        # 2. Perceptual arc-length Rd warping with soft-knee rail protection on sharp/intense voices
+        rd_grid, _, _, psi_grid = _get_lf_glottal_table()
+
+        if b_clamped < 0.0:
+            # Positive tension (Ht > 0, b in [-2, 0]): map smoothly down to voice-adaptive tense floor
+            # Gives mellow voices (psi0 ~ 0.72) full ~13 dB upward travel while protecting sharp voices (psi0 ~ 0.38)
+            rd_base = rd0
+            psi0 = float(np.interp(rd_base, rd_grid, psi_grid))
+            u = -b_clamped / 2.0
+            psi_floor = min(psi0, 0.042 + 0.030 * max(0.0, 0.55 - psi0))
+            psi_target = psi_floor + (psi0 - psi_floor) * (1.0 - math.tanh(1.75 * u) / math.tanh(1.75))
+            tilt_scale = 1.28
+        else:
+            # Negative tension (Ht < 0, b in (0, +2]): guarantee full downward softening excursion
+            # even on mellow voices by capping rd_base <= 0.92 while preserving wider travel on sharp voices
+            rd_base = min(rd0, 0.92)
+            psi0 = float(np.interp(rd_base, rd_grid, psi_grid))
+            drive = (b_clamped / 2.0) * 1.65
+            psi_target = psi0 + (1.0 - psi0) * math.tanh(drive)
+            tilt_scale = 1.48
+
+        rd_target = float(np.interp(psi_target, psi_grid, rd_grid))
+
+        # 3. Closed-form LF harmonic log-ratio (strictly 0 dB at and below H1 = f0_src)
+        freqs_np = freqs.detach().cpu().numpy()
+        log_g0 = _interp_lf_log_spectrum(rd_base, f0_src, freqs_np)
+        log_gt = _interp_lf_log_spectrum(rd_target, f0_src, freqs_np)
+        raw_delta_np = tilt_scale * (log_gt - log_g0)
+        log_gain = torch.from_numpy(raw_delta_np).to(device=wave.device, dtype=torch.float32)
+
+        # 4. Bidirectional high-frequency counter-damping ramp (+/- 0.8 Np = +/- 6.95 dB over [8.2k, 11.5k] Hz)
+        # Prevents >9 kHz sibilant harshness on Ht > 0 AND preserves vocal "air" on Ht < 0
+        hf_ramp = torch.clamp((freqs - 8200.0) / 3300.0, min=0.0, max=1.0)
+        hf_counter = torch.clamp(-hf_ramp * log_gain, min=-0.80, max=0.80)
+        log_gain = log_gain + hf_counter
+
+        # 5. Formant-preserving slope-damped plateau across vowel formants F1/F2/F3
+        log_gain = _apply_formant_plateau_protection(
+            log_gain, formant_prominence, freqs, sr, n_fft, alpha_prot=0.50
+        )
     else:
-        # Negative tension (Ht < 0, b in (0, +2]): guarantee full downward softening excursion
-        # even on mellow voices by capping rd_base <= 0.92 while preserving wider travel on sharp voices
-        rd_base = min(rd0, 0.92)
-        psi0 = float(np.interp(rd_base, rd_grid, psi_grid))
-        drive = (b_clamped / 2.0) * 1.65
-        psi_target = psi0 + (1.0 - psi0) * math.tanh(drive)
-        tilt_scale = 1.48
+        log_gain = torch.zeros_like(freqs)
 
-    rd_target = float(np.interp(psi_target, psi_grid, rd_grid))
+    # 5b. Openness (Ho): F0-anchored Klatt real-pole resonator tilt (0 dB at f <= f0_src)
+    if abs(ho_clamped) >= 1e-6:
+        f_eff = torch.clamp(freqs, min=f0_src)
+        h_res_o = _klatt_resonator_response(f_eff, f0_src, 300.0, sr)
+        log_gain_ho = -(ho_clamped / 300.0) * torch.log(torch.clamp(h_res_o, min=1e-7))
+        hf_ramp_ho = torch.clamp((freqs - 8200.0) / 3300.0, min=0.0, max=1.0)
+        log_gain = log_gain + log_gain_ho + torch.clamp(-hf_ramp_ho * log_gain_ho, min=-0.80, max=0.80)
 
-    # 3. Closed-form LF harmonic log-ratio (strictly 0 dB at and below H1 = f0_src)
-    freqs_np = freqs.detach().cpu().numpy()
-    log_g0 = _interp_lf_log_spectrum(rd_base, f0_src, freqs_np)
-    log_gt = _interp_lf_log_spectrum(rd_target, f0_src, freqs_np)
-    raw_delta_np = tilt_scale * (log_gt - log_g0)
-    log_gain = torch.from_numpy(raw_delta_np).to(device=wave.device, dtype=torch.float32)
-
-    # 4. Bidirectional high-frequency counter-damping ramp (+/- 0.8 Np = +/- 6.95 dB over [8.2k, 11.5k] Hz)
-    # Prevents >9 kHz sibilant harshness on Ht > 0 AND preserves vocal "air" on Ht < 0
-    hf_ramp = torch.clamp((freqs - 8200.0) / 3300.0, min=0.0, max=1.0)
-    hf_counter = torch.clamp(-hf_ramp * log_gain, min=-0.80, max=0.80)
-    log_gain = log_gain + hf_counter
-
-    # 5. Formant-preserving slope-damped plateau across vowel formants F1/F2/F3
-    log_gain = _apply_formant_plateau_protection(
-        log_gain, formant_prominence, freqs, sr, n_fft, alpha_prot=0.50
-    )
+    # 5c. Singer's Formant (Hr): 3200 Hz (B = 1000 Hz) additive-magnitude bell/notch
+    if abs(hr_clamped) >= 1e-6:
+        h_res_r = _klatt_resonator_response(freqs, 3200.0, 1000.0, sr)
+        beta_hr = (0.1 * hr_clamped) if hr_clamped > 0.0 else (hr_clamped / 101.0)
+        log_gain = log_gain + torch.log(torch.clamp(1.0 + beta_hr * h_res_r, min=1e-4))
 
     # 6. Minimum-phase complex transfer function via causal real cepstrum folding
     cepstrum = torch.fft.irfft(log_gain, n=n_fft)
@@ -679,15 +719,17 @@ def couple_aperiodic_to_tension(
     orig_voiced_wave: torch.Tensor,
     mod_voiced_wave: torch.Tensor,
     b: float,
+    ho: float = 0.0,
+    hr: float = 0.0,
 ) -> torch.Tensor:
     """
     Clean-room voiced aspiration noise coupling with 5-frame boundary anchor stabilization:
     - Leaves unvoiced consonants (s, sh, t, k, ch) and silence 100% bit-identical (voiced_mask == 0);
     - Smoothly couples high-frequency (> 1.6 kHz) voiced aspiration turbulence inside vowels
-      to track harmonic spectral energy changes induced by Ht, eliminating exposed hiss on soft Ht < 0
-      and matching glottal turbulence on bright Ht > 0.
+      to track harmonic spectral energy changes induced by Ht/Ho/Hr, eliminating exposed hiss on soft settings
+      and matching glottal/formant resonance on bright settings.
     """
-    if abs(float(b)) < 1e-6:
+    if abs(float(b)) < 1e-6 and abs(float(ho)) < 1e-6 and abs(float(hr)) < 1e-6:
         return aperiodic_wave
 
     orig_dtype = aperiodic_wave.dtype

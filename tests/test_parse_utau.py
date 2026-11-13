@@ -185,6 +185,8 @@ class TestUtauFlagsRegex:
         assert "Hb" in flags
         assert "Hv" in flags
         assert "Ht" in flags
+        assert "Ho" in flags
+        assert "Hr" in flags
         assert "He" in flags
         assert "HG" in flags
         assert "P" in flags
@@ -200,13 +202,15 @@ class TestUtauFlagsRegex:
         assert matches_no_val == [("G", "")]
 
     def test_compound_flag_matching(self):
-        flag_str = "g-5t10Hb100Hv80Ht-20HG30P90"
+        flag_str = "g-5t10Hb100Hv80Ht-20Ho+35Hr-25HG30P90"
         matches = dict(flag_re.findall(flag_str))
         assert matches["g"] == "-5"
         assert matches["t"] == "10"
         assert matches["Hb"] == "100"
         assert matches["Hv"] == "80"
         assert matches["Ht"] == "-20"
+        assert matches["Ho"] == "+35"
+        assert matches["Hr"] == "-25"
         assert matches["HG"] == "30"
         assert matches["P"] == "90"
 
