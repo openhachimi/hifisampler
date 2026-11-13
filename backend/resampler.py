@@ -21,6 +21,7 @@ from util.audio import (
 )
 from util.parse_utau import flag_re, midi_to_hz, note_to_midi, pitch_string_to_cents
 from util.cache_manager import cache_manager
+from util.onnx_dsp import dynamic_range_compression_np
 
 cache_ext = '.hifi.npz'  # cache file extension
 
@@ -112,10 +113,7 @@ class Resampler:
         return wave * scale_factor
 
     def generate_features(self, features_path):
-        wave = read_wav(self.in_file)
-        wave = torch.from_numpy(wave).to(
-            dtype=torch.float32, device=CONFIG.device).unsqueeze(0).unsqueeze(0)
-        logging.debug(f"wave shape: {wave.shape}")
+        wave_np = read_wav(self.in_file)
 
         breath = self.flags.get("Hb", 100)
         voicing = self.flags.get("Hv", 100)
@@ -124,10 +122,79 @@ class Resampler:
         singer_formant = self.flags.get("Hr", 0)
         logging.debug(f'breath: {breath}, voicing: {voicing}, tension: {tension}, openness: {openness}, singer_formant: {singer_formant}')
 
+        gender = self.flags.get("g", 0)
+        if gender is None:
+            gender = 0
+        gender = np.clip(gender, -100, 100)
+        logging.debug(f'gender: {gender}')
+
         torch_gpu = getattr(models, 'torch_uses_gpu', CONFIG.device.type != 'cpu')
         hnsep_gpu = getattr(models, 'hnsep_uses_gpu', False) or torch_gpu
+        needs_hnsep = self._needs_hnsep_separation(breath, voicing, tension, openness, singer_formant)
+        numpy_mel = getattr(models, 'numpy_mel_analyzer', None)
+        numpy_hnsep = getattr(models, 'numpy_hnsep_model', None)
+        numpy_hnsep_ok = (not needs_hnsep) or (
+            numpy_hnsep is not None
+            and getattr(numpy_hnsep, 'session', None) is not None
+            and getattr(models, 'hnsep_model', None) is not None
+            and getattr(numpy_hnsep, 'session', None) is getattr(models.hnsep_model, 'session', None)
+        )
 
-        if self._needs_hnsep_separation(breath, voicing, tension, openness, singer_formant):
+        # Pure NumPy/SciPy ONNX fast-path: avoids torch Tensor allocations on CPU/DirectML when no tension filter is active
+        if (
+            CONFIG.device.type == 'cpu'
+            and tension == 0
+            and openness == 0
+            and singer_formant == 0
+            and numpy_mel is not None
+            and numpy_hnsep_ok
+        ):
+            if needs_hnsep:
+                hnsep_cache_path = self.in_file.with_name(f'{self.in_file.stem}_hnsep')
+                force_generate = self.flags.get('G', 0) != 0
+                with cache_manager.get_lock(hnsep_cache_path):
+                    seg_output = cache_manager.load_hnsep_cache(
+                        hnsep_cache_path, 'cpu', force_generate, source_path=self.in_file
+                    )
+                    if seg_output is None:
+                        logging.info(f'Generating hnsep features (NumPy ONNX) for {hnsep_cache_path.name}')
+                        with _gpu_lock(hnsep_gpu):
+                            seg_np = numpy_hnsep.predict_from_audio(wave_np)
+                        seg_tensor = torch.from_numpy(np.ascontiguousarray(seg_np, dtype=np.float32)).unsqueeze(0).unsqueeze(0)
+                        saved_tensor = cache_manager.save_hnsep_cache(
+                            hnsep_cache_path,
+                            seg_tensor,
+                            device='cpu',
+                            force_generate=force_generate,
+                            source_path=self.in_file,
+                        )
+                        seg_np = saved_tensor.squeeze(0).squeeze(0).cpu().numpy()
+                    else:
+                        seg_np = seg_output.squeeze(0).squeeze(0).cpu().numpy()
+
+                breath = float(np.clip(breath, 0, 500))
+                voicing = float(np.clip(voicing, 0, 150))
+                wave_np = ((breath / 100.0) * (wave_np - seg_np) + (voicing / 100.0) * seg_np).astype(np.float32, copy=False)
+            elif breath != 100 or voicing != 100:
+                wave_np = self._apply_simple_scaling(wave_np, breath).astype(np.float32, copy=False)
+
+            wave_max = _peak_abs(wave_np)
+            if wave_max >= 0.5:
+                scale = float(0.5 / wave_max)
+                wave_np = (wave_np * np.float32(scale)).astype(np.float32, copy=False)
+            else:
+                scale = 1.0
+
+            mel_origin = numpy_mel(wave_np, -gender * 0.06, 1)
+            mel_origin = dynamic_range_compression_np(mel_origin)
+            logging.debug('Features generation completed (pure NumPy ONNX fast-path).')
+            return {'mel_origin': mel_origin, 'scale': scale}
+
+        wave = torch.from_numpy(wave_np).to(
+            dtype=torch.float32, device=CONFIG.device).unsqueeze(0).unsqueeze(0)
+        logging.debug(f"wave shape: {wave.shape}")
+
+        if needs_hnsep:
             logging.debug('Hb, Hv, Ht, Ho, or Hr flag requires hnsep separation. Split audio into breath, voicing')
 
             hnsep_cache_path = self.in_file.with_name(

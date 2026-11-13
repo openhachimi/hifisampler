@@ -7,12 +7,15 @@ import torch
 
 from config import CONFIG
 from util.wav2mel import PitchAdjustableMelSpectrogram
+from util.onnx_dsp import NumpyHnsepModel, NumpyMelSpectrogram
 from util.model_loader import HifiGANLoader, HNSEPLoader
 
 vocoder = None
 ort_session = None
 hnsep_model = None
 mel_analyzer = None
+numpy_mel_analyzer = None
+numpy_hnsep_model = None
 vocoder_type = None
 hnsep_type = None
 ort_uses_gpu = False
@@ -53,8 +56,8 @@ def warmup_models():
 
 
 def initialize_models():
-    global vocoder, ort_session, hnsep_model, mel_analyzer, vocoder_type, hnsep_type
-    global ort_uses_gpu, torch_uses_gpu, vocoder_uses_gpu, hnsep_uses_gpu
+    global vocoder, ort_session, hnsep_model, mel_analyzer, numpy_mel_analyzer, numpy_hnsep_model
+    global vocoder_type, hnsep_type, ort_uses_gpu, torch_uses_gpu, vocoder_uses_gpu, hnsep_uses_gpu
 
     logging.info("Initializing models...")
     torch_uses_gpu = CONFIG.device.type != "cpu"
@@ -85,8 +88,10 @@ def initialize_models():
             hnsep_uses_gpu = hnsep_model.session.get_providers()[0] != "CPUExecutionProvider"
         except Exception:
             hnsep_uses_gpu = False
+        numpy_hnsep_model = NumpyHnsepModel(hnsep_model.session, hnsep_model.config)
     else:
         hnsep_uses_gpu = torch_uses_gpu
+        numpy_hnsep_model = None
 
     ort_uses_gpu = vocoder_uses_gpu or hnsep_uses_gpu
 
@@ -103,6 +108,15 @@ def initialize_models():
         torch.set_num_threads(max(1, physical_cpus // workers))
 
     mel_analyzer = PitchAdjustableMelSpectrogram(
+        sample_rate=CONFIG.sample_rate,
+        n_fft=CONFIG.n_fft,
+        win_length=CONFIG.win_size,
+        hop_length=CONFIG.origin_hop_size,
+        f_min=CONFIG.mel_fmin,
+        f_max=CONFIG.mel_fmax,
+        n_mels=CONFIG.n_mels,
+    )
+    numpy_mel_analyzer = NumpyMelSpectrogram(
         sample_rate=CONFIG.sample_rate,
         n_fft=CONFIG.n_fft,
         win_length=CONFIG.win_size,
