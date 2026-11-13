@@ -5,37 +5,16 @@ from pathlib import Path
 import threading
 import uuid
 import numpy as np
-import resampy
 import torch
 from config import CONFIG
 from util.cache_manager import cache_manager
+from util.lufs import loudness_norm_fast, resample_poly_fast
 import soundfile as sf
 
-if CONFIG.wave_norm:
-    try:
-        import pyloudnorm as pyln
-        logging.info("pyloudnorm imported for wave normalization.")
-    except ImportError:
-        logging.warning(
-            "pyloudnorm not found, wave normalization disabled.")
-        CONFIG.wave_norm = False  # Disable if import fails
-
-_METER_CACHE = {}
-_METER_LOCK = threading.Lock()
 _PRE_EMPHASIS_CACHE = {}
 _PRE_EMPHASIS_LOCK = threading.Lock()
 _LF_GLOTTAL_TABLE = None
 _LF_GLOTTAL_LOCK = threading.Lock()
-
-
-def _get_loudness_meter(rate: int, block_size: float):
-    key = (int(rate), float(block_size))
-    with _METER_LOCK:
-        meter = _METER_CACHE.get(key)
-        if meter is None:
-            meter = pyln.Meter(rate, block_size=block_size)
-            _METER_CACHE[key] = meter
-        return meter
 
 
 class DotDict(dict):
@@ -59,139 +38,19 @@ def loudness_norm(
     audio: np.ndarray, rate: int, peak=-1.0, loudness=-23.0, block_size=0.400, strength=100
 ) -> np.ndarray:
     """
-    Perform loudness normalization (ITU-R BS.1770-4) on audio files.
-
-    Args:
-        audio: audio data
-        rate: sample rate
-        peak: peak normalize audio to N dB. Defaults to -1.0.
-        loudness: loudness normalize audio to N dB LUFS. Defaults to -23.0.
-        block_size: block size for loudness measurement. Defaults to 0.400. (400 ms)
-        strength: strength of the normalization. Defaults to 100.
-
-    Returns:
-        loudness normalized audio
+    Perform loudness normalization (ITU-R BS.1770-4) on audio files
+    using the fast pure-NumPy/SciPy implementation with envelope-aware tail protection.
     """
-    if len(audio) == 0 or _peak_abs(audio) < 1e-8:
-        return audio
-
-    original_length = len(audio)
-    original_audio = audio.copy()  # 保存原始音频用于后续处理
-    voiced_frames = []
-    first_voiced = 0
-    hop_length = int(rate * 0.01)
-
-    if CONFIG.trim_silence:
-        frame_length = int(rate * 0.02)  # 20ms窗口
-        hop_length = int(rate * 0.01)    # 10ms步长
-
-        # Match range(0, len(audio) - frame_length, hop_length) frame count exactly
-        num_frames = max(0, (len(audio) - frame_length + hop_length - 1) // hop_length)
-        if num_frames > 0:
-            cs = np.empty(len(audio) + 1, dtype=np.float64)
-            cs[0] = 0.0
-            np.cumsum(np.square(audio, dtype=np.float64), out=cs[1:])
-            starts = np.arange(num_frames) * hop_length
-            mean_sq = (cs[starts + frame_length] - cs[starts]) / frame_length
-            thresh_sq = max(1e-20, float(10.0 ** (CONFIG.silence_threshold / 10.0)))
-            voiced_frames = np.flatnonzero(mean_sq > thresh_sq).tolist()
-
-        if voiced_frames:
-            first_voiced = voiced_frames[0]
-            last_voiced = voiced_frames[-1]
-
-            # 添加一些余量，避免突然截断
-            padding_frames = int(rate * 0.1) // hop_length  # 添加100ms的余量
-
-            # 确保不超出边界
-            start_sample = max(0, first_voiced * hop_length)
-            end_sample = min(len(audio), (last_voiced + 1 +
-                             padding_frames) * hop_length + frame_length)
-
-            trimmed_audio = audio[start_sample:end_sample]
-            logging.debug(
-                f'Trimmed silence: {len(audio)} -> {len(trimmed_audio)} samples')
-
-            # 使用截取后的音频进行响度标准化
-            audio = trimmed_audio
-        elif num_frames > 0:
-            return original_audio
-
-    if len(audio) == 0 or _peak_abs(audio) < 1e-8:
-        return original_audio
-
-    # 如果音频长度小于最小块大小，仅对测量副本进行填充，避免反射回声混入输出尾部
-    min_samples = int(rate * block_size)
-    if len(audio) < min_samples:
-        padding_length = min_samples - len(audio)
-        measure_audio = np.pad(audio, (0, padding_length), mode='reflect')
-    else:
-        measure_audio = audio
-
-    # Measure the loudness first using cached BS.1770 meter
-    meter = _get_loudness_meter(rate, block_size)
-    _loudness = meter.integrated_loudness(measure_audio)
-    if not np.isfinite(_loudness):
-        return original_audio
-
-    # Apply strength to calculate the target loudness
-    final_loudness = _loudness + (loudness - _loudness) * strength / 100
-
-    # Loudness normalize audio to [loudness] LUFS
-    audio = pyln.normalize.loudness(audio, _loudness, final_loudness)
-
-    # 如果启用了无声截取功能，需要恢复原始长度
-    if CONFIG.trim_silence:
-        # 创建一个全零数组作为输出
-        output = np.zeros(original_length, dtype=original_audio.dtype)
-
-        # 将标准化后的音频放回原位置，并添加平滑过渡
-        if voiced_frames:  # 确保有声音帧存在
-            start_sample = max(0, first_voiced * int(hop_length))
-
-            # 计算需要放回的音频长度
-            available_length = min(len(audio), original_length - start_sample)
-
-            # 创建一个逐渐衰减的窗函数，用于音频的尾部淡出
-            # 最多200ms或音频长度的1/4
-            fade_length = min(int(rate * 0.2), available_length // 4)
-            fade_out = np.ones(available_length)
-
-            if fade_length > 0:
-                # 在末尾应用淡出效果
-                fade_out[-fade_length:] = np.linspace(1.0, 0.0, fade_length)
-
-            # 应用淡出效果并放回原位置
-            output[start_sample:start_sample +
-                   available_length] = audio[:available_length] * fade_out
-            # 如果原始音频有后续部分，应用交叉淡入淡出
-            if start_sample + available_length < original_length:
-                remain_length = original_length - \
-                    (start_sample + available_length)
-                crossfade_length = min(fade_length, remain_length)
-
-                if crossfade_length > 0:
-                    crossfade_start = start_sample + available_length
-                    # 从原始音频获取剩余部分
-                    remain_audio = original_audio[crossfade_start:original_length]
-
-                    # 应用淡入效果到原始音频的剩余部分
-                    fade_in = np.ones(remain_length)
-                    fade_in[:crossfade_length] = np.linspace(
-                        0.0, 1.0, crossfade_length)
-
-                    # 填充剩余部分
-                    output[crossfade_start:original_length] = remain_audio * fade_in
-        else:  # 如果没有声音帧，直接返回原始音频
-            output = original_audio[:original_length]
-
-        audio = output
-
-    # 如果原始音频短于block_size，裁剪回原始长度
-    if original_length < min_samples:
-        audio = audio[:original_length]
-
-    return audio
+    return loudness_norm_fast(
+        audio,
+        rate,
+        peak=peak,
+        loudness=loudness,
+        block_size=block_size,
+        strength=strength,
+        trim_silence=CONFIG.trim_silence,
+        silence_threshold=CONFIG.silence_threshold,
+    )
 
 
 def _middle_ear_loudness_weight(freqs: torch.Tensor) -> torch.Tensor:
@@ -887,7 +746,7 @@ def read_wav(loc):
         x = np.mean(x, axis=1, dtype=np.float32)
 
     if fs != CONFIG.sample_rate:
-        x = resampy.resample(x, fs, CONFIG.sample_rate).astype(np.float32, copy=False)
+        x = resample_poly_fast(x, fs, CONFIG.sample_rate)
 
     cache_manager.save_wav_cache(resolved_loc, x)
     return x
