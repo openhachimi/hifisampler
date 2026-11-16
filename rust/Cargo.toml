@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/*",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["hifisampler team"]
+license = "MIT"
+
+[workspace.dependencies]
+# WAV audio I/O
+hound = "3.5"
+
+# Binary serialization & endianness
+byteorder = "1.5"
+bytemuck = { version = "1.21", features = ["derive"] }
+
+# Multi-dimensional arrays & numpy interoperability
+ndarray = { version = "0.17", features = ["serde"] }
+ndarray-npy = { version = "0.10.0", features = ["npz"] }
+
+# Atomic temp file operations & tests
+tempfile = "3.17"
+
+# Error handling
+thiserror = "2.0"
+
+# Unique temporary IDs
+uuid = { version = "1.10", features = ["v4", "fast-rng"] }
+
+# Testing utilities
+approx = "0.5"
+
+# Internal workspace crates
+hifi_lufs = { path = "crates/hifi_lufs" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"

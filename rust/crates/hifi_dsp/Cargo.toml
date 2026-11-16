@@ -1,0 +1,17 @@
+[package]
+name = "hifi_dsp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Clean-room Mel, HN-SEP STFT/ISTFT, Akima pitch/time-axis, and Ht v3 LF tension DSP for hifisampler"
+
+[dependencies]
+ndarray.workspace = true
+thiserror.workspace = true
+num-complex = "0.4"
+realfft = "3.4"
+rustfft = "6.2"
+
+[dev-dependencies]
+approx.workspace = true

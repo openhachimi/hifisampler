@@ -1,0 +1,21 @@
+[package]
+name = "hifi_core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Core audio I/O and HIFIBIN1 binary feature cache for hifisampler"
+
+[dependencies]
+hifi_lufs.workspace = true
+hound.workspace = true
+byteorder.workspace = true
+bytemuck.workspace = true
+ndarray.workspace = true
+ndarray-npy.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+approx.workspace = true

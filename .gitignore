@@ -31,3 +31,10 @@ config.yaml
 uv.exe
 hnsep/vr/
 pc_nsf_hifigan_44.1k_hop512_128bin_2025.02/
+
+# Rust build artifacts
+target/
+rust/target/
+
+# Local agent/teamwork artifacts
+.agents/

@@ -1,0 +1,33 @@
+[package]
+name = "hifi_onnx"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Clean-room dynamic ONNX Runtime wrapper (CPU/DirectML/CUDA/ROCm/CoreML) for hifisampler"
+
+[features]
+default = ["directml", "cuda", "rocm", "coreml", "migraphx"]
+cpu = []
+directml = []
+cuda = []
+rocm = []
+coreml = []
+migraphx = []
+all-eps = ["directml", "cuda", "rocm", "coreml", "migraphx"]
+
+[dependencies]
+ndarray.workspace = true
+thiserror.workspace = true
+log = "0.4"
+once_cell = "1.21"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true
+approx.workspace = true
