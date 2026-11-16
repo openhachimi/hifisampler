@@ -1,0 +1,26 @@
+[package]
+name = "hifi_bench"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Reproducible A/B audio equivalence and performance benchmark suite for hifisampler"
+
+[[bin]]
+name = "hifi_bench"
+path = "src/main.rs"
+
+[dependencies]
+hifi_core = { path = "../hifi_core" }
+hifi_dsp = { path = "../hifi_dsp" }
+hifi_lufs.workspace = true
+ndarray.workspace = true
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
+
+[dev-dependencies]
+tempfile.workspace = true
