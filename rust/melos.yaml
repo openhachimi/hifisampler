@@ -1,0 +1,130 @@
+# OpenUtau Resampler Manifest for Melos
+# Copy this file alongside melos.exe or melos in OpenUtau's Resamplers folder
+# (pair with melos-wavtool.exe in OpenUtau's Wavtools folder for full-phrase Mel synthesis).
+expressions:
+  gen:
+    name: gender
+    abbr: gen
+    type: Numerical
+    min: -100
+    max: 100
+    default_value: 0
+    is_flag: true
+    flag: g
+    skip_output_if_default: false
+  Hb:
+    name: breathiness (melos)
+    abbr: Hb
+    type: Numerical
+    min: 0
+    max: 500
+    default_value: 100
+    is_flag: true
+    flag: Hb
+    skip_output_if_default: true
+  Hv:
+    name: voicing (melos)
+    abbr: Hv
+    type: Numerical
+    min: 0
+    max: 150
+    default_value: 100
+    is_flag: true
+    flag: Hv
+    skip_output_if_default: true
+  Ht:
+    name: tension (melos)
+    abbr: Ht
+    type: Numerical
+    min: -100
+    max: 100
+    default_value: 0
+    is_flag: true
+    flag: Ht
+    skip_output_if_default: true
+  Ho:
+    name: openness (melos)
+    abbr: Ho
+    type: Numerical
+    min: -100
+    max: 100
+    default_value: 0
+    is_flag: true
+    flag: Ho
+    skip_output_if_default: true
+  Hr:
+    name: singer's formant (melos)
+    abbr: Hr
+    type: Numerical
+    min: -100
+    max: 100
+    default_value: 0
+    is_flag: true
+    flag: Hr
+    skip_output_if_default: true
+  HG:
+    name: growl (melos)
+    abbr: HG
+    type: Numerical
+    min: 0
+    max: 100
+    default_value: 0
+    is_flag: true
+    flag: HG
+    skip_output_if_default: true
+  norm:
+    name: normalize
+    abbr: norm
+    type: Numerical
+    min: 0
+    max: 100
+    default_value: 86
+    is_flag: true
+    flag: P
+    skip_output_if_default: false
+  t:
+    name: pitch shift (10 cents) (melos)
+    abbr: t
+    type: Numerical
+    min: -120
+    max: 120
+    default_value: 0
+    is_flag: true
+    flag: t
+    skip_output_if_default: true
+  A:
+    name: amplitude modulation (melos)
+    abbr: A
+    type: Numerical
+    min: -100
+    max: 100
+    default_value: 0
+    is_flag: true
+    flag: A
+    skip_output_if_default: true
+  G:
+    name: force regenerate cache (melos)
+    abbr: G
+    type: Options
+    min: 0
+    max: 1
+    default_value: 0
+    is_flag: true
+    flag: G
+    options:
+      - ""
+      - G
+    skip_output_if_default: true
+  He:
+    name: loop mode (melos)
+    abbr: He
+    type: Options
+    min: 0
+    max: 1
+    default_value: 0
+    is_flag: true
+    flag: He
+    options:
+      - ""
+      - He
+    skip_output_if_default: true

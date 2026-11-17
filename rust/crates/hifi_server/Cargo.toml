@@ -30,5 +30,7 @@ uuid.workspace = true
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [dev-dependencies]
+approx.workspace = true
 hifi_client = { path = "../hifi_client" }
+tempfile.workspace = true
 tower = { version = "0.4", features = ["util"] }

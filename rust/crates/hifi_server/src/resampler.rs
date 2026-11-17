@@ -1,3 +1,4 @@
+use crate::phrase_mgr::{PhraseBatchRequest, WavtoolStepRequest};
 use crate::stats::StatsCollector;
 use hifi_core::utau::{note_to_midi, parse_flags, parse_tempo, UtauFlags};
 use ndarray::{Array4, ArrayView2};
@@ -134,6 +135,40 @@ pub trait OnnxRunner: Send + Sync {
 /// Thread-safe server resampler engine matching `backend/resampler.py`.
 pub trait ResampleEngine: Send + Sync {
     fn resample(&self, raw_args: &[String], stats: &StatsCollector) -> Result<(), ResampleError>;
+
+    /// Prepares acoustic features (Mel + F0 + fry + P-gain) without running the GPU vocoder,
+    /// persisting a `MELOSNT1` sidecar and writing a minimal valid WAV stub for `melos`.
+    fn prepare_phrase_note(
+        &self,
+        _raw_args: &[String],
+        _stats: &StatsCollector,
+    ) -> Result<(), ResampleError> {
+        Err(ResampleError::Internal(
+            "Phrase preparation is not supported by this engine".into(),
+        ))
+    }
+
+    /// Accumulates or executes continuous phrase synthesis for a `melos-wavtool` step.
+    fn process_wavtool_step(
+        &self,
+        _req: WavtoolStepRequest,
+        _stats: &StatsCollector,
+    ) -> Result<(), ResampleError> {
+        Err(ResampleError::Internal(
+            "Phrase wavtool synthesis is not supported by this engine".into(),
+        ))
+    }
+
+    /// One-shot batch continuous phrase synthesis endpoint.
+    fn render_phrase_batch(
+        &self,
+        _req: PhraseBatchRequest,
+        _stats: &StatsCollector,
+    ) -> Result<(), ResampleError> {
+        Err(ResampleError::Internal(
+            "Phrase batch rendering is not supported by this engine".into(),
+        ))
+    }
 }
 
 #[cfg(test)]

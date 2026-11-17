@@ -17,11 +17,20 @@ pub enum FastPathOutcome {
 }
 
 pub fn try_optimistic_post(port: u16, payload: &str, media_type: &str) -> FastPathOutcome {
+    try_optimistic_post_path(port, "/", payload, media_type)
+}
+
+pub fn try_optimistic_post_path(
+    port: u16,
+    path: &str,
+    payload: &str,
+    media_type: &str,
+) -> FastPathOutcome {
     let t0 = Instant::now();
     match http_request_loopback(
         port,
         "POST",
-        "/",
+        path,
         Some((payload, media_type)),
         Duration::from_millis(300),
         Duration::from_secs(180),
@@ -185,18 +194,27 @@ pub fn ensure_server_running(port: u16, loc: &ServerLocation) -> Result<(), Stri
 }
 
 pub fn communicate_with_server(port: u16, payload: &str, media_type: &str) -> Result<(), String> {
+    communicate_with_server_path(port, "/", payload, media_type)
+}
+
+pub fn communicate_with_server_path(
+    port: u16,
+    path: &str,
+    payload: &str,
+    media_type: &str,
+) -> Result<(), String> {
     let max_retries = 2usize;
     let retry_delay = Duration::from_millis(800);
 
     for attempt in 1..=(max_retries + 1) {
         println!(
-            "[Communicate] Sending POST (Attempt {attempt}/{})...",
+            "[Communicate] Sending POST {path} (Attempt {attempt}/{})...",
             max_retries + 1
         );
         match http_request_loopback(
             port,
             "POST",
-            "/",
+            path,
             Some((payload, media_type)),
             Duration::from_secs(2),
             Duration::from_secs(180),

@@ -497,6 +497,123 @@ fn pad_short_for_measurement(work_audio: &[f32], min_samples: usize) -> Vec<f32>
     out
 }
 
+struct LufsGainPlan {
+    span: Option<(usize, usize)>,
+    target_gain: f64,
+    active: bool,
+}
+
+fn compute_lufs_gain_and_span(
+    original: &[f32],
+    rate: u32,
+    opts: &LoudnessNormOptions,
+) -> Result<LufsGainPlan, LufsError> {
+    if rate == 0 {
+        return Err(LufsError::InvalidSampleRate(rate));
+    }
+    if !opts.block_size.is_finite() || opts.block_size <= 0.0 {
+        return Err(LufsError::InvalidBlockSize(opts.block_size));
+    }
+
+    if original.is_empty() {
+        return Ok(LufsGainPlan {
+            span: None,
+            target_gain: 1.0,
+            active: false,
+        });
+    }
+
+    let peak_abs = original.iter().map(|s| s.abs()).fold(0.0_f32, f32::max);
+    if peak_abs < 1e-8 || opts.strength < 0.01 {
+        return Ok(LufsGainPlan {
+            span: None,
+            target_gain: 1.0,
+            active: false,
+        });
+    }
+
+    let mut span: Option<(usize, usize)> = None;
+    let work_audio: &[f32] = if opts.trim_silence {
+        match find_voiced_span(original, rate, opts.silence_threshold) {
+            Some((start, end)) => {
+                span = Some((start, end));
+                let slice = &original[start..end];
+                let slice_peak = slice.iter().map(|s| s.abs()).fold(0.0_f32, f32::max);
+                if slice.is_empty() || slice_peak < 1e-8 {
+                    return Ok(LufsGainPlan {
+                        span: None,
+                        target_gain: 1.0,
+                        active: false,
+                    });
+                }
+                slice
+            }
+            None => {
+                return Ok(LufsGainPlan {
+                    span: None,
+                    target_gain: 1.0,
+                    active: false,
+                });
+            }
+        }
+    } else {
+        original
+    };
+
+    let min_samples = ((rate as f64 * opts.block_size) as usize).max(1);
+    let current_lufs = if work_audio.len() < min_samples {
+        let padded = pad_short_for_measurement(work_audio, min_samples);
+        measure_lufs_multichannel(&padded, rate, 1, opts.block_size)?
+    } else {
+        measure_lufs_multichannel(work_audio, rate, 1, opts.block_size)?
+    };
+
+    if !current_lufs.is_finite() {
+        return Ok(LufsGainPlan {
+            span,
+            target_gain: 1.0,
+            active: false,
+        });
+    }
+
+    let final_loudness =
+        current_lufs + (opts.target_loudness - current_lufs) * opts.strength / 100.0;
+    let mut gain_db = final_loudness - current_lufs;
+    if let Some(max_b) = opts.max_boost_db {
+        gain_db = gain_db.min(max_b);
+    }
+    let target_gain = 10.0_f64.powf(gain_db / 20.0);
+    Ok(LufsGainPlan {
+        span,
+        target_gain,
+        active: true,
+    })
+}
+
+/// Computes the linear loudness normalization multiplier for `audio` using ITU-R BS.1770-4,
+/// returning `1.0` for empty, silent, or fully gated signals.
+pub fn compute_lufs_target_gain(
+    audio: &[f32],
+    rate: u32,
+    opts: LoudnessNormOptions,
+) -> Result<f64, LufsError> {
+    if rate == 0 {
+        return Err(LufsError::InvalidSampleRate(rate));
+    }
+    if !opts.block_size.is_finite() || opts.block_size <= 0.0 {
+        return Err(LufsError::InvalidBlockSize(opts.block_size));
+    }
+    if audio.is_empty() {
+        return Ok(1.0);
+    }
+    let original: Vec<f32> = audio
+        .iter()
+        .map(|&s| if s.is_finite() { s } else { 0.0 })
+        .collect();
+    let plan = compute_lufs_gain_and_span(&original, rate, &opts)?;
+    Ok(plan.target_gain)
+}
+
 /// Performs fast ITU-R BS.1770-4 loudness normalization with optional silence trimming,
 /// 5 ms crossfade lead-in / up to 200 ms tail crossfade, and envelope-aware tail protection.
 ///
@@ -523,48 +640,17 @@ pub fn loudness_norm_fast(
         .map(|&s| if s.is_finite() { s } else { 0.0 })
         .collect();
 
-    let peak_abs = original.iter().map(|s| s.abs()).fold(0.0_f32, f32::max);
-    if peak_abs < 1e-8 || opts.strength < 0.01 {
+    let plan = compute_lufs_gain_and_span(&original, rate, &opts)?;
+    if !plan.active {
         return Ok(original);
     }
+    let span = plan.span;
+    let target_gain = plan.target_gain;
 
-    let mut span: Option<(usize, usize)> = None;
-    let work_audio: &[f32] = if opts.trim_silence {
-        match find_voiced_span(&original, rate, opts.silence_threshold) {
-            Some((start, end)) => {
-                span = Some((start, end));
-                let slice = &original[start..end];
-                let slice_peak = slice.iter().map(|s| s.abs()).fold(0.0_f32, f32::max);
-                if slice.is_empty() || slice_peak < 1e-8 {
-                    return Ok(original);
-                }
-                slice
-            }
-            None => return Ok(original),
-        }
-    } else {
-        &original
+    let work_audio: &[f32] = match span {
+        Some((start, end)) if opts.trim_silence => &original[start..end],
+        _ => &original,
     };
-
-    let min_samples = ((rate as f64 * opts.block_size) as usize).max(1);
-    let current_lufs = if work_audio.len() < min_samples {
-        let padded = pad_short_for_measurement(work_audio, min_samples);
-        measure_lufs_multichannel(&padded, rate, 1, opts.block_size)?
-    } else {
-        measure_lufs_multichannel(work_audio, rate, 1, opts.block_size)?
-    };
-
-    if !current_lufs.is_finite() {
-        return Ok(original);
-    }
-
-    let final_loudness =
-        current_lufs + (opts.target_loudness - current_lufs) * opts.strength / 100.0;
-    let mut gain_db = final_loudness - current_lufs;
-    if let Some(max_b) = opts.max_boost_db {
-        gain_db = gain_db.min(max_b);
-    }
-    let target_gain = 10.0_f64.powf(gain_db / 20.0);
 
     let normalized = apply_envelope_aware_gain(
         work_audio,

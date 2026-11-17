@@ -4,18 +4,26 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Lightweight UTAU resampler CLI client (hifisampler)"
+description = "Lightweight UTAU resampler and phrase wavtool CLI clients (hifisampler, melos, melos-wavtool)"
 
 [[bin]]
 name = "hifisampler"
 path = "src/main.rs"
+
+[[bin]]
+name = "melos"
+path = "src/bin/melos.rs"
+
+[[bin]]
+name = "melos-wavtool"
+path = "src/bin/melos_wavtool.rs"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Globalization", "Win32_System_Threading"] }
 
 [dev-dependencies]
 uuid.workspace = true

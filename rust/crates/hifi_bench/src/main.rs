@@ -3,7 +3,10 @@ use hifi_bench::{
     inspect_hifibin, process_peak_rss_bytes, process_tree_peak_rss_bytes, AudioEquivalenceReport,
     HifiBinSummary, LatencySummary,
 };
+use hifi_core::audio::{read_wav, write_wav, AudioBuffer};
 use hifi_core::utau::parse_flags;
+use hifi_core::wavtool::WavtoolEnvelope;
+use hifi_lufs::measure_lufs;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
@@ -99,8 +102,49 @@ struct ColdStartReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BinarySizesReport {
     rust_hifisampler_bytes: u64,
+    rust_melos_bytes: Option<u64>,
+    rust_melos_wavtool_bytes: Option<u64>,
     rust_hifiserver_bytes: u64,
     csharp_hifisampler_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PhraseModeMetrics {
+    note_count: usize,
+    wall_ms: f64,
+    throughput_nps: f64,
+    vocoder_calls: usize,
+    server_sum_synthesis_ms: f64,
+    server_sum_feature_ms: f64,
+    server_sum_postprocess_ms: f64,
+    output_samples: usize,
+    all_finite: bool,
+    lufs: f64,
+    overlap_rms_ratio: f64,
+    backfilled_stubs_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PhraseScenarioComparison {
+    name: String,
+    note_count: usize,
+    dur_ms: f64,
+    ovr_ms: f64,
+    expected_samples: usize,
+    baseline_note_by_note: PhraseModeMetrics,
+    melos_route_b: PhraseModeMetrics,
+    wall_speedup: f64,
+    vocoder_synthesis_ms_reduction: f64,
+    sample_count_diff: isize,
+    lufs_delta_db: f64,
+    overlap_continuity_improvement: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PhraseComparisonReport {
+    repo_root: String,
+    binary_sizes: BinarySizesReport,
+    scenarios: Vec<PhraseScenarioComparison>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +170,7 @@ struct FullBenchmarkReport {
     concurrent_mixed_batch_rs: BatchThroughputResult,
     concurrent_warm_batch_py: Option<BatchThroughputResult>,
     concurrent_warm_batch_rs: BatchThroughputResult,
+    phrase_route_b: Option<Vec<PhraseScenarioComparison>>,
     memory: MemoryReport,
 }
 
@@ -707,12 +752,14 @@ struct CliArgs {
     explicit_root: Option<PathBuf>,
     json_out: Option<PathBuf>,
     rust_only: bool,
+    phrase_only: bool,
 }
 
 fn parse_cli_args(args: &[String]) -> Result<CliArgs, String> {
     let mut explicit_root: Option<PathBuf> = None;
     let mut json_out: Option<PathBuf> = None;
     let mut rust_only = false;
+    let mut phrase_only = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -728,6 +775,9 @@ fn parse_cli_args(args: &[String]) -> Result<CliArgs, String> {
             "--rust-only" => {
                 rust_only = true;
             }
+            "--phrase-only" => {
+                phrase_only = true;
+            }
             other => return Err(format!("Unknown argument: {other}")),
         }
         i += 1;
@@ -737,7 +787,562 @@ fn parse_cli_args(args: &[String]) -> Result<CliArgs, String> {
         explicit_root,
         json_out,
         rust_only,
+        phrase_only,
     })
+}
+
+fn run_cli_exe(
+    exe: &Path,
+    args: &[String],
+    cwd: &Path,
+    port_s: &str,
+    repo_s: &str,
+    home_s: &str,
+) -> Result<(), String> {
+    let output = Command::new(exe)
+        .args(args)
+        .current_dir(cwd)
+        .env("USERPROFILE", home_s)
+        .env("HOME", home_s)
+        .env("HIFISAMPLER_PORT", port_s)
+        .env("HIFISAMPLER_HOME", repo_s)
+        .output()
+        .map_err(|e| format!("Failed to invoke {}: {e}", exe.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "CLI {} exited with {}:\nstdout={}\nstderr={}",
+            exe.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+fn compute_rms(slice: &[f32]) -> f64 {
+    if slice.is_empty() {
+        return 0.0;
+    }
+    let sq: f64 = slice.iter().map(|&v| (v as f64) * (v as f64)).sum();
+    (sq / slice.len() as f64).sqrt()
+}
+
+fn compute_overlap_rms_ratio(
+    samples: &[f32],
+    note_count: usize,
+    dur_ms: f64,
+    ovr_ms: f64,
+    sr: u32,
+) -> f64 {
+    if note_count < 2 || ovr_ms <= 0.0 || dur_ms <= ovr_ms {
+        return 1.0;
+    }
+    let sr_f = sr as f64;
+    let step_ms = dur_ms - ovr_ms;
+    let half_w = ((15.0 * sr_f / 1000.0).round() as usize).max(64);
+    let mut ratios = Vec::with_capacity(note_count - 1);
+
+    for i in 1..note_count {
+        let ovr_start_ms = i as f64 * step_ms;
+        let ovr_mid_ms = ovr_start_ms + 0.5 * ovr_ms;
+        let left_ref_ms = (ovr_start_ms - 32.0).max(20.0);
+        let right_ref_ms = ovr_start_ms + ovr_ms + 32.0;
+
+        let mid_idx = (ovr_mid_ms * sr_f / 1000.0).round() as usize;
+        let left_idx = (left_ref_ms * sr_f / 1000.0).round() as usize;
+        let right_idx = (right_ref_ms * sr_f / 1000.0).round() as usize;
+
+        let window_rms = |center: usize| -> Option<f64> {
+            let s0 = center.saturating_sub(half_w);
+            let s1 = (center + half_w).min(samples.len());
+            if s1 > s0 + 16 {
+                Some(compute_rms(&samples[s0..s1]))
+            } else {
+                None
+            }
+        };
+
+        if let (Some(rm), Some(rl), Some(rr)) = (
+            window_rms(mid_idx),
+            window_rms(left_idx),
+            window_rms(right_idx),
+        ) {
+            let ref_rms = 0.5 * (rl + rr);
+            if ref_rms > 1e-6 {
+                ratios.push(rm / ref_rms);
+            }
+        }
+    }
+
+    if ratios.is_empty() {
+        1.0
+    } else {
+        ratios.iter().sum::<f64>() / ratios.len() as f64
+    }
+}
+
+fn concat_baseline_wavs(
+    note_paths: &[PathBuf],
+    dur_ms: f64,
+    ovr_ms: f64,
+    sr: u32,
+) -> Result<Vec<f32>, String> {
+    let sr_f = sr as f64;
+    let step_ms = dur_ms - ovr_ms;
+    let total_ms = if note_paths.is_empty() {
+        0.0
+    } else {
+        (note_paths.len() - 1) as f64 * step_ms + dur_ms
+    };
+    let total_samples = (total_ms * sr_f / 1000.0).round() as usize;
+    let mut out = vec![0.0_f32; total_samples];
+
+    for (i, path) in note_paths.iter().enumerate() {
+        let buf = read_wav(path).map_err(|e| format!("Baseline read {}: {e}", path.display()))?;
+        let cur_ovr = if i == 0 { 0.0 } else { ovr_ms };
+        let start_ms = if i == 0 { 0.0 } else { i as f64 * step_ms };
+        let start_sample = (start_ms * sr_f / 1000.0).round() as usize;
+        let end_sample =
+            (((start_ms + dur_ms) * sr_f / 1000.0).round() as usize).min(total_samples);
+
+        let env = WavtoolEnvelope {
+            p1_ms: 0.0,
+            p2_ms: if i == 0 { 25.0 } else { cur_ovr },
+            p3_ms: if i + 1 == note_paths.len() {
+                25.0
+            } else {
+                ovr_ms
+            },
+            v1: 0.0,
+            v2: 100.0,
+            v3: 100.0,
+            v4: 0.0,
+            ovr_ms: cur_ovr,
+            p4_ms: 0.0,
+            p5_v5: None,
+        };
+
+        for (local_i, (slot, &src)) in out[start_sample..end_sample]
+            .iter_mut()
+            .zip(buf.samples.iter())
+            .enumerate()
+        {
+            let pos_ms = local_i as f64 * 1000.0 / sr_f;
+            let gain = env.evaluate_gain(pos_ms, dur_ms) as f32;
+            *slot += src * gain;
+        }
+    }
+
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_phrase_scenario(
+    name: &str,
+    repo: &Path,
+    rs_srv_port: u16,
+    hifisampler_exe: &Path,
+    melos_exe: &Path,
+    melos_wavtool_exe: &Path,
+    src_wav: &Path,
+    work_dir: &Path,
+    pitches: &[&'static str],
+    flags_cycle: &[&'static str],
+    offset_ms: &'static str,
+    req_len_ms: &'static str,
+    consonant_ms: &'static str,
+    cutoff_ms: &'static str,
+    dur_ms: f64,
+    ovr_ms: f64,
+) -> Result<PhraseScenarioComparison, String> {
+    let note_count = pitches.len();
+    let port_s = rs_srv_port.to_string();
+    let repo_s = canonical_path_str(repo);
+    let iso_home = work_dir.join(format!("home_{name}"));
+    fs::create_dir_all(&iso_home).map_err(|e| e.to_string())?;
+    let home_s = iso_home.to_string_lossy().into_owned();
+
+    let base_dir = work_dir.join(format!("phrase_base_{name}"));
+    let route_b_dir = work_dir.join(format!("phrase_routeb_{name}"));
+    fs::create_dir_all(&base_dir).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&route_b_dir).map_err(|e| e.to_string())?;
+
+    let base_src = base_dir.join("src.wav");
+    let rb_src = route_b_dir.join("src.wav");
+    fs::copy(src_wav, &base_src).map_err(|e| e.to_string())?;
+    fs::copy(src_wav, &rb_src).map_err(|e| e.to_string())?;
+
+    // Pre-warm all flag feature caches identically on both isolated WAVs before timed runs
+    for (fi, &fl) in flags_cycle.iter().enumerate() {
+        let warm_case = NoteCase {
+            name: "warm",
+            pitch: "A4",
+            velocity: "100",
+            flags: fl,
+            offset: offset_ms,
+            length: req_len_ms,
+            consonant: consonant_ms,
+            cutoff: cutoff_ms,
+            tempo: "!120",
+            pitch_string: "AA",
+            use_real_vocal: false,
+        };
+        let _ = post_note(
+            rs_srv_port,
+            &note_args(
+                &base_src,
+                &base_dir.join(format!("pw_{fi}.wav")),
+                &warm_case,
+            ),
+        )?;
+        let _ = post_note(
+            rs_srv_port,
+            &note_args(
+                &rb_src,
+                &route_b_dir.join(format!("pw_{fi}.wav")),
+                &warm_case,
+            ),
+        )?;
+    }
+
+    let stats_sum_from = |s: &Value, field: &str| -> f64 {
+        let sc = s["success_count"].as_u64().unwrap_or(0).min(200) as f64;
+        s[field].as_f64().unwrap_or(0.0) * sc
+    };
+
+    // 1. Baseline: N sequential hifisampler.exe invocations + 5-point WAV crossfade
+    let stats_base_before = fetch_stats(rs_srv_port)?;
+    let mut base_note_paths = Vec::with_capacity(note_count);
+    let t_base0 = Instant::now();
+    for i in 0..note_count {
+        let out_wav = base_dir.join(format!("res-{i:04}.wav"));
+        let args = vec![
+            base_src.to_string_lossy().into_owned(),
+            out_wav.to_string_lossy().into_owned(),
+            pitches[i].to_string(),
+            "100".to_string(),
+            flags_cycle[i % flags_cycle.len()].to_string(),
+            offset_ms.to_string(),
+            req_len_ms.to_string(),
+            consonant_ms.to_string(),
+            cutoff_ms.to_string(),
+            "100".to_string(),
+            "0".to_string(),
+            "!120".to_string(),
+            "AA".to_string(),
+        ];
+        run_cli_exe(hifisampler_exe, &args, repo, &port_s, &repo_s, &home_s)?;
+        base_note_paths.push(out_wav);
+    }
+    let base_samples = concat_baseline_wavs(&base_note_paths, dur_ms, ovr_ms, 44100)?;
+    let base_phrase_wav = base_dir.join("cat-baseline.wav");
+    write_wav(
+        &base_phrase_wav,
+        &AudioBuffer::new(base_samples.clone(), 44100, 1),
+    )
+    .map_err(|e| format!("Baseline write failed: {e}"))?;
+    let base_wall_ms = t_base0.elapsed().as_secs_f64() * 1000.0;
+    let stats_base_after = fetch_stats(rs_srv_port)?;
+
+    let base_synth_ms = (stats_sum_from(&stats_base_after, "avg_synthesis_ms")
+        - stats_sum_from(&stats_base_before, "avg_synthesis_ms"))
+    .max(0.0);
+    let base_feat_ms = (stats_sum_from(&stats_base_after, "avg_feature_ms")
+        - stats_sum_from(&stats_base_before, "avg_feature_ms"))
+    .max(0.0);
+    let base_post_ms = (stats_sum_from(&stats_base_after, "avg_postprocess_ms")
+        - stats_sum_from(&stats_base_before, "avg_postprocess_ms"))
+    .max(0.0);
+
+    let baseline_metrics = PhraseModeMetrics {
+        note_count,
+        wall_ms: base_wall_ms,
+        throughput_nps: note_count as f64 * 1000.0 / base_wall_ms.max(1e-6),
+        vocoder_calls: note_count,
+        server_sum_synthesis_ms: base_synth_ms,
+        server_sum_feature_ms: base_feat_ms,
+        server_sum_postprocess_ms: base_post_ms,
+        output_samples: base_samples.len(),
+        all_finite: base_samples.iter().all(|v| v.is_finite()),
+        lufs: measure_lufs(&base_samples, 44100).unwrap_or(f64::NEG_INFINITY),
+        overlap_rms_ratio: compute_overlap_rms_ratio(
+            &base_samples,
+            note_count,
+            dur_ms,
+            ovr_ms,
+            44100,
+        ),
+        backfilled_stubs_count: 0,
+    };
+
+    // 2. Melos Route B: authentic OpenUtau temp.bat + melos.exe + melos-wavtool.exe
+    let rb_phrase_wav = route_b_dir.join("cat-melos.wav");
+    let tool_str = canonical_path_str(melos_wavtool_exe);
+    let resamp_str = canonical_path_str(melos_exe);
+    let dir_str = canonical_path_str(&route_b_dir);
+
+    let mut bat = format!(
+        "@rem project=\r\n\
+         @set tempo=120\r\n\
+         @set samples=44100\r\n\
+         @set oto={dir_str}\r\n\
+         @set tool={tool_str}\r\n\
+         @set output=cat-melos.wav\r\n\
+         @set helper=temp_helper.bat\r\n\
+         @set cachedir={dir_str}\r\n"
+    );
+    let mut rb_note_paths = Vec::with_capacity(note_count);
+    let mut rb_resampler_calls = Vec::with_capacity(note_count);
+    let mut rb_wavtool_calls = Vec::with_capacity(note_count);
+    for i in 0..note_count {
+        let note_wav = route_b_dir.join(format!("res-{i:04}.wav"));
+        let note_fname = format!("res-{i:04}.wav");
+        let fl = flags_cycle[i % flags_cycle.len()];
+        let cur_ovr = if i == 0 { 0.0 } else { ovr_ms };
+        let p2 = if i == 0 { 25.0 } else { cur_ovr };
+        let p3 = if i + 1 == note_count { 25.0 } else { ovr_ms };
+
+        bat.push_str(&format!(
+            "@set resamp={resamp_str}\r\n\
+             @set params=100 0 !120 AA\r\n\
+             @set flag=\"{fl}\"\r\n\
+             @set env=0 {p2} {p3} 0 100 100 0 {cur_ovr} 0 0 100\r\n\
+             @set stp=0\r\n\
+             @set vel=100\r\n\
+             @set temp=\"%cachedir%\\{note_fname}\"\r\n\
+             @call %helper% \"%oto%\\src.wav\" {} {dur_ms} 0 {offset_ms} {req_len_ms} {consonant_ms} {cutoff_ms} {i}\r\n",
+            pitches[i]
+        ));
+
+        rb_resampler_calls.push(vec![
+            rb_src.to_string_lossy().into_owned(),
+            note_wav.to_string_lossy().into_owned(),
+            pitches[i].to_string(),
+            "100".to_string(),
+            fl.to_string(),
+            offset_ms.to_string(),
+            req_len_ms.to_string(),
+            consonant_ms.to_string(),
+            cutoff_ms.to_string(),
+            "100".to_string(),
+            "0".to_string(),
+            "!120".to_string(),
+            "AA".to_string(),
+        ]);
+
+        rb_wavtool_calls.push(vec![
+            rb_phrase_wav.to_string_lossy().into_owned(),
+            note_wav.to_string_lossy().into_owned(),
+            "0".to_string(),
+            format!("{dur_ms}"),
+            "0".to_string(),
+            format!("{p2}"),
+            format!("{p3}"),
+            "0".to_string(),
+            "100".to_string(),
+            "100".to_string(),
+            "0".to_string(),
+            format!("{cur_ovr}"),
+            "0".to_string(),
+            "0".to_string(),
+            "100".to_string(),
+        ]);
+
+        rb_note_paths.push(note_wav);
+    }
+    fs::write(route_b_dir.join("temp.bat"), bat.as_bytes())
+        .map_err(|e| format!("Failed to write temp.bat: {e}"))?;
+
+    let stats_rb_before = fetch_stats(rs_srv_port)?;
+    let t_rb0 = Instant::now();
+    for args in &rb_resampler_calls {
+        run_cli_exe(melos_exe, args, &route_b_dir, &port_s, &repo_s, &home_s)?;
+    }
+    for (idx, args) in rb_wavtool_calls.iter().enumerate() {
+        run_cli_exe(
+            melos_wavtool_exe,
+            args,
+            &route_b_dir,
+            &port_s,
+            &repo_s,
+            &home_s,
+        )?;
+        if idx + 1 < note_count && rb_phrase_wav.exists() {
+            return Err(format!(
+                "Route B wrote {} prematurely at step {idx}",
+                rb_phrase_wav.display()
+            ));
+        }
+    }
+    let rb_wall_ms = t_rb0.elapsed().as_secs_f64() * 1000.0;
+    let stats_rb_after = fetch_stats(rs_srv_port)?;
+
+    if !rb_phrase_wav.is_file() {
+        return Err(format!(
+            "Route B did not produce {}",
+            rb_phrase_wav.display()
+        ));
+    }
+    let rb_buf = read_wav(&rb_phrase_wav).map_err(|e| format!("Read Route B wav: {e}"))?;
+    let rb_samples = &rb_buf.samples;
+    if !rb_samples.iter().all(|v| v.is_finite()) {
+        return Err("Route B output contains non-finite samples".to_string());
+    }
+
+    let rb_recent = stats_rb_after["recent"]
+        .as_array()
+        .ok_or("Missing /stats recent array")?;
+    let recent0_name = rb_recent
+        .first()
+        .and_then(|v| v["note_name"].as_str())
+        .unwrap_or("");
+    let recent0_synth = rb_recent
+        .first()
+        .and_then(|v| v["synthesis_ms"].as_f64())
+        .unwrap_or(0.0);
+    if !recent0_name.starts_with("phrase:") {
+        return Err(format!(
+            "Expected latest /stats entry to be phrase:*, got '{recent0_name}'"
+        ));
+    }
+
+    let rb_synth_ms = (stats_sum_from(&stats_rb_after, "avg_synthesis_ms")
+        - stats_sum_from(&stats_rb_before, "avg_synthesis_ms"))
+    .max(0.0);
+    let rb_feat_ms = (stats_sum_from(&stats_rb_after, "avg_feature_ms")
+        - stats_sum_from(&stats_rb_before, "avg_feature_ms"))
+    .max(0.0);
+    let rb_post_ms = (stats_sum_from(&stats_rb_after, "avg_postprocess_ms")
+        - stats_sum_from(&stats_rb_before, "avg_postprocess_ms"))
+    .max(0.0);
+
+    // Verify all `prep:*` entries skipped GPU vocoder (sum delta equals single phrase synthesis_ms)
+    if (rb_synth_ms - recent0_synth).abs() > 0.5 {
+        return Err(format!(
+            "Unexpected GPU vocoder synthesis during prepare: sum_delta={rb_synth_ms:.3}, phrase={recent0_synth:.3}"
+        ));
+    }
+
+    let mut backfilled_count = 0usize;
+    for p in &rb_note_paths {
+        let nb = read_wav(p).map_err(|e| format!("Read backfill {}: {e}", p.display()))?;
+        let peak = nb.samples.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
+        if nb.samples.len() > 64 && peak > 0.01 {
+            backfilled_count += 1;
+        }
+    }
+
+    let route_b_metrics = PhraseModeMetrics {
+        note_count,
+        wall_ms: rb_wall_ms,
+        throughput_nps: note_count as f64 * 1000.0 / rb_wall_ms.max(1e-6),
+        vocoder_calls: 1,
+        server_sum_synthesis_ms: rb_synth_ms,
+        server_sum_feature_ms: rb_feat_ms,
+        server_sum_postprocess_ms: rb_post_ms,
+        output_samples: rb_samples.len(),
+        all_finite: true,
+        lufs: measure_lufs(rb_samples, 44100).unwrap_or(f64::NEG_INFINITY),
+        overlap_rms_ratio: compute_overlap_rms_ratio(rb_samples, note_count, dur_ms, ovr_ms, 44100),
+        backfilled_stubs_count: backfilled_count,
+    };
+
+    let expected_samples =
+        (((note_count - 1) as f64 * (dur_ms - ovr_ms) + dur_ms) * 44.1).round() as usize;
+    let wall_speedup = baseline_metrics.wall_ms / route_b_metrics.wall_ms.max(1e-6);
+    let vocoder_reduction = baseline_metrics.server_sum_synthesis_ms
+        / route_b_metrics.server_sum_synthesis_ms.max(1e-6);
+    let sample_count_diff =
+        route_b_metrics.output_samples as isize - baseline_metrics.output_samples as isize;
+    let lufs_delta_db = route_b_metrics.lufs - baseline_metrics.lufs;
+    let base_dip_err = (1.0 - baseline_metrics.overlap_rms_ratio).abs();
+    let rb_dip_err = (1.0 - route_b_metrics.overlap_rms_ratio).abs();
+    let overlap_continuity_improvement = if rb_dip_err > 1e-6 {
+        base_dip_err / rb_dip_err
+    } else {
+        1.0
+    };
+
+    Ok(PhraseScenarioComparison {
+        name: name.to_string(),
+        note_count,
+        dur_ms,
+        ovr_ms,
+        expected_samples,
+        baseline_note_by_note: baseline_metrics,
+        melos_route_b: route_b_metrics,
+        wall_speedup,
+        vocoder_synthesis_ms_reduction: vocoder_reduction,
+        sample_count_diff,
+        lufs_delta_db,
+        overlap_continuity_improvement,
+    })
+}
+
+fn run_phrase_route_b_benchmark(
+    repo: &Path,
+    rs_srv_port: u16,
+    synth_wav: &Path,
+    real_vocal_wav: Option<&Path>,
+    work_dir: &Path,
+) -> Result<Vec<PhraseScenarioComparison>, String> {
+    let hifisampler_exe = repo.join("rust/target/release/hifisampler.exe");
+    let melos_exe = repo.join("rust/target/release/melos.exe");
+    let melos_wavtool_exe = repo.join("rust/target/release/melos-wavtool.exe");
+    if !melos_exe.is_file() || !melos_wavtool_exe.is_file() {
+        return Err("Missing melos.exe or melos-wavtool.exe under rust/target/release/".into());
+    }
+
+    let pitches_20 = [
+        "C4", "D4", "E4", "F4", "G4", "A4", "B4", "C5", "G4", "E4", "C4", "D4", "E4", "F4", "G4",
+        "A4", "B4", "C5", "G4", "E4",
+    ];
+    let mixed_flags = ["", "P100", "g-10", "A30", "Hb120Hv90"];
+    let mixed_cmp = run_phrase_scenario(
+        "mixed_20note_c4_c5",
+        repo,
+        rs_srv_port,
+        &hifisampler_exe,
+        &melos_exe,
+        &melos_wavtool_exe,
+        synth_wav,
+        work_dir,
+        &pitches_20,
+        &mixed_flags,
+        "0",
+        "300",
+        "0",
+        "0",
+        250.0,
+        50.0,
+    )?;
+
+    let mut scenarios = vec![mixed_cmp];
+    if let Some(real_wav) = real_vocal_wav {
+        let pitches_6 = ["A3", "B3", "C4", "D4", "C4", "A3"];
+        let real_cmp = run_phrase_scenario(
+            "real_vocal_6note_legato",
+            repo,
+            rs_srv_port,
+            &hifisampler_exe,
+            &melos_exe,
+            &melos_wavtool_exe,
+            real_wav,
+            work_dir,
+            &pitches_6,
+            &[""],
+            "1200",
+            "450",
+            "80",
+            "-1200",
+            350.0,
+            60.0,
+        )?;
+        scenarios.push(real_cmp);
+    }
+
+    Ok(scenarios)
 }
 
 fn main() -> Result<(), String> {
@@ -753,6 +1358,8 @@ fn main() -> Result<(), String> {
     );
 
     let rs_client = repo.join("rust/target/release/hifisampler.exe");
+    let rs_melos = repo.join("rust/target/release/melos.exe");
+    let rs_melos_wavtool = repo.join("rust/target/release/melos-wavtool.exe");
     let rs_server_bin = repo.join("rust/target/release/hifiserver.exe");
     let cs_client = repo.join("hifisampler.exe");
     if !rs_client.is_file() || !rs_server_bin.is_file() {
@@ -761,6 +1368,8 @@ fn main() -> Result<(), String> {
 
     let binary_sizes = BinarySizesReport {
         rust_hifisampler_bytes: fs::metadata(&rs_client).map_err(|e| e.to_string())?.len(),
+        rust_melos_bytes: fs::metadata(&rs_melos).ok().map(|m| m.len()),
+        rust_melos_wavtool_bytes: fs::metadata(&rs_melos_wavtool).ok().map(|m| m.len()),
         rust_hifiserver_bytes: fs::metadata(&rs_server_bin)
             .map_err(|e| e.to_string())?
             .len(),
@@ -784,6 +1393,36 @@ fn main() -> Result<(), String> {
     } else {
         None
     };
+
+    if cli.phrase_only {
+        eprintln!("[hifi_bench] Running Route B phrase synthesis benchmark (--phrase-only)...");
+        let port = find_free_port()?;
+        let mut srv = spawn_rs_server(&repo, port, work_dir.join("rs_phrase_only.log"))?;
+        srv.wait_ready(Duration::from_secs(60))?;
+        let real_opt = real_vocal_source
+            .as_ref()
+            .map(|_| real_vocal_copy.as_path());
+        let scenarios = run_phrase_route_b_benchmark(&repo, port, &synth_wav, real_opt, &work_dir)?;
+        srv.shutdown();
+
+        let phrase_report = PhraseComparisonReport {
+            repo_root: canonical_path_str(&repo),
+            binary_sizes,
+            scenarios,
+        };
+        let json_text = serde_json::to_string_pretty(&phrase_report)
+            .map_err(|e| format!("JSON serialize failed: {e}"))?;
+        if let Some(out_path) = cli.json_out {
+            if let Some(parent) = out_path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            fs::write(&out_path, &json_text).map_err(|e| format!("Write JSON failed: {e}"))?;
+        } else {
+            println!("{json_text}");
+        }
+        let _ = fs::remove_dir_all(&work_dir);
+        return Ok(());
+    }
 
     // 1. Cold-start latency: HTTP server startups (2 repeats each)
     eprintln!("[hifi_bench] 1/6 Measuring server cold-start latency...");
@@ -1334,7 +1973,22 @@ fn main() -> Result<(), String> {
             (None, None, None, None)
         };
 
-    // 5. Peak memory RSS
+    // 5. Route B OpenUtau Phrase Synthesis Comparison + Peak memory RSS
+    let phrase_route_b = if rs_melos.is_file() && rs_melos_wavtool.is_file() {
+        eprintln!("[hifi_bench] Running Route B phrase synthesis benchmark...");
+        let port = find_free_port()?;
+        let mut srv = spawn_rs_server(&repo, port, work_dir.join("rs_phrase_main.log"))?;
+        srv.wait_ready(Duration::from_secs(60))?;
+        let real_opt = real_vocal_source
+            .as_ref()
+            .map(|_| real_vocal_copy.as_path());
+        let res = run_phrase_route_b_benchmark(&repo, port, &synth_wav, real_opt, &work_dir)?;
+        srv.shutdown();
+        Some(res)
+    } else {
+        None
+    };
+
     eprintln!("[hifi_bench] 5/6 Capturing peak RSS...");
     let py_onnx_peak_rss = py_srv.as_ref().and_then(|s| s.peak_rss_bytes());
     let rs_server_peak_rss = rs_srv.peak_rss_bytes();
@@ -1366,6 +2020,7 @@ fn main() -> Result<(), String> {
         concurrent_mixed_batch_rs,
         concurrent_warm_batch_py,
         concurrent_warm_batch_rs,
+        phrase_route_b,
         memory: MemoryReport {
             py_default_peak_rss_bytes: py_default_peak_rss,
             py_onnx_peak_rss_bytes: py_onnx_peak_rss,

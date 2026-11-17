@@ -7,6 +7,7 @@ license.workspace = true
 description = "Clean-room Mel, HN-SEP STFT/ISTFT, Akima pitch/time-axis, and Ht v3 LF tension DSP for hifisampler"
 
 [dependencies]
+hifi_core = { path = "../hifi_core" }
 ndarray.workspace = true
 thiserror.workspace = true
 num-complex = "0.4"

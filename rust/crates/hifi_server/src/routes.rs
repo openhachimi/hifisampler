@@ -1,10 +1,11 @@
 use crate::args::split_arguments;
+use crate::phrase_mgr::{PhraseBatchRequest, WavtoolStepRequest};
 use crate::resampler::{ResampleEngine, ResampleError};
 use crate::stats::StatsCollector;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::json;
 use std::path::Path;
@@ -96,6 +97,9 @@ pub fn has_browser_origin_headers(headers: &HeaderMap) -> bool {
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(handle_get_root).post(handle_post_root))
+        .route("/phrase/prepare", post(handle_post_phrase_prepare))
+        .route("/phrase/wavtool", post(handle_post_phrase_wavtool))
+        .route("/phrase/render", post(handle_post_phrase_render))
         .route("/health", get(handle_health))
         .route("/stats", get(handle_stats))
         .with_state(state)
@@ -135,61 +139,51 @@ async fn handle_stats(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
     (StatusCode::OK, Json(snap)).into_response()
 }
 
-async fn handle_post_root(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: String,
-) -> Response {
-    state.touch_activity();
-
-    if has_browser_origin_headers(&headers) {
+fn check_post_preconditions(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+) -> Result<Arc<dyn ResampleEngine>, Box<Response>> {
+    if has_browser_origin_headers(headers) {
         tracing::warn!("Rejected browser cross-origin POST request.");
-        return (
-            StatusCode::FORBIDDEN,
-            "Forbidden: Browser requests are not allowed.",
-        )
-            .into_response();
+        return Err(Box::new(
+            (
+                StatusCode::FORBIDDEN,
+                "Forbidden: Browser requests are not allowed.",
+            )
+                .into_response(),
+        ));
     }
 
     if !state.ready.load(Ordering::Acquire) {
         tracing::warn!("POST arrived but server not ready.");
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Server initializing, please retry.",
-        )
-            .into_response();
+        return Err(Box::new(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Server initializing, please retry.",
+            )
+                .into_response(),
+        ));
     }
 
-    let sliced = match split_arguments(&body) {
-        Ok(args) => args,
-        Err(err) => {
-            let msg = format!("Bad request arguments: {err}");
-            tracing::warn!("{msg}");
-            return (StatusCode::BAD_REQUEST, msg).into_response();
-        }
+    let Some(engine) = state.engine.get().cloned() else {
+        return Err(Box::new(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Server initializing, please retry.",
+            )
+                .into_response(),
+        ));
     };
 
+    Ok(engine)
+}
+
+async fn run_blocking_engine_task<F>(state: Arc<AppState>, note: String, op: F) -> Response
+where
+    F: FnOnce(&Arc<StatsCollector>) -> Result<(), ResampleError> + Send + 'static,
+{
     let _job_guard = ActiveJobGuard::enter(&state);
     let req_t0 = Instant::now();
-
-    let in_stem = Path::new(&sliced[0])
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(&sliced[0]);
-    let out_name = Path::new(&sliced[1])
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(&sliced[1]);
-    let note = format!("'{in_stem}' -> '{out_name}'");
-    tracing::info!("Queued {note} ...");
-
-    let Some(engine) = state.engine.get().cloned() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Server initializing, please retry.",
-        )
-            .into_response();
-    };
 
     let sem = state
         .worker_semaphore
@@ -204,10 +198,9 @@ async fn handle_post_root(
     };
 
     let stats = state.stats.clone();
-    let args_clone = sliced.clone();
     let res = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        engine.resample(&args_clone, &stats)
+        op(&stats)
     })
     .await;
 
@@ -219,6 +212,12 @@ async fn handle_post_root(
             tracing::error!("{err}");
             state.stats.record_error(&note, &err, elapsed_ms);
             (StatusCode::NOT_FOUND, err).into_response()
+        }
+        Ok(Err(ResampleError::BadInput(detail))) => {
+            let err = format!("Bad request arguments: {detail}");
+            tracing::warn!("{err}");
+            state.stats.record_error(&note, &err, elapsed_ms);
+            (StatusCode::BAD_REQUEST, err).into_response()
         }
         Ok(Err(other)) => {
             let err = format!("Error processing note: ResampleError: {other}");
@@ -233,6 +232,129 @@ async fn handle_post_root(
             (StatusCode::INTERNAL_SERVER_ERROR, err).into_response()
         }
     }
+}
+
+fn format_note_label(in_raw: &str, out_raw: &str) -> String {
+    let in_stem = Path::new(in_raw)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(in_raw);
+    let out_name = Path::new(out_raw)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(out_raw);
+    format!("'{in_stem}' -> '{out_name}'")
+}
+
+async fn handle_post_root(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    state.touch_activity();
+
+    let engine = match check_post_preconditions(&state, &headers) {
+        Ok(e) => e,
+        Err(resp) => return *resp,
+    };
+
+    let sliced = match split_arguments(&body) {
+        Ok(args) => args,
+        Err(err) => {
+            let msg = format!("Bad request arguments: {err}");
+            tracing::warn!("{msg}");
+            return (StatusCode::BAD_REQUEST, msg).into_response();
+        }
+    };
+
+    let note = format_note_label(&sliced[0], &sliced[1]);
+    tracing::info!("Queued {note} ...");
+    run_blocking_engine_task(state, note, move |stats| engine.resample(&sliced, stats)).await
+}
+
+async fn handle_post_phrase_prepare(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    state.touch_activity();
+
+    let engine = match check_post_preconditions(&state, &headers) {
+        Ok(e) => e,
+        Err(resp) => return *resp,
+    };
+
+    let sliced = match split_arguments(&body) {
+        Ok(args) => args,
+        Err(err) => {
+            let msg = format!("Bad request arguments: {err}");
+            tracing::warn!("{msg}");
+            return (StatusCode::BAD_REQUEST, msg).into_response();
+        }
+    };
+
+    let note = format_note_label(&sliced[0], &sliced[1]);
+    tracing::info!("Queued phrase prepare {note} ...");
+    run_blocking_engine_task(state, note, move |stats| {
+        engine.prepare_phrase_note(&sliced, stats)
+    })
+    .await
+}
+
+async fn handle_post_phrase_wavtool(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    state.touch_activity();
+
+    let engine = match check_post_preconditions(&state, &headers) {
+        Ok(e) => e,
+        Err(resp) => return *resp,
+    };
+
+    let req: WavtoolStepRequest = match serde_json::from_str(&body) {
+        Ok(r) => r,
+        Err(err) => {
+            let msg = format!("Bad wavtool JSON payload: {err}");
+            tracing::warn!("{msg}");
+            return (StatusCode::BAD_REQUEST, msg).into_response();
+        }
+    };
+
+    let note = format_note_label(&req.input_file, &req.output_file);
+    run_blocking_engine_task(state, note, move |stats| {
+        engine.process_wavtool_step(req, stats)
+    })
+    .await
+}
+
+async fn handle_post_phrase_render(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    state.touch_activity();
+
+    let engine = match check_post_preconditions(&state, &headers) {
+        Ok(e) => e,
+        Err(resp) => return *resp,
+    };
+
+    let req: PhraseBatchRequest = match serde_json::from_str(&body) {
+        Ok(r) => r,
+        Err(err) => {
+            let msg = format!("Bad phrase render JSON payload: {err}");
+            tracing::warn!("{msg}");
+            return (StatusCode::BAD_REQUEST, msg).into_response();
+        }
+    };
+
+    let note = format!("batch -> '{}'", req.output_file);
+    run_blocking_engine_task(state, note, move |stats| {
+        engine.render_phrase_batch(req, stats)
+    })
+    .await
 }
 
 /// Background idle watchdog task triggering graceful shutdown after `idle_timeout_secs`.

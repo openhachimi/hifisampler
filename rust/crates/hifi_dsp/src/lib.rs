@@ -5,6 +5,7 @@ use thiserror::Error;
 
 pub mod hnsep_stft;
 pub mod mel;
+pub mod phrase;
 pub mod pitch;
 pub mod tension;
 
@@ -17,6 +18,10 @@ pub use mel::{
     dynamic_range_compression, dynamic_range_compression_default,
     dynamic_range_compression_inplace, slaney_mel_filterbank, MelConfig, MelSpectrogram,
     DEFAULT_DRC_CLIP_VAL,
+};
+pub use phrase::{
+    build_spliced_phrase_mel_and_f0, layout_phrase_timeline, mel_note_unscaled_gain, PhraseLayout,
+    PhraseNoteMelSlice, PhraseSpan, PhraseTimelineItem, SplicedPhraseExcitation, PHRASE_PAD_FRAMES,
 };
 pub use pitch::{
     midi_to_hz, resample_mel_and_pitch, Akima1DInterpolator, ResampleTimeParams, ResampledFeatures,

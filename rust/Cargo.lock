@@ -350,6 +350,7 @@ name = "hifi_dsp"
 version = "0.1.0"
 dependencies = [
  "approx",
+ "hifi_core",
  "ndarray",
  "num-complex",
  "realfft",
@@ -392,6 +393,7 @@ dependencies = [
 name = "hifi_server"
 version = "0.1.0"
 dependencies = [
+ "approx",
  "axum",
  "hifi_client",
  "hifi_core",
@@ -403,6 +405,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "tempfile",
  "tokio",
  "tower 0.4.13",
  "tracing",

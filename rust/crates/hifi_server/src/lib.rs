@@ -6,6 +6,7 @@ pub mod cache_locks;
 pub mod cli;
 pub mod config;
 pub mod lock;
+pub mod phrase_mgr;
 pub mod pipeline;
 pub mod resampler;
 pub mod routes;

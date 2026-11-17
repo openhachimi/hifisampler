@@ -9,10 +9,10 @@ use thiserror::Error;
 
 pub use biquad::{apply_sos_filter, k_weighting_sos, K_WEIGHT_SOS_44100};
 pub use loudness::{
-    apply_envelope_aware_gain, apply_peak_limit, loudness_norm, loudness_norm_fast, measure_lufs,
-    measure_lufs_multichannel, measure_lufs_with_block_size, peak_normalize, EnvelopeGainOptions,
-    LoudnessNormOptions, TailMode, ABS_GATE_LUFS, DEFAULT_BLOCK_SIZE_SEC,
-    DEFAULT_SILENCE_THRESHOLD_DB, REL_GATE_LU,
+    apply_envelope_aware_gain, apply_peak_limit, compute_lufs_target_gain, loudness_norm,
+    loudness_norm_fast, measure_lufs, measure_lufs_multichannel, measure_lufs_with_block_size,
+    peak_normalize, EnvelopeGainOptions, LoudnessNormOptions, TailMode, ABS_GATE_LUFS,
+    DEFAULT_BLOCK_SIZE_SEC, DEFAULT_SILENCE_THRESHOLD_DB, REL_GATE_LU,
 };
 pub use resample::resample_poly_fast;
 

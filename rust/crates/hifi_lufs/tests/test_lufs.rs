@@ -1,7 +1,7 @@
 use approx::assert_relative_eq;
 use hifi_lufs::{
-    apply_envelope_aware_gain, apply_peak_limit, k_weighting_sos, loudness_norm,
-    loudness_norm_fast, measure_lufs, measure_lufs_multichannel, peak_normalize,
+    apply_envelope_aware_gain, apply_peak_limit, compute_lufs_target_gain, k_weighting_sos,
+    loudness_norm, loudness_norm_fast, measure_lufs, measure_lufs_multichannel, peak_normalize,
     resample_poly_fast, EnvelopeGainOptions, LoudnessNormOptions, LufsError, TailMode,
     K_WEIGHT_SOS_44100,
 };
@@ -523,4 +523,50 @@ fn test_peak_normalize_and_peak_limit_helpers() {
     apply_peak_limit(&mut hot, 0.99);
     let limited_peak = hot.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
     assert_relative_eq!(limited_peak, 0.99, epsilon = 1e-6);
+}
+
+#[test]
+fn test_compute_lufs_target_gain_matches_norm_and_respects_strength() {
+    let sr = 44100u32;
+    let tone = make_sine(440.0, sr, 0.8, 0.08);
+    let tone_lufs = measure_lufs(&tone, sr).unwrap();
+
+    // P100 targeting -16.0 LUFS
+    let opts_full = LoudnessNormOptions {
+        target_loudness: -16.0,
+        strength: 100.0,
+        trim_silence: true,
+        silence_threshold: -52.0,
+        ..LoudnessNormOptions::default()
+    };
+    let gain_full = compute_lufs_target_gain(&tone, sr, opts_full).unwrap();
+    let expected_db = (-16.0 - tone_lufs).min(18.0);
+    let expected_gain = 10.0_f64.powf(expected_db / 20.0);
+    assert_relative_eq!(gain_full, expected_gain, epsilon = 1e-4);
+
+    // P50 halves the dB shift
+    let opts_half = LoudnessNormOptions {
+        strength: 50.0,
+        ..opts_full
+    };
+    let gain_half = compute_lufs_target_gain(&tone, sr, opts_half).unwrap();
+    let expected_half_gain = 10.0_f64.powf((0.5 * (-16.0 - tone_lufs)).min(18.0) / 20.0);
+    assert_relative_eq!(gain_half, expected_half_gain, epsilon = 1e-4);
+
+    // P0 and silent buffers yield unity 1.0
+    let opts_zero = LoudnessNormOptions {
+        strength: 0.0,
+        ..opts_full
+    };
+    assert_relative_eq!(
+        compute_lufs_target_gain(&tone, sr, opts_zero).unwrap(),
+        1.0,
+        epsilon = 1e-12
+    );
+    let silent = vec![0.0_f32; 4410];
+    assert_relative_eq!(
+        compute_lufs_target_gain(&silent, sr, opts_full).unwrap(),
+        1.0,
+        epsilon = 1e-12
+    );
 }

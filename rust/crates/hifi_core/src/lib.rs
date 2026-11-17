@@ -4,6 +4,7 @@
 pub mod audio;
 pub mod cache;
 pub mod utau;
+pub mod wavtool;
 
 pub use audio::{
     is_null_device, read_wav, read_wav_raw, read_wav_with_target_rate, resolve_audio_path,
@@ -19,4 +20,7 @@ pub use utau::{
     find_flags, midi_slice_to_hz, midi_to_hz, note_to_midi, parse_flags, parse_flags_map,
     parse_tempo, pitch_string_to_cents, to_int12, to_int12_stream, to_uint6, UtauError, UtauFlags,
     ALL_FLAGS, MAX_PITCH_RLE_COUNT,
+};
+pub use wavtool::{
+    parse_wavtool_cli_args, parse_wavtool_duration_ms, WavtoolCliArgs, WavtoolEnvelope,
 };

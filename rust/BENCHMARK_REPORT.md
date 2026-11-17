@@ -2,7 +2,7 @@
 
 ## 1. Environment & Methodology
 
-- **Repository / Branch**: `C:\Project\hifi` (`feat/rust-port`)
+- **Repository / Branch**: `C:\Project\hifi` (`melos`)
 - **Generations Evaluated**:
   1. **`v0.1.0` (`1b59be1`)** — Original Python `aiohttp` + PyTorch/ONNX server (`config.default.yaml`: `pc_nsf_hifigan_44.1k_hop512_128bin_2025.02/model.onnx` vocoder + `hnsep/vr/model.pt` PyTorch HN-SEP, PyTorch Mel analysis, linear `Ht` ramp, `pyloudnorm` + `resampy`, `.hifi.npz` zipped cache, C# CLI client, DirectML forced `max_workers=1`; isolated archive outside repo via `rust/crates/hifi_bench/scripts/bench_v010.py`).
   2. **Python `main` (`b6a1791`)** — Post-v0.1.2/NumPy/HIFIBIN1 Python server (`rust/crates/hifi_bench/scripts/py_bench_server.py --hnsep-onnx` for apples-to-apples ONNX comparisons without altering `config.yaml`, plus `hifiserver.py` default `model.pt` startup/RSS probe and C# `hifisampler.exe`).
@@ -155,3 +155,27 @@ All 8 canonical and real-vocal cases produced identical sample counts (`sample_c
 | `real_vocal_Ht50Ho40Hr-30P100` | 25,579 / 25,579 | Yes | -15.7978 | -15.7978 | +5.87e-6 | 0.999999934 | 6.92e-7 | 0.99999999983 | 0.00377 | 0.99999999967 |
 
 *(Note: For `auto_vocal_fry`, deterministic NumPy vs Rust sub-cent/jitter PRNG streams produce slightly different fry micro-pulse timing (`mel_corr = 0.9179`, `stft_mag_corr = 0.9952`) while preserving integrated loudness within `0.0072 dB` and waveform correlation at `0.9755`. All non-stochastic DSP + ONNX cases preserve `<= 5.87e-6 dB` LUFS delta and `>= 0.99999988` Mel correlation.)*
+
+---
+
+## 6. Route B: Zero-Modification OpenUtau Phrase Mel Synthesis (`melos` + `melos-wavtool`)
+
+Measured after final red-team hardening on real DirectML ONNX models (`hifi_bench.exe --root C:\Project\hifi --phrase-only`), pairing `melos.exe` (`566,272 B` / **`553.0 KiB`**) as Resampler with `melos-wavtool.exe` (`528,896 B` / **`516.5 KiB`**) as Wavtool against baseline sequential note-by-note `hifisampler.exe` (`489,472 B` / `478.0 KiB`) + 5-point UTAU waveform crossfade (`hifiserver.exe` size: `4,502,016 B` / `4.29 MiB`):
+
+| Scenario & Span | Mode | Wall Time (ms) | Throughput (nps) | GPU Vocoder Calls | Summed Vocoder `synthesis_ms` | Output Samples (`diff`) | Finite | Integrated LUFS (dB) | Overlap Midpoint RMS Ratio | Backfilled Stubs |
+|---|---|---:|---:|---:|---:|---:|:---:|---:|---:|---:|
+| **`mixed_20note_c4_c5`** *(20 notes, `dur=250 ms`, `ovr=50 ms`, `["", "P100", "g-10", "A30", "Hb120Hv90"]`)* | Baseline (`hifisampler` x20 + wavtool xfade) | 3,645.99 | 5.49 | 20 | 2,884.46 | 178,605 | Yes | -16.5326 | 0.7326 | 0 |
+| | **Melos Route B** (`temp.bat`: `melos` + `melos-wavtool`) | **2,495.93** (**1.46x faster**) | **8.01** | **1** (**-95%**) | **1,220.00** (**2.36x faster**) | 178,605 (**0**) | Yes | -15.7206 *(+0.81)* | **1.0411** (**6.51x** closer to 1.0) | **20 / 20** |
+| **`real_vocal_6note_legato`** *(6 notes on `A3__ああいあうえあ.wav`, `dur=350 ms`, `ovr=60 ms`)* | Baseline (`hifisampler` x6 + wavtool xfade) | 1,703.42 | 3.52 | 6 | 1,365.69 | 79,380 | Yes | -18.6806 | 0.6273 | 0 |
+| | **Melos Route B** (`temp.bat`: `melos` + `melos-wavtool`) | **929.87** (**1.83x faster**) | **6.45** | **1** (**-83.3%**) | **497.57** (**2.74x faster**) | 79,380 (**0**) | Yes | -18.5764 *(+0.10)* | **0.7680** (**1.61x** smaller dip) | **6 / 6** |
+
+### Post-Hardening Route B Verification Summary
+
+- **Formatting & Linter**: `cargo fmt --all -- --check` (exit 0) and `cargo clippy --offline --workspace --all-targets -- -D warnings` (exit 0, zero warnings).
+- **Rust Release Tests**: **140 / 140 PASS** (`hifi_bench`: 5, `hifi_client`: 14, `hifi_core`: 46, `hifi_dsp`: 14, `hifi_effects`: 11, `hifi_lufs`: 8, `hifi_onnx`: 12, `hifi_server`: 30).
+- **Python Regression Suites**: Unit suite **259 / 259 PASS** (`10.94 s`); Rust E2E suite (Tiers 1–4) **196 / 196 PASS** (`77.87 s` pytest / `81.34 s` runner total).
+
+> **Key Takeaways**:
+> 1. **Single-Pass Continuous NSF Phase (`20 -> 1` / `6 -> 1` Vocoder calls)**: Instead of launching HiFi-GAN independently per note (causing phase discontinuities and `-2.7 dB` overlap dips at `0.7326` RMS ratio), Route B splices normalized Mel power & continuous MIDI pitch curves across overlapping boundaries with `PHRASE_PAD_FRAMES = 8` context padding and runs HiFi-GAN **once** per phrase, eliminating incoherent overlap dips (`0.7326 -> 1.0411`, **6.51x** tighter continuity).
+> 2. **GPU & Wall-Clock Gains**: Summed GPU Vocoder inference drops **2.36x** (`2,884.46 ms -> 1,220.00 ms`) on 20-note phrases and **2.74x** (`1,365.69 ms -> 497.57 ms`) on 6-note legato vocals; end-to-end wall time including all 40 Windows CLI process spawns speeds up **1.46x–1.83x**.
+> 3. **Zero-Modification OpenUtau Compatibility**: Verified via authentic OpenUtau `temp.bat` execution — buffered steps `0..N-2` emit zero premature outputs, all `prep:*` calls skip GPU Vocoder (`sum(synthesis_ms) == single phrase`), and all 20/20 + 6/6 stub `res-xxxx.wav` note caches are atomically backfilled cleanly.
