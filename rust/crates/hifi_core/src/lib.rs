@@ -10,9 +10,10 @@ pub use audio::{
     write_wav, AudioBuffer, AudioError, DEFAULT_SAMPLE_RATE,
 };
 pub use cache::{
-    load_cache, resolve_feature_cache_paths, save_cache, stat_sig, CacheError, CacheManager,
-    CachedFeatures, HifiBinHeader, StatSig, HEADER_SIZE, HIFIBIN_MAGIC, HIFIBIN_VERSION,
-    MAX_FEATURES_RAM_ITEMS, MAX_WAV_RAM_ITEMS,
+    cleanup_orphan_tmp_files, cleanup_stale_tmp_files, load_cache, load_cache_with_options,
+    rename_with_retry, resolve_feature_cache_paths, save_cache, save_cache_with_options, stat_sig,
+    CacheError, CacheManager, CachedFeatures, HifiBinHeader, StatSig, HEADER_SIZE, HIFIBIN_MAGIC,
+    HIFIBIN_VERSION, MAX_FEATURES_RAM_ITEMS, MAX_WAV_RAM_ITEMS,
 };
 pub use utau::{
     find_flags, midi_slice_to_hz, midi_to_hz, note_to_midi, parse_flags, parse_flags_map,

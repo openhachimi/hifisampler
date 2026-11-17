@@ -7,6 +7,7 @@ license.workspace = true
 description = "Clean-room vocal DSP effects (vocal fry, growl, A-flag modulation) for hifisampler"
 
 [dependencies]
+hifi_dsp = { path = "../hifi_dsp" }
 ndarray.workspace = true
 
 [dev-dependencies]

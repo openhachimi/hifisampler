@@ -99,13 +99,10 @@ static HANNING_KERNEL_CACHE: LazyLock<Mutex<HashMap<usize, Vec<f64>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Converts MIDI note number to frequency in Hz (`A4 = 440 Hz`).
-#[inline]
-pub fn midi_to_hz(midi: f64) -> f64 {
-    440.0 * ((midi - 69.0) / 12.0).exp2()
-}
+pub use hifi_dsp::midi_to_hz;
 
 /// Computes a Slaney-normalized Mel filterbank matrix of shape `[n_mels, n_fft / 2 + 1]`
-/// identical to `util/utils.py::slaney_mel_filterbank`.
+/// identical to `util/utils.py::slaney_mel_filterbank`, delegating to [`hifi_dsp::slaney_mel_filterbank`].
 pub fn slaney_mel_filterbank(
     sr: u32,
     n_fft: usize,
@@ -113,62 +110,10 @@ pub fn slaney_mel_filterbank(
     fmin: f64,
     fmax: f64,
 ) -> Array2<f32> {
-    let n_bins = n_fft / 2 + 1;
     if n_mels == 0 || n_fft < 2 || sr == 0 {
-        return Array2::zeros((n_mels, n_bins));
+        return Array2::zeros((n_mels, n_fft / 2 + 1));
     }
-
-    let f_sp = 200.0 / 3.0;
-    let min_log_hz = 1000.0;
-    let min_log_mel = min_log_hz / f_sp;
-    let logstep = 6.4_f64.ln() / 27.0;
-
-    let min_mel = if fmin >= min_log_hz {
-        min_log_mel + (fmin / min_log_hz).ln() / logstep
-    } else {
-        fmin / f_sp
-    };
-    let max_mel = if fmax >= min_log_hz {
-        min_log_mel + (fmax / min_log_hz).ln() / logstep
-    } else {
-        fmax / f_sp
-    };
-
-    let n_points = n_mels + 2;
-    let mut mel_f = Vec::with_capacity(n_points);
-    for k in 0..n_points {
-        let m = min_mel + (max_mel - min_mel) * (k as f64) / ((n_points - 1) as f64);
-        let f = if m >= min_log_mel {
-            min_log_hz * (logstep * (m - min_log_mel)).exp()
-        } else {
-            f_sp * m
-        };
-        mel_f.push(f);
-    }
-
-    let df = sr as f64 / n_fft as f64;
-    let mut fftfreqs = Vec::with_capacity(n_bins);
-    for j in 0..n_bins {
-        fftfreqs.push((j as f64) * df);
-    }
-
-    let mut weights = Array2::<f32>::zeros((n_mels, n_bins));
-    for i in 0..n_mels {
-        let f_lo = mel_f[i];
-        let f_mid = mel_f[i + 1];
-        let f_hi = mel_f[i + 2];
-        let diff_lo = f_mid - f_lo;
-        let diff_hi = f_hi - f_mid;
-        let enorm = 2.0 / (f_hi - f_lo);
-        for j in 0..n_bins {
-            let f = fftfreqs[j];
-            let lower = (f - f_lo) / diff_lo;
-            let upper = (f_hi - f) / diff_hi;
-            let w = lower.min(upper).max(0.0) as f32;
-            weights[[i, j]] = ((w as f64) * enorm) as f32;
-        }
-    }
-    weights
+    hifi_dsp::slaney_mel_filterbank(sr as f64, n_fft, n_mels, fmin, Some(fmax))
 }
 
 fn get_hanning_kernel(win: usize) -> Vec<f64> {
@@ -809,9 +754,15 @@ pub(crate) fn prepare_vocal_fry_deterministic(
             for k in 0..pb.len() {
                 t_pitch.push(dt_pitch * (k as f64) + input.new_start);
             }
-            let akima = Akima1DInterpolator::new(&t_pitch, &pitch_full);
-            let p_eval = akima.eval_clamped(input.t_mel);
-            p_eval.into_iter().map(midi_to_hz).collect()
+            if let Ok(akima) = Akima1DInterpolator::new(&t_pitch, &pitch_full) {
+                akima
+                    .evaluate_clamped(input.t_mel)
+                    .into_iter()
+                    .map(midi_to_hz)
+                    .collect()
+            } else {
+                input.f0_render.iter().map(|&f| f as f64).collect()
+            }
         }
     } else {
         input.f0_render.iter().map(|&f| f as f64).collect()
@@ -1027,6 +978,53 @@ fn unwrap_phase(angles: &[f64]) -> Vec<f64> {
     out
 }
 
+/// O(N) monotonic two-pointer cursor interpolating block phase `phi_blk` at sample indices
+/// `0..n_samples` and applying the slew-limited epoch offset (`|dphi| <= 0.18 * dphase`).
+fn align_epoch_phase_monotonic(
+    blk_t: &[f64],
+    phi_blk: &[f64],
+    dphase: &[f64],
+    phase: &[f64],
+) -> Vec<f64> {
+    let n_blk = blk_t.len();
+    let n_samples = phase.len();
+    let mut aligned = Vec::with_capacity(n_samples);
+    if n_blk == 0 || n_samples == 0 {
+        return aligned;
+    }
+
+    let mut prev_phi_raw = phi_blk[0];
+    let mut running_phi_peak = prev_phi_raw;
+    let mut seg = 0_usize;
+    let last_seg = n_blk.saturating_sub(2);
+    for i in 0..n_samples {
+        let x = i as f64;
+        let phi_raw = if n_blk <= 1 || x <= blk_t[0] {
+            phi_blk[0]
+        } else if x >= blk_t[n_blk - 1] {
+            phi_blk[n_blk - 1]
+        } else {
+            while seg < last_seg && x >= blk_t[seg + 1] {
+                seg += 1;
+            }
+            let span = blk_t[seg + 1] - blk_t[seg];
+            if span <= 0.0 {
+                phi_blk[seg]
+            } else {
+                let frac = (x - blk_t[seg]) / span;
+                phi_blk[seg] + frac * (phi_blk[seg + 1] - phi_blk[seg])
+            }
+        };
+        let dphi_raw = phi_raw - prev_phi_raw;
+        prev_phi_raw = phi_raw;
+        let max_d = 0.18 * dphase[i];
+        let dphi = dphi_raw.clamp(-max_d, max_d);
+        running_phi_peak += dphi;
+        aligned.push(phase[i] - running_phi_peak + 0.050);
+    }
+    aligned
+}
+
 pub(crate) fn apply_lf_vocal_fry_impl(
     render: &[f32],
     fry_ctx: Option<&FryExcitationResult>,
@@ -1125,8 +1123,7 @@ pub(crate) fn apply_lf_vocal_fry_impl(
     }
 
     let z_glob_abs = z_glob_re.hypot(z_glob_im);
-    let mut aligned = Vec::with_capacity(n_samples);
-    if z_glob_abs > 1e-16 {
+    let aligned = if z_glob_abs > 1e-16 {
         let z_fb_re = z_glob_re / z_glob_abs;
         let z_fb_im = z_glob_im / z_glob_abs;
         let win_l = ((n_blk / 2) * 2 + 1).clamp(3, 11);
@@ -1157,22 +1154,10 @@ pub(crate) fn apply_lf_vocal_fry_impl(
             .map(|a| a / (2.0 * PI))
             .collect();
 
-        let mut prev_phi_raw = interp_1d_clamped(&blk_t, &phi_blk, 0.0);
-        let mut running_phi_peak = prev_phi_raw;
-        for i in 0..n_samples {
-            let phi_raw = interp_1d_clamped(&blk_t, &phi_blk, i as f64);
-            let dphi_raw = phi_raw - prev_phi_raw;
-            prev_phi_raw = phi_raw;
-            let max_d = 0.18 * dphase[i];
-            let dphi = dphi_raw.clamp(-max_d, max_d);
-            running_phi_peak += dphi;
-            aligned.push(phase[i] - running_phi_peak + 0.050);
-        }
+        align_epoch_phase_monotonic(&blk_t, &phi_blk, &dphase, &phase)
     } else {
-        for &ph in &phase {
-            aligned.push(ph + 0.050);
-        }
-    }
+        phase.iter().map(|&ph| ph + 0.050).collect()
+    };
 
     // Stochastic + dichrotic per-bubble amplitude shimmer
     let min_al = aligned.iter().copied().fold(f64::INFINITY, f64::min);
@@ -1390,5 +1375,47 @@ mod tests {
         assert_eq!(res.seed, 2106217256);
         let min_f0 = res.f0_mod.iter().copied().fold(f32::INFINITY, f32::min);
         assert!((27.0..=36.0).contains(&min_f0), "min_f0={min_f0}");
+    }
+
+    #[test]
+    fn test_align_epoch_phase_monotonic_matches_binary_search() {
+        for &n_samples in &[500_usize, 1536, 8193] {
+            let step = 1024_usize;
+            let n_blk = n_samples.div_ceil(step).max(1);
+            let blk_t: Vec<f64> = (0..n_blk)
+                .map(|b| (b as f64 + 0.5) * (step as f64))
+                .collect();
+            let phi_blk: Vec<f64> = (0..n_blk)
+                .map(|b| 0.15 * ((b as f64) * 0.7).sin())
+                .collect();
+            let dphase: Vec<f64> = (0..n_samples)
+                .map(|i| (32.0 + 10.0 * ((i as f64) * 0.001).cos()) / 44100.0)
+                .collect();
+            let mut phase = Vec::with_capacity(n_samples);
+            let mut acc = 0.0_f64;
+            for &dp in &dphase {
+                acc += dp;
+                phase.push(acc);
+            }
+
+            let fast = align_epoch_phase_monotonic(&blk_t, &phi_blk, &dphase, &phase);
+
+            let mut prev_phi_raw = interp_1d_clamped(&blk_t, &phi_blk, 0.0);
+            let mut running_phi_peak = prev_phi_raw;
+            let mut ref_aligned = Vec::with_capacity(n_samples);
+            for i in 0..n_samples {
+                let phi_raw = interp_1d_clamped(&blk_t, &phi_blk, i as f64);
+                let dphi_raw = phi_raw - prev_phi_raw;
+                prev_phi_raw = phi_raw;
+                let max_d = 0.18 * dphase[i];
+                running_phi_peak += dphi_raw.clamp(-max_d, max_d);
+                ref_aligned.push(phase[i] - running_phi_peak + 0.050);
+            }
+
+            assert_eq!(fast.len(), ref_aligned.len());
+            for (a, b) in fast.iter().zip(ref_aligned.iter()) {
+                assert_abs_diff_eq!(a, b, epsilon = 0.0);
+            }
+        }
     }
 }

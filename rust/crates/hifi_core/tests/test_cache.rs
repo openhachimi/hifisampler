@@ -1,11 +1,14 @@
 use approx::assert_relative_eq;
 use hifi_core::{
-    load_cache, resolve_feature_cache_paths, save_cache, stat_sig, AudioBuffer, CacheError,
-    CacheManager, HifiBinHeader, DEFAULT_SAMPLE_RATE, HEADER_SIZE, HIFIBIN_MAGIC, HIFIBIN_VERSION,
+    cleanup_orphan_tmp_files, cleanup_stale_tmp_files, load_cache, load_cache_with_options,
+    rename_with_retry, resolve_feature_cache_paths, save_cache, save_cache_with_options, stat_sig,
+    AudioBuffer, CacheError, CacheManager, HifiBinHeader, DEFAULT_SAMPLE_RATE, HEADER_SIZE,
+    HIFIBIN_MAGIC, HIFIBIN_VERSION,
 };
 use ndarray::{Array0, Array2};
 use std::fs::{self, File};
 use std::io::Write;
+use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
 
@@ -297,4 +300,135 @@ fn test_cache_manager_stat_sig_invalidation_and_npz_non_finite_scale() {
         load_cache(&bin_path, None),
         Err(CacheError::NonFiniteScale(_))
     ));
+}
+
+#[test]
+fn test_all_zero_payload_rejected_and_regenerated_while_allowed_for_hnsep() {
+    let dir = tempdir().unwrap();
+    let bin_path = dir.path().join("zero_powerloss.hifi.bin");
+
+    // Simulate power-loss zero-filled exact-size .hifi.bin (28B header + 128*16*4 zero bytes)
+    let header = HifiBinHeader::new(128, 16, 1.0).to_bytes();
+    {
+        let mut f = File::create(&bin_path).unwrap();
+        f.write_all(&header).unwrap();
+        f.write_all(&vec![0u8; 128 * 16 * 4]).unwrap();
+    }
+
+    // 1. Direct Mel load rejects all-zero payload
+    assert!(matches!(
+        load_cache(&bin_path, None),
+        Err(CacheError::ZeroFilledPayload)
+    ));
+
+    // 2. Callers like _hnsep (reject_all_zero = false) accept valid silent audio
+    let silent_ok = load_cache_with_options(&bin_path, None, false)
+        .unwrap()
+        .expect("silent payload should succeed when reject_all_zero = false");
+    assert_eq!(silent_ok.mel_origin.shape(), &[128, 16]);
+    assert!(silent_ok.mel_origin.iter().all(|&v| v == 0.0));
+
+    // 3. CacheManager treats zero-filled Mel cache as miss, regenerates, and persists
+    let cm = CacheManager::new();
+    assert!(cm.load_features_cache_arc(&bin_path, false, None).is_none());
+
+    let real_mel = Array2::from_shape_vec((128, 16), vec![-4.5_f32; 128 * 16]).unwrap();
+    let regenerated = cm
+        .save_features_cache_arc(&bin_path, &real_mel, 0.85, false, None)
+        .unwrap();
+    assert_eq!(regenerated.scale, 0.85);
+
+    // Subsequent loads return the regenerated features and share the same Arc
+    let hit = cm
+        .load_features_cache_arc(&bin_path, false, None)
+        .expect("regenerated cache must hit");
+    assert!(Arc::ptr_eq(&regenerated, &hit));
+    let disk_hit = load_cache(&bin_path, None).unwrap().unwrap();
+    assert_relative_eq!(disk_hit.mel_origin[[0, 0]], -4.5, epsilon = 1e-6);
+}
+
+#[test]
+fn test_non_finite_payload_and_zero_copy_save_and_arc_caches() {
+    let dir = tempdir().unwrap();
+    let bad_bin = dir.path().join("nan_payload.hifi.bin");
+
+    let mut payload = vec![1.0_f32; 4 * 4];
+    payload[7] = f32::NAN;
+    save_cache_with_options(&bad_bin, 4, 4, &payload, 1.0, false).unwrap();
+    assert!(matches!(
+        load_cache(&bad_bin, None),
+        Err(CacheError::NonFinitePayload)
+    ));
+
+    // Valid non-durable save & reload
+    let fast_bin = dir.path().join("fast_hnsep.hifi.bin");
+    let raw = vec![0.25_f32, -0.5, 0.75, 1.0];
+    save_cache_with_options(&fast_bin, 1, 4, &raw, 1.0, false).unwrap();
+    let loaded = load_cache_with_options(&fast_bin, None, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.mel_origin.as_slice().unwrap(), raw.as_slice());
+
+    // Arc sharing for WAV cache
+    let wav_path = dir.path().join("sample.wav");
+    fs::write(&wav_path, b"RIFF").unwrap();
+    let cm = CacheManager::new();
+    let buf = Arc::new(AudioBuffer::new(
+        vec![0.1, 0.2, 0.3],
+        DEFAULT_SAMPLE_RATE,
+        1,
+    ));
+    cm.save_wav_cache_arc(&wav_path, Arc::clone(&buf));
+    let wav_hit = cm.load_wav_cache_arc(&wav_path).unwrap();
+    assert!(Arc::ptr_eq(&buf, &wav_hit));
+}
+
+#[test]
+fn test_rename_with_retry_cleanup_orphan_tmp_and_lock_pruning() {
+    let dir = tempdir().unwrap();
+    let tmp = dir.path().join(".note.1234.tmp");
+    let dest = dir.path().join("note.wav");
+    fs::write(&tmp, b"data").unwrap();
+    rename_with_retry(&tmp, &dest).unwrap();
+    assert!(!tmp.exists());
+    assert!(dest.exists());
+
+    // Orphan temp file cleanup preserves regular files
+    let orphan1 = dir.path().join(".orphan1.abc.tmp");
+    let orphan2 = dir.path().join(".orphan2.def.tmp");
+    let keep_hidden = dir.path().join(".keep");
+    fs::write(&orphan1, b"tmp1").unwrap();
+    fs::write(&orphan2, b"tmp2").unwrap();
+    fs::write(&keep_hidden, b"keep").unwrap();
+
+    // High min_age skips brand-new files
+    assert_eq!(
+        cleanup_stale_tmp_files(dir.path(), Duration::from_secs(3600)),
+        0
+    );
+    assert!(orphan1.exists());
+
+    // Zero min_age removes both .*.tmp files while leaving note.wav and .keep intact
+    assert_eq!(cleanup_orphan_tmp_files(dir.path()), 2);
+    assert!(!orphan1.exists());
+    assert!(!orphan2.exists());
+    assert!(dest.exists());
+    assert!(keep_hidden.exists());
+
+    // Lazy pruning in CacheManager::get_lock when > 256 entries
+    let cm = CacheManager::new();
+    let held_path = dir.path().join("held_entry.hifi.bin");
+    let held_lock = cm.get_lock(&held_path);
+    for i in 0..300 {
+        let p = dir.path().join(format!("idle_{i}.hifi.bin"));
+        let _ = cm.get_lock(&p);
+    }
+    assert!(
+        cm.tracked_lock_count() < 260,
+        "idle locks should be lazily pruned below 260, got {}",
+        cm.tracked_lock_count()
+    );
+    // Held lock remains identical (strong_count > 1 kept it)
+    let held_again = cm.get_lock(&held_path);
+    assert!(Arc::ptr_eq(&held_lock, &held_again));
 }

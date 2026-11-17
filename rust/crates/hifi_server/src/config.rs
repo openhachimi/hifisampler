@@ -43,6 +43,14 @@ impl MaxWorkersConfig {
         if directml_active {
             return 1;
         }
+        self.resolve_http_workers()
+    }
+
+    /// Resolve HTTP inference worker concurrency decoupled from GPU kernel serialization.
+    ///
+    /// GPU inference sessions synchronize internally via `OrtRuntime::lock_gpu()`, allowing
+    /// multiple HTTP workers to overlap CPU DSP and disk cache work even when DirectML is active.
+    pub fn resolve_http_workers(&self) -> usize {
         match self {
             Self::Auto => physical_cpu_count().clamp(1, 4),
             Self::Fixed(n) => (*n).max(1),
@@ -444,6 +452,8 @@ performance:
         assert_eq!(cfg.max_workers, MaxWorkersConfig::Auto);
         assert_eq!(cfg.device_preference, DevicePreference::DirectMl);
         assert_eq!(cfg.max_workers.resolve(true), 1);
+        assert!((1..=4).contains(&cfg.max_workers.resolve_http_workers()));
+        assert_eq!(MaxWorkersConfig::Fixed(2).resolve_http_workers(), 2);
         assert_eq!(cfg.idle_timeout, 120);
     }
 

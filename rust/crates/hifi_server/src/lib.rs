@@ -93,6 +93,16 @@ pub fn run_server_with_factory(factory: EngineFactory) -> i32 {
         }
     };
 
+    // Best-effort cleanup of stale orphan `.*.tmp` files leftover from hard crashes.
+    let stale_min_age = Duration::from_secs(300);
+    let _ = hifi_core::cache::cleanup_stale_tmp_files(&std::env::temp_dir(), stale_min_age);
+    if let Some(beacon_dir) = beacon::default_beacon_path()
+        .as_deref()
+        .and_then(std::path::Path::parent)
+    {
+        let _ = hifi_core::cache::cleanup_stale_tmp_files(beacon_dir, stale_min_age);
+    }
+
     let idle_timeout = apply_managed_runtime_config(&mut cfg, cli.managed, cli.idle_timeout);
     if let Err(err) = beacon::write_locator_beacon(&server_root, cli.port, cli.managed) {
         tracing::debug!("Could not write locator beacon: {err}");

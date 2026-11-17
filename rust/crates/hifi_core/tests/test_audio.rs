@@ -261,3 +261,14 @@ fn test_read_wav_resamples_non_44100_to_default_sample_rate() {
         "48k->44.1k resampling interior max_err={max_err}"
     );
 }
+
+#[test]
+fn test_write_wav_empty_batch_writer() {
+    let dir = tempdir().unwrap();
+    let wav_path = dir.path().join("empty.wav");
+    let empty = AudioBuffer::new(vec![], DEFAULT_SAMPLE_RATE, 1);
+    write_wav(&wav_path, &empty).expect("Failed to write empty WAV");
+    let loaded = read_wav(&wav_path).expect("Failed to read empty WAV");
+    assert!(loaded.samples.is_empty());
+    assert_eq!(loaded.sample_rate, DEFAULT_SAMPLE_RATE);
+}

@@ -8,13 +8,13 @@
 //! - `scale`: `f64` (8 bytes, little-endian)
 
 use crate::audio::AudioBuffer;
-use ndarray::Array2;
+use ndarray::{Array2, ArrayView2};
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -24,6 +24,9 @@ pub const MAX_FEATURES_RAM_ITEMS: usize = 128;
 /// Maximum number of decoded WAV waveforms cached in L1 RAM (`util/cache_manager.py`).
 pub const MAX_WAV_RAM_ITEMS: usize = 64;
 
+/// Threshold above which `CacheManager::get_lock` lazily prunes idle lock entries.
+const LOCK_PRUNE_THRESHOLD: usize = 256;
+
 /// File metadata signature matching Python `(st.st_mtime_ns, st.st_size)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StatSig {
@@ -31,9 +34,8 @@ pub struct StatSig {
     pub size: u64,
 }
 
-/// Reads `(mtime_ns, size)` metadata signature for `path`, returning `None` if unavailable.
-pub fn stat_sig(path: &Path) -> Option<StatSig> {
-    let meta = fs::metadata(path).ok()?;
+#[inline]
+fn stat_sig_from_meta(meta: &fs::Metadata) -> Option<StatSig> {
     let modified = meta.modified().ok()?;
     let mtime_ns = match modified.duration_since(UNIX_EPOCH) {
         Ok(d) => d.as_nanos() as i128,
@@ -43,6 +45,26 @@ pub fn stat_sig(path: &Path) -> Option<StatSig> {
         mtime_ns,
         size: meta.len(),
     })
+}
+
+/// Reads `(mtime_ns, size)` metadata signature for `path`, returning `None` if unavailable.
+pub fn stat_sig(path: &Path) -> Option<StatSig> {
+    let meta = fs::metadata(path).ok()?;
+    stat_sig_from_meta(&meta)
+}
+
+/// Computes the legacy `.npz` fallback path corresponding to a `.bin` cache path.
+fn sibling_npz_path(cache_path: &Path) -> PathBuf {
+    if let Some(stem) = cache_path.file_name().and_then(|s| s.to_str()) {
+        if let Some(stripped) = stem.strip_suffix(".bin") {
+            let new_name = format!("{stripped}.npz");
+            return match cache_path.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p.join(new_name),
+                _ => PathBuf::from(new_name),
+            };
+        }
+    }
+    cache_path.with_extension("npz")
 }
 
 /// Resolves `(read_path, write_path)` for feature cache files, falling back to an existing
@@ -101,6 +123,79 @@ pub fn resolve_feature_cache_paths(base_path: &Path) -> (PathBuf, PathBuf) {
             (read_path, bin_path)
         }
     }
+}
+
+/// Atomically renames `tmp` to `dest` with up to 3 exponential retries (`20ms`, `80ms`, `200ms`)
+/// when encountering transient Windows sharing/access errors (`ERROR_ACCESS_DENIED=5`,
+/// `ERROR_SHARING_VIOLATION=32`, or `ErrorKind::PermissionDenied`).
+pub fn rename_with_retry(tmp: &Path, dest: &Path) -> io::Result<()> {
+    const BACKOFF_MS: [u64; 3] = [20, 80, 200];
+    let mut attempt = 0;
+    loop {
+        match fs::rename(tmp, dest) {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt < BACKOFF_MS.len() && is_retryable_rename_err(&e) => {
+                std::thread::sleep(Duration::from_millis(BACKOFF_MS[attempt]));
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+#[inline]
+fn is_retryable_rename_err(e: &io::Error) -> bool {
+    if e.kind() == io::ErrorKind::PermissionDenied {
+        return true;
+    }
+    matches!(e.raw_os_error(), Some(5) | Some(32))
+}
+
+/// Best-effort cleanup of orphan `.*.tmp` files inside `dir` older than `min_age`.
+/// Returns the number of files removed.
+pub fn cleanup_stale_tmp_files(dir: &Path, min_age: Duration) -> usize {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let now = SystemTime::now();
+    let mut removed = 0usize;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !(name.starts_with('.') && name.ends_with(".tmp")) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        if !min_age.is_zero() {
+            let Ok(modified) = meta.modified() else {
+                continue;
+            };
+            let Ok(age) = now.duration_since(modified) else {
+                continue;
+            };
+            if age < min_age {
+                continue;
+            }
+        }
+        if fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Best-effort cleanup of all orphan `.*.tmp` files inside `dir`.
+/// Returns the number of files removed.
+pub fn cleanup_orphan_tmp_files(dir: &Path) -> usize {
+    cleanup_stale_tmp_files(dir, Duration::ZERO)
 }
 
 /// 8-byte ASCII magic identifier for HIFIBIN1 feature cache files.
@@ -212,7 +307,7 @@ pub struct CachedFeatures {
 #[derive(Debug, Error)]
 pub enum CacheError {
     #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[from] io::Error),
 
     #[error("Truncated binary cache header: {0} bytes (expected 28)")]
     TruncatedHeader(usize),
@@ -225,6 +320,12 @@ pub enum CacheError {
 
     #[error("Non-finite scale in binary cache: {0}")]
     NonFiniteScale(f64),
+
+    #[error("Non-finite payload element detected in binary cache")]
+    NonFinitePayload,
+
+    #[error("Zero-filled payload detected in feature cache (requires regeneration)")]
+    ZeroFilledPayload,
 
     #[error(
         "Binary cache size mismatch: expected {expected} bytes for ({rows}, {cols}), got {actual}"
@@ -250,37 +351,48 @@ pub enum CacheError {
         tmp: PathBuf,
         dest: PathBuf,
         #[source]
-        source: std::io::Error,
+        source: io::Error,
     },
 }
 
-/// Helper to test if a cache file is stale compared to its source WAV using `(mtime_ns, size)` metadata.
-fn is_stale(cache_path: &Path, source_path: &Path) -> Result<bool, CacheError> {
-    if !source_path.exists() {
-        return Ok(false);
-    }
-    let cache_mtime_ns = match stat_sig(cache_path) {
-        Some(sig) => sig.mtime_ns,
-        None => {
-            let _ = fs::metadata(cache_path)?;
-            return Ok(false);
-        }
+fn is_stale_from_sig(
+    cache_sig: StatSig,
+    source_path: &Path,
+    known_src_sig: Option<Option<StatSig>>,
+) -> Result<bool, CacheError> {
+    let src_sig = match known_src_sig {
+        Some(Some(sig)) => sig,
+        Some(None) => return Ok(false),
+        None => match fs::metadata(source_path) {
+            Ok(m) => match stat_sig_from_meta(&m) {
+                Some(sig) => sig,
+                None => return Ok(false),
+            },
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(CacheError::Io(e)),
+        },
     };
-    let source_mtime_ns = match stat_sig(source_path) {
-        Some(sig) => sig.mtime_ns,
-        None => {
-            let _ = fs::metadata(source_path)?;
-            return Ok(false);
-        }
-    };
-    Ok(cache_mtime_ns < source_mtime_ns)
+    Ok(cache_sig.mtime_ns < src_sig.mtime_ns)
 }
 
-/// Atomically saves acoustic features to disk using the `HIFIBIN1` binary format.
-pub fn save_cache(cache_path: &Path, mel: &Array2<f32>, scale: f64) -> Result<(), CacheError> {
+/// Atomically saves a contiguous `[rows, cols]` `f32` payload to disk using `HIFIBIN1`,
+/// calling `sync_all()` only when `durable == true`.
+pub fn save_cache_with_options(
+    cache_path: &Path,
+    rows: usize,
+    cols: usize,
+    flat_data: &[f32],
+    scale: f64,
+    durable: bool,
+) -> Result<(), CacheError> {
     if !scale.is_finite() {
         return Err(CacheError::NonFiniteScale(scale));
     }
+
+    // Validate dimensions fit u32 and match flat_data.len() without overflow.
+    let rows_u32 = u32::try_from(rows).map_err(|_| CacheError::DimensionOverflow { rows, cols })?;
+    let cols_u32 = u32::try_from(cols).map_err(|_| CacheError::DimensionOverflow { rows, cols })?;
+    let _ = ArrayView2::from_shape((rows, cols), flat_data)?;
 
     if let Some(parent) = cache_path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -292,7 +404,7 @@ pub fn save_cache(cache_path: &Path, mel: &Array2<f32>, scale: f64) -> Result<()
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("cache.bin");
-    let tmp_file_name = format!(".{}.{}.tmp", file_name, Uuid::new_v4().simple());
+    let tmp_file_name = format!(".{file_name}.{}.tmp", Uuid::new_v4().simple());
     let tmp_path = match cache_path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.join(&tmp_file_name),
         _ => PathBuf::from(&tmp_file_name),
@@ -309,17 +421,7 @@ pub fn save_cache(cache_path: &Path, mel: &Array2<f32>, scale: f64) -> Result<()
     }
     let cleanup = TmpCleanup(&tmp_path);
 
-    let rows_usize = mel.nrows();
-    let cols_usize = mel.ncols();
-    let rows = u32::try_from(rows_usize).map_err(|_| CacheError::DimensionOverflow {
-        rows: rows_usize,
-        cols: cols_usize,
-    })?;
-    let cols = u32::try_from(cols_usize).map_err(|_| CacheError::DimensionOverflow {
-        rows: rows_usize,
-        cols: cols_usize,
-    })?;
-    let header = HifiBinHeader::new(rows, cols, scale);
+    let header = HifiBinHeader::new(rows_u32, cols_u32, scale);
 
     {
         let file = File::create(&tmp_path)?;
@@ -327,24 +429,28 @@ pub fn save_cache(cache_path: &Path, mel: &Array2<f32>, scale: f64) -> Result<()
 
         header.write_to(&mut writer)?;
 
-        let standard = mel.as_standard_layout();
-        if let Some(slice) = standard.as_slice() {
-            let byte_slice = bytemuck::cast_slice::<f32, u8>(slice);
+        #[cfg(target_endian = "little")]
+        {
+            let byte_slice = bytemuck::cast_slice::<f32, u8>(flat_data);
             writer.write_all(byte_slice)?;
-        } else {
-            for &val in standard.iter() {
+        }
+        #[cfg(not(target_endian = "little"))]
+        {
+            for &val in flat_data {
                 writer.write_all(&val.to_le_bytes())?;
             }
         }
 
         writer.flush()?;
-        writer
-            .into_inner()
-            .map_err(|e| e.into_error())?
-            .sync_all()?;
+        if durable {
+            writer
+                .into_inner()
+                .map_err(|e| e.into_error())?
+                .sync_all()?;
+        }
     }
 
-    fs::rename(&tmp_path, cache_path).map_err(|e| CacheError::AtomicRenameFailed {
+    rename_with_retry(&tmp_path, cache_path).map_err(|e| CacheError::AtomicRenameFailed {
         tmp: tmp_path.clone(),
         dest: cache_path.to_path_buf(),
         source: e,
@@ -356,57 +462,85 @@ pub fn save_cache(cache_path: &Path, mel: &Array2<f32>, scale: f64) -> Result<()
     Ok(())
 }
 
-/// Reads cached acoustic features from disk.
-///
-/// Features are validated against `source_wav_path` (if provided): if `cache.mtime < source.mtime`,
-/// the cache is deemed stale and `Ok(None)` is returned.
-/// If `cache_path` is missing, transparently checks for a sibling `.npz` archive.
-pub fn load_cache(
+/// Atomically saves acoustic features to disk using the `HIFIBIN1` binary format (`durable = true`).
+pub fn save_cache(cache_path: &Path, mel: &Array2<f32>, scale: f64) -> Result<(), CacheError> {
+    let rows = mel.nrows();
+    let cols = mel.ncols();
+    let standard = mel.as_standard_layout();
+    if let Some(slice) = standard.as_slice() {
+        save_cache_with_options(cache_path, rows, cols, slice, scale, true)
+    } else {
+        let owned = standard.to_owned();
+        save_cache_with_options(
+            cache_path,
+            rows,
+            cols,
+            owned.as_slice().unwrap_or(&[]),
+            scale,
+            true,
+        )
+    }
+}
+
+fn validate_payload(floats: &[f32], reject_all_zero: bool) -> Result<(), CacheError> {
+    let mut all_zero = reject_all_zero && !floats.is_empty();
+    for &v in floats {
+        if !v.is_finite() {
+            return Err(CacheError::NonFinitePayload);
+        }
+        if all_zero && v != 0.0 {
+            all_zero = false;
+        }
+    }
+    if all_zero {
+        return Err(CacheError::ZeroFilledPayload);
+    }
+    Ok(())
+}
+
+fn load_cache_with_options_inner(
     cache_path: &Path,
     source_wav_path: Option<&Path>,
+    known_src_sig: Option<Option<StatSig>>,
+    reject_all_zero: bool,
 ) -> Result<Option<CachedFeatures>, CacheError> {
-    if !cache_path.exists() {
-        // Fallback to .npz if .bin does not exist
-        let candidate_npz = if let Some(stem) = cache_path.file_name().and_then(|s| s.to_str()) {
-            if let Some(stripped) = stem.strip_suffix(".bin") {
-                let new_name = format!("{}.npz", stripped);
-                match cache_path.parent() {
-                    Some(p) if !p.as_os_str().is_empty() => p.join(new_name),
-                    _ => PathBuf::from(new_name),
-                }
-            } else {
-                cache_path.with_extension("npz")
-            }
-        } else {
-            cache_path.with_extension("npz")
-        };
-
-        if candidate_npz.exists() {
+    let file = match File::open(cache_path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let candidate_npz = sibling_npz_path(cache_path);
+            let npz_file = match File::open(&candidate_npz) {
+                Ok(f) => f,
+                Err(e2) if e2.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(e2) => return Err(CacheError::Io(e2)),
+            };
             if let Some(source_path) = source_wav_path {
-                if is_stale(&candidate_npz, source_path)? {
-                    return Ok(None);
+                let meta = npz_file.metadata()?;
+                if let Some(cache_sig) = stat_sig_from_meta(&meta) {
+                    if is_stale_from_sig(cache_sig, source_path, known_src_sig)? {
+                        return Ok(None);
+                    }
                 }
             }
-            return load_npz_cache(&candidate_npz);
+            return load_npz_from_reader(BufReader::new(npz_file), reject_all_zero);
         }
+        Err(e) => return Err(CacheError::Io(e)),
+    };
 
-        return Ok(None);
-    }
+    let meta = file.metadata()?;
+    let file_len = meta.len();
 
-    // Check mtime invalidation against source WAV
     if let Some(source_path) = source_wav_path {
-        if is_stale(cache_path, source_path)? {
-            return Ok(None);
+        if let Some(cache_sig) = stat_sig_from_meta(&meta) {
+            if is_stale_from_sig(cache_sig, source_path, known_src_sig)? {
+                return Ok(None);
+            }
         }
     }
-
-    let file = File::open(cache_path)?;
-    let file_len = file.metadata()?.len();
 
     let mut reader = BufReader::new(file);
     let mut magic_buf = [0u8; 8];
     if let Err(e) = reader.read_exact(&mut magic_buf) {
-        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+        if e.kind() == io::ErrorKind::UnexpectedEof {
             return Err(CacheError::TruncatedHeader(file_len as usize));
         }
         return Err(CacheError::Io(e));
@@ -414,7 +548,12 @@ pub fn load_cache(
 
     if magic_buf == *HIFIBIN_MAGIC {
         let mut rest_header = [0u8; HEADER_SIZE - 8];
-        reader.read_exact(&mut rest_header)?;
+        if let Err(e) = reader.read_exact(&mut rest_header) {
+            if e.kind() == io::ErrorKind::UnexpectedEof {
+                return Err(CacheError::TruncatedHeader(file_len as usize));
+            }
+            return Err(CacheError::Io(e));
+        }
 
         let mut header_buf = [0u8; HEADER_SIZE];
         header_buf[0..8].copy_from_slice(&magic_buf);
@@ -455,14 +594,24 @@ pub fn load_cache(
                 rows: header.rows,
                 cols: header.cols,
             })?;
-        let mut payload_bytes = vec![0u8; num_elements * 4];
-        reader.read_exact(&mut payload_bytes)?;
 
-        let mut floats = Vec::with_capacity(num_elements);
-        let (chunks, _) = payload_bytes.as_chunks::<4>();
-        for chunk in chunks {
-            floats.push(f32::from_le_bytes(*chunk));
+        let mut floats = vec![0.0_f32; num_elements];
+        if num_elements > 0 {
+            #[cfg(target_endian = "little")]
+            {
+                reader.read_exact(bytemuck::cast_slice_mut::<f32, u8>(&mut floats))?;
+            }
+            #[cfg(not(target_endian = "little"))]
+            {
+                let mut buf4 = [0u8; 4];
+                for dst in &mut floats {
+                    reader.read_exact(&mut buf4)?;
+                    *dst = f32::from_le_bytes(buf4);
+                }
+            }
         }
+
+        validate_payload(&floats, reject_all_zero)?;
 
         let mel_origin =
             Array2::from_shape_vec((header.rows as usize, header.cols as usize), floats)?;
@@ -474,19 +623,40 @@ pub fn load_cache(
     } else {
         // Not a HIFIBIN1 magic; attempt legacy NPZ decode
         reader.seek(SeekFrom::Start(0))?;
-        load_npz_from_reader(reader)
+        load_npz_from_reader(reader, reject_all_zero)
     }
 }
 
-/// Decodes cached features from an on-disk `.npz` archive.
-fn load_npz_cache(path: &Path) -> Result<Option<CachedFeatures>, CacheError> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    load_npz_from_reader(reader)
+/// Reads cached acoustic features from disk with configurable all-zero payload rejection.
+///
+/// Validates `source_wav_path` mtime staleness, rejects non-finite payload floats,
+/// and when `reject_all_zero == true`, rejects non-empty all-zero payloads so power-loss
+/// zero-filled feature caches regenerate automatically.
+pub fn load_cache_with_options(
+    cache_path: &Path,
+    source_wav_path: Option<&Path>,
+    reject_all_zero: bool,
+) -> Result<Option<CachedFeatures>, CacheError> {
+    load_cache_with_options_inner(cache_path, source_wav_path, None, reject_all_zero)
+}
+
+/// Reads cached acoustic features from disk (`reject_all_zero = true`).
+///
+/// Features are validated against `source_wav_path` (if provided): if `cache.mtime < source.mtime`,
+/// the cache is deemed stale and `Ok(None)` is returned.
+/// If `cache_path` is missing, transparently checks for a sibling `.npz` archive.
+pub fn load_cache(
+    cache_path: &Path,
+    source_wav_path: Option<&Path>,
+) -> Result<Option<CachedFeatures>, CacheError> {
+    load_cache_with_options_inner(cache_path, source_wav_path, None, true)
 }
 
 /// Decodes features from an `.npz` stream.
-fn load_npz_from_reader<R: Read + Seek>(reader: R) -> Result<Option<CachedFeatures>, CacheError> {
+fn load_npz_from_reader<R: Read + Seek>(
+    reader: R,
+    reject_all_zero: bool,
+) -> Result<Option<CachedFeatures>, CacheError> {
     let mut npz =
         ndarray_npy::NpzReader::new(reader).map_err(|e| CacheError::Npz(e.to_string()))?;
 
@@ -523,13 +693,30 @@ fn load_npz_from_reader<R: Read + Seek>(reader: R) -> Result<Option<CachedFeatur
         return Err(CacheError::NonFiniteScale(scale));
     }
 
+    if let Some(slice) = mel_origin.as_slice() {
+        validate_payload(slice, reject_all_zero)?;
+    } else {
+        let mut all_zero = reject_all_zero && !mel_origin.is_empty();
+        for &v in mel_origin.iter() {
+            if !v.is_finite() {
+                return Err(CacheError::NonFinitePayload);
+            }
+            if all_zero && v != 0.0 {
+                all_zero = false;
+            }
+        }
+        if all_zero {
+            return Err(CacheError::ZeroFilledPayload);
+        }
+    }
+
     Ok(Some(CachedFeatures { mel_origin, scale }))
 }
 
 struct FeatureRamEntry {
     disk_sig: Option<StatSig>,
     src_sig: Option<StatSig>,
-    features: CachedFeatures,
+    features: Arc<CachedFeatures>,
 }
 
 struct LruCache<V> {
@@ -592,11 +779,12 @@ impl<V> LruCache<V> {
 /// Thread-safe L1 RAM LRU + L2 disk `HIFIBIN1` cache manager mirroring `util/cache_manager.py`.
 ///
 /// Validates both cache file and source WAV `(mtime_ns, size)` signatures (`StatSig`),
-/// supports transparent `.hifi.npz` fallback reads, and provides per-path locks.
+/// supports zero-copy `Arc` handles for RAM hits, transparent `.hifi.npz` fallback reads,
+/// and lazily-pruned per-path locks.
 pub struct CacheManager {
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     mem_features: Mutex<LruCache<FeatureRamEntry>>,
-    mem_wav: Mutex<LruCache<(StatSig, AudioBuffer)>>,
+    mem_wav: Mutex<LruCache<(StatSig, Arc<AudioBuffer>)>>,
 }
 
 impl Default for CacheManager {
@@ -631,49 +819,69 @@ impl CacheManager {
         }
     }
 
-    /// Returns a per-cache-path lock for coordinating concurrent feature generation.
+    /// Returns a per-cache-path lock for coordinating concurrent feature generation,
+    /// lazily pruning idle lock entries when the map exceeds 256 entries.
     pub fn get_lock(&self, cache_path: &Path) -> Arc<Mutex<()>> {
         let key = Self::resolve_key(cache_path);
         let mut guard = self.locks.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.len() > LOCK_PRUNE_THRESHOLD {
+            guard.retain(|_, v| Arc::strong_count(v) > 1);
+        }
         guard
             .entry(key)
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
     }
 
-    /// Loads decoded WAV audio from L1 RAM cache if `(mtime_ns, size)` matches `path`.
-    pub fn load_wav_cache(&self, path: &Path) -> Option<AudioBuffer> {
+    /// Returns the number of currently tracked per-path locks (for diagnostics/tests).
+    pub fn tracked_lock_count(&self) -> usize {
+        self.locks.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
+    /// Loads decoded WAV audio from L1 RAM cache as a zero-copy `Arc` if `(mtime_ns, size)` matches `path`.
+    pub fn load_wav_cache_arc(&self, path: &Path) -> Option<Arc<AudioBuffer>> {
         let sig = stat_sig(path)?;
         let key = Self::resolve_key(path);
         let mut guard = self.mem_wav.lock().unwrap_or_else(|p| p.into_inner());
         if let Some((cached_sig, buf)) = guard.get_mut(&key) {
             if *cached_sig == sig {
-                return Some(buf.clone());
+                return Some(Arc::clone(buf));
             }
             guard.remove(&key);
         }
         None
     }
 
-    /// Stores decoded WAV audio in L1 RAM cache keyed by `(mtime_ns, size)`.
-    pub fn save_wav_cache(&self, path: &Path, audio: &AudioBuffer) {
+    /// Loads decoded WAV audio from L1 RAM cache if `(mtime_ns, size)` matches `path`.
+    pub fn load_wav_cache(&self, path: &Path) -> Option<AudioBuffer> {
+        self.load_wav_cache_arc(path)
+            .map(|arc| arc.as_ref().clone())
+    }
+
+    /// Stores decoded WAV audio `Arc` in L1 RAM cache keyed by `(mtime_ns, size)`.
+    pub fn save_wav_cache_arc(&self, path: &Path, audio: Arc<AudioBuffer>) {
         let Some(sig) = stat_sig(path) else {
             return;
         };
         let key = Self::resolve_key(path);
         let mut guard = self.mem_wav.lock().unwrap_or_else(|p| p.into_inner());
-        guard.insert(key, (sig, audio.clone()));
+        guard.insert(key, (sig, audio));
     }
 
-    /// Loads acoustic features from L1 RAM or L2 disk (`HIFIBIN1` or legacy `.npz` fallback),
-    /// invalidating when `source_path` has a newer `mtime_ns` or altered `(mtime_ns, size)`.
-    /// Corrupted disk files return `None` so callers can transparently regenerate.
-    pub fn load_features_cache(
+    /// Stores decoded WAV audio in L1 RAM cache keyed by `(mtime_ns, size)`.
+    pub fn save_wav_cache(&self, path: &Path, audio: &AudioBuffer) {
+        self.save_wav_cache_arc(path, Arc::new(audio.clone()));
+    }
+
+    /// Loads acoustic features from L1 RAM or L2 disk (`HIFIBIN1` or legacy `.npz` fallback)
+    /// as a zero-copy `Arc<CachedFeatures>`, invalidating when `source_path` has a newer `mtime_ns`
+    /// or altered `(mtime_ns, size)`. Corrupted or zero-filled disk files return `None`.
+    pub fn load_features_cache_arc(
         &self,
         cache_path: &Path,
         force_generate: bool,
         source_path: Option<&Path>,
-    ) -> Option<CachedFeatures> {
+    ) -> Option<Arc<CachedFeatures>> {
         let key = Self::resolve_key(cache_path);
         if force_generate {
             let mut guard = self.mem_features.lock().unwrap_or_else(|p| p.into_inner());
@@ -681,12 +889,8 @@ impl CacheManager {
             return None;
         }
 
-        let effective_path = if cache_path.exists() {
-            cache_path.to_path_buf()
-        } else {
-            resolve_feature_cache_paths(cache_path).0
-        };
-        let disk_sig = stat_sig(&effective_path);
+        // Single metadata lookup for cache_path; only probe sibling .npz if .bin is missing.
+        let disk_sig = stat_sig(cache_path).or_else(|| stat_sig(&sibling_npz_path(cache_path)));
         let src_sig = source_path.and_then(stat_sig);
 
         if let (Some(d), Some(s)) = (disk_sig, src_sig) {
@@ -706,53 +910,68 @@ impl CacheManager {
                 );
                 let disk_matches = entry.disk_sig == disk_sig;
                 if !src_stale && disk_matches {
-                    return Some(entry.features.clone());
+                    return Some(Arc::clone(&entry.features));
                 }
                 guard.remove(&key);
             }
         }
 
-        match load_cache(cache_path, source_path) {
+        // If neither .bin nor .npz exists on disk, avoid a redundant File::open ENOENT syscall.
+        disk_sig?;
+
+        match load_cache_with_options_inner(cache_path, source_path, Some(src_sig), true) {
             Ok(Some(features)) => {
+                let arc = Arc::new(features);
                 let mut guard = self.mem_features.lock().unwrap_or_else(|p| p.into_inner());
                 guard.insert(
                     key,
                     FeatureRamEntry {
                         disk_sig,
                         src_sig,
-                        features: features.clone(),
+                        features: Arc::clone(&arc),
                     },
                 );
-                Some(features)
+                Some(arc)
             }
             Ok(None) | Err(_) => None,
         }
     }
 
-    /// Saves acoustic features atomically to `.hifi.bin` and updates L1 RAM cache.
+    /// Loads acoustic features from L1 RAM or L2 disk (`HIFIBIN1` or legacy `.npz` fallback).
+    pub fn load_features_cache(
+        &self,
+        cache_path: &Path,
+        force_generate: bool,
+        source_path: Option<&Path>,
+    ) -> Option<CachedFeatures> {
+        self.load_features_cache_arc(cache_path, force_generate, source_path)
+            .map(|arc| arc.as_ref().clone())
+    }
+
+    /// Saves acoustic features atomically to `.hifi.bin` and updates L1 RAM cache, returning an `Arc`.
     /// If writing to disk fails (e.g. read-only directory), still caches in L1 RAM.
-    pub fn save_features_cache(
+    pub fn save_features_cache_arc(
         &self,
         cache_path: &Path,
         mel: &Array2<f32>,
         scale: f64,
         force_generate: bool,
         source_path: Option<&Path>,
-    ) -> Result<CachedFeatures, CacheError> {
+    ) -> Result<Arc<CachedFeatures>, CacheError> {
         if !scale.is_finite() {
             return Err(CacheError::NonFiniteScale(scale));
         }
 
         if !force_generate {
-            if let Some(existing) = self.load_features_cache(cache_path, false, source_path) {
+            if let Some(existing) = self.load_features_cache_arc(cache_path, false, source_path) {
                 return Ok(existing);
             }
         }
 
-        let features = CachedFeatures {
+        let features = Arc::new(CachedFeatures {
             mel_origin: mel.clone(),
             scale,
-        };
+        });
         let key = Self::resolve_key(cache_path);
         let src_sig = source_path.and_then(stat_sig);
 
@@ -767,9 +986,22 @@ impl CacheManager {
             FeatureRamEntry {
                 disk_sig,
                 src_sig,
-                features: features.clone(),
+                features: Arc::clone(&features),
             },
         );
         Ok(features)
+    }
+
+    /// Saves acoustic features atomically to `.hifi.bin` and updates L1 RAM cache.
+    pub fn save_features_cache(
+        &self,
+        cache_path: &Path,
+        mel: &Array2<f32>,
+        scale: f64,
+        force_generate: bool,
+        source_path: Option<&Path>,
+    ) -> Result<CachedFeatures, CacheError> {
+        self.save_features_cache_arc(cache_path, mel, scale, force_generate, source_path)
+            .map(|arc| arc.as_ref().clone())
     }
 }

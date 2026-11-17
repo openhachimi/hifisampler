@@ -90,8 +90,11 @@ impl ExecutionProvider {
         }
     }
 
-    /// Returns `true` when the active provider executes on GPU/accelerator hardware
-    /// and therefore benefits from serialized execution (`gpu_infer_lock`).
+    /// Returns `true` when the active provider executes on GPU/accelerator hardware.
+    ///
+    /// GPU inference passes serialize internally via [`crate::OrtRuntime::lock_gpu()`] inside
+    /// [`crate::OrtSession::run_f32`] / [`crate::OrtSession::run_f32_timed`], satisfying the
+    /// thread-safe `OnnxRunner` contract without external caller locking.
     pub fn is_gpu_ep(&self) -> bool {
         !matches!(self, Self::Cpu)
     }
@@ -112,7 +115,7 @@ pub struct SessionConfig {
     pub intra_op_threads: Option<usize>,
     /// Number of inter-op threads (`1` by default, matching `util/model_loader.py`).
     pub inter_op_threads: usize,
-    /// Expected worker concurrency hint used to size intra-op threads (`2` by default, forced to `1` on DirectML).
+    /// Expected HTTP/DSP worker concurrency hint used to divide intra-op threads (`2` by default).
     pub workers_hint: usize,
     /// GPU device index (`0` by default).
     pub device_id: i32,
@@ -120,7 +123,7 @@ pub struct SessionConfig {
     pub disable_dml_metacommands: bool,
     /// Override memory pattern setting (`None` enables it on CPU/CUDA/ROCm and disables it on DirectML).
     pub enable_mem_pattern: Option<bool>,
-    /// Enable CPU memory arena (`true` by default).
+    /// Enable CPU memory arena (`false` by default to prevent unbounded arena growth).
     pub enable_cpu_mem_arena: bool,
     /// Explicit ONNX Runtime shared library path override.
     pub ort_library_path: Option<PathBuf>,
@@ -136,7 +139,7 @@ impl Default for SessionConfig {
             device_id: 0,
             disable_dml_metacommands: true,
             enable_mem_pattern: None,
-            enable_cpu_mem_arena: true,
+            enable_cpu_mem_arena: false,
             ort_library_path: None,
         }
     }
@@ -151,8 +154,9 @@ impl SessionConfig {
         }
     }
 
-    /// Compute the effective intra-op thread count for the target provider.
-    pub fn effective_intra_op_threads(&self, provider: &ExecutionProvider) -> i32 {
+    /// Compute the effective intra-op thread count (`(physical / workers_hint).max(1)`)
+    /// uniformly across all execution providers so concurrent HTTP workers do not oversubscribe CPUs.
+    pub fn effective_intra_op_threads(&self, _provider: &ExecutionProvider) -> i32 {
         if let Some(explicit) = self.intra_op_threads {
             return explicit.max(1) as i32;
         }
@@ -160,11 +164,7 @@ impl SessionConfig {
             .map(|n| n.get())
             .unwrap_or(2);
         let physical = (logical / 2).max(1);
-        let workers = if matches!(provider, ExecutionProvider::DirectMl) {
-            1
-        } else {
-            self.workers_hint.max(1)
-        };
+        let workers = self.workers_hint.max(1);
         (physical / workers).max(1) as i32
     }
 }

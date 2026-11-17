@@ -168,12 +168,13 @@ impl VocoderSession {
         })
     }
 
-    /// Run vocoder inference on `mel` `[B, T, n_mels]` (`[1, T, 128]`) and `f0` `[B, T]` (`[1, T]`).
-    pub fn synthesize(
+    /// Run vocoder inference on `mel` `[B, T, n_mels]` (`[1, T, 128]`) and `f0` `[B, T]` (`[1, T]`),
+    /// returning `(waveform, gpu_wait_ms)`.
+    pub fn synthesize_timed(
         &self,
         mel: ArrayView3<'_, f32>,
         f0: ArrayView2<'_, f32>,
-    ) -> Result<Vec<f32>, OnnxError> {
+    ) -> Result<(Vec<f32>, f64), OnnxError> {
         let (batch, frames, mel_bins) = mel.dim();
         let (f0_batch, f0_frames) = f0.dim();
 
@@ -208,7 +209,7 @@ impl VocoderSession {
         let mel_dims = [batch as i64, frames as i64, mel_bins as i64];
         let f0_dims = [f0_batch as i64, f0_frames as i64];
 
-        let mut outputs = self.inner.run_f32(
+        let (mut outputs, gpu_wait_ms) = self.inner.run_f32_timed(
             &[
                 (&self.mel_input_name, &mel_dims, mel_slice),
                 (&self.f0_input_name, &f0_dims, f0_slice),
@@ -219,7 +220,30 @@ impl VocoderSession {
         let (_, waveform) = outputs.pop().ok_or_else(|| OnnxError::InvalidInput {
             message: "vocoder returned empty output vector".to_string(),
         })?;
-        Ok(waveform)
+        Ok((waveform, gpu_wait_ms))
+    }
+
+    /// Run vocoder inference on `mel` `[B, T, n_mels]` (`[1, T, 128]`) and `f0` `[B, T]` (`[1, T]`).
+    pub fn synthesize(
+        &self,
+        mel: ArrayView3<'_, f32>,
+        f0: ArrayView2<'_, f32>,
+    ) -> Result<Vec<f32>, OnnxError> {
+        self.synthesize_timed(mel, f0).map(|(wav, _)| wav)
+    }
+
+    /// Convenience wrapper taking `[T, 128]` Mel frames and `[T]` F0 slice, returning `(waveform, gpu_wait_ms)`.
+    pub fn synthesize_frames_timed(
+        &self,
+        mel_frames_by_bins: ArrayView2<'_, f32>,
+        f0: &[f32],
+    ) -> Result<(Vec<f32>, f64), OnnxError> {
+        let mel_3d = mel_frames_by_bins.insert_axis(ndarray::Axis(0));
+        let f0_2d =
+            ArrayView2::from_shape((1, f0.len()), f0).map_err(|e| OnnxError::InvalidInput {
+                message: format!("failed to reshape f0 slice: {e}"),
+            })?;
+        self.synthesize_timed(mel_3d, f0_2d)
     }
 
     /// Convenience wrapper taking `[T, 128]` Mel frames and `[T]` F0 slice.
@@ -228,12 +252,18 @@ impl VocoderSession {
         mel_frames_by_bins: ArrayView2<'_, f32>,
         f0: &[f32],
     ) -> Result<Vec<f32>, OnnxError> {
-        let mel_3d = mel_frames_by_bins.insert_axis(ndarray::Axis(0));
-        let f0_2d =
-            ArrayView2::from_shape((1, f0.len()), f0).map_err(|e| OnnxError::InvalidInput {
-                message: format!("failed to reshape f0 slice: {e}"),
-            })?;
-        self.synthesize(mel_3d, f0_2d)
+        self.synthesize_frames_timed(mel_frames_by_bins, f0)
+            .map(|(wav, _)| wav)
+    }
+
+    /// Convenience wrapper taking `[128, T]` (`[n_mels, n_frames]`, matching `hifi_dsp`) and `[T]` F0,
+    /// returning `(waveform, gpu_wait_ms)`.
+    pub fn synthesize_mels_by_frames_timed(
+        &self,
+        mel_bins_by_frames: ArrayView2<'_, f32>,
+        f0: &[f32],
+    ) -> Result<(Vec<f32>, f64), OnnxError> {
+        self.synthesize_frames_timed(mel_bins_by_frames.t(), f0)
     }
 
     /// Convenience wrapper taking `[128, T]` (`[n_mels, n_frames]`, matching `hifi_dsp`) and `[T]` F0.
@@ -242,7 +272,8 @@ impl VocoderSession {
         mel_bins_by_frames: ArrayView2<'_, f32>,
         f0: &[f32],
     ) -> Result<Vec<f32>, OnnxError> {
-        self.synthesize_frames(mel_bins_by_frames.t(), f0)
+        self.synthesize_mels_by_frames_timed(mel_bins_by_frames, f0)
+            .map(|(wav, _)| wav)
     }
 
     /// Run a short dummy forward pass to warm up execution provider kernels (matching `backend/models.py`).

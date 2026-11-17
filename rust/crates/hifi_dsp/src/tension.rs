@@ -12,7 +12,8 @@ use ndarray::Array2;
 use num_complex::{Complex32, Complex64};
 
 use crate::hnsep_stft::{
-    constant_pad_1d, irfft_real_1d, istft_1d, periodic_hann_window, rfft_1d, stft_1d, PadMode,
+    constant_pad_1d, irfft_real_1d, istft_1d_frames, periodic_hann_window, rfft_1d, stft_1d_frames,
+    FramesSpectrum, PadMode,
 };
 use crate::DspError;
 
@@ -573,62 +574,88 @@ pub fn klatt_resonator_response(
         .collect()
 }
 
-/// Applies Ht v3 LF glottal tension (`b = -Ht / 50`), Ho openness, and Hr singer's formant
-/// filtering with default 44.1 kHz / 2048-FFT parameters.
-pub fn pre_emphasis_base_tension(
-    wave: &[f32],
-    b: f64,
-    ho: f64,
-    hr: f64,
-) -> Result<Vec<f32>, DspError> {
-    pre_emphasis_base_tension_with_config(wave, b, ho, hr, &TensionConfig::default())
-}
-
-/// Applies Ht v3 LF glottal tension, Ho openness, and Hr singer's formant filtering
-/// using explicit STFT configuration.
-pub fn pre_emphasis_base_tension_with_config(
-    wave: &[f32],
-    b: f64,
-    ho: f64,
-    hr: f64,
-    config: &TensionConfig,
-) -> Result<Vec<f32>, DspError> {
-    config.validate()?;
-    if b.abs() < 1e-6 && ho.abs() < 1e-6 && hr.abs() < 1e-6 {
-        return Ok(wave.to_vec());
-    }
-    let original_length = wave.len();
-    if original_length == 0 {
-        return Ok(Vec::new());
-    }
-
-    let sr = config.sample_rate;
-    let n_fft = config.n_fft;
-    let hop_size = config.hop_size;
-    let win_size = config.win_size;
-
+#[inline]
+fn compute_tension_pad_len(original_length: usize, n_fft: usize, hop_size: usize) -> usize {
     let mut pad_length = (hop_size - (original_length % hop_size)) % hop_size;
     let min_stft_len = n_fft / 2 + 1;
     if original_length + pad_length < min_stft_len {
         pad_length = min_stft_len - original_length;
     }
-    let wave_padded = constant_pad_1d(wave, 0, pad_length, 0.0);
+    pad_length
+}
 
-    let window = periodic_hann_window(win_size);
-    let mut spec = stft_1d(
-        &wave_padded,
-        n_fft,
-        hop_size,
-        &window,
-        true,
-        PadMode::Reflect,
-    )?;
+#[inline]
+fn hf_band_range(freqs: &[f32]) -> (usize, usize) {
+    let start = freqs.partition_point(|&f| f < 1600.0);
+    let end = freqs.partition_point(|&f| f <= 9000.0);
+    (start, end)
+}
 
-    let (n_freq, n_frames) = spec.dim();
-    let df = sr as f64 / n_fft as f64;
-    let freqs: Vec<f32> = (0..n_freq).map(|k| (k as f64 * df) as f32).collect();
-    let ear_weight = middle_ear_loudness_weight(&freqs);
+struct VoicedEnergyStats {
+    p_vo: Vec<f64>,
+    eh_orig: Vec<f64>,
+    max_vo: f64,
+}
 
+struct TensionStftCtx<'a> {
+    config: &'a TensionConfig,
+    window: &'a [f32],
+    freqs: &'a [f32],
+}
+
+fn compute_voiced_stats(
+    spec_vo: &FramesSpectrum,
+    hf_start: usize,
+    hf_end: usize,
+) -> VoicedEnergyStats {
+    let n_frames = spec_vo.n_frames;
+    let mut p_vo = Vec::with_capacity(n_frames);
+    let mut eh_orig = Vec::with_capacity(n_frames);
+    let mut max_vo = 0.0_f64;
+
+    for t in 0..n_frames {
+        let frame = spec_vo.frame(t);
+        let mut s_vo = 0.0_f64;
+        for c in frame {
+            s_vo += (c.re * c.re + c.im * c.im) as f64;
+        }
+        let mut hf_o = 0.0_f64;
+        for c in &frame[hf_start..hf_end] {
+            hf_o += (c.re * c.re + c.im * c.im) as f64;
+        }
+        if s_vo > max_vo {
+            max_vo = s_vo;
+        }
+        p_vo.push(s_vo);
+        eh_orig.push(hf_o);
+    }
+
+    VoicedEnergyStats {
+        p_vo,
+        eh_orig,
+        max_vo,
+    }
+}
+
+fn apply_tension_on_frames(
+    spec: &mut FramesSpectrum,
+    wave_padded: &[f32],
+    original_length: usize,
+    b: f64,
+    ho: f64,
+    hr: f64,
+    ctx: &TensionStftCtx<'_>,
+) -> Result<Vec<f32>, DspError> {
+    let config = ctx.config;
+    let window = ctx.window;
+    let freqs = ctx.freqs;
+    let sr = config.sample_rate;
+    let n_fft = config.n_fft;
+    let hop_size = config.hop_size;
+    let n_freq = spec.n_freq;
+    let n_frames = spec.n_frames;
+
+    let ear_weight = middle_ear_loudness_weight(freqs);
     let b_clamped = b.clamp(-2.0, 2.0);
     let ho_clamped = ho.clamp(-100.0, 100.0);
     let hr_clamped = hr.clamp(-100.0, 100.0);
@@ -636,36 +663,37 @@ pub fn pre_emphasis_base_tension_with_config(
     // 1. Voiced-energy-weighted mean power spectrum and adaptive f0_src
     let mut frame_energy = vec![0.0_f64; n_frames];
     let mut total_energy = 0.0_f64;
-    for t in 0..n_frames {
+    for (t, fe_slot) in frame_energy.iter_mut().enumerate() {
         let mut fe = 0.0_f64;
-        for f in 0..n_freq {
-            let c = spec[[f, t]];
+        for c in spec.frame(t) {
             fe += (c.re * c.re + c.im * c.im) as f64;
         }
-        frame_energy[t] = fe;
+        *fe_slot = fe;
         total_energy += fe;
     }
     if total_energy <= 1e-12 {
         return Ok(vec![0.0_f32; original_length]);
     }
 
-    let mut mean_power = vec![0.0_f32; n_freq];
-    let denom_total = total_energy + 1e-12;
-    for f in 0..n_freq {
-        let mut acc = 0.0_f64;
-        for t in 0..n_frames {
-            let c = spec[[f, t]];
+    let mut mean_power_acc = vec![0.0_f64; n_freq];
+    for (t, &fe) in frame_energy.iter().enumerate() {
+        let row = spec.frame(t);
+        for (acc, &c) in mean_power_acc.iter_mut().zip(row.iter()) {
             let p = (c.re * c.re + c.im * c.im) as f64;
-            acc += p * frame_energy[t];
+            *acc += p * fe;
         }
-        mean_power[f] = (acc / denom_total) as f32;
     }
+    let denom_total = total_energy + 1e-12;
+    let mean_power: Vec<f32> = mean_power_acc
+        .into_iter()
+        .map(|acc| (acc / denom_total) as f32)
+        .collect();
 
     let f0_src = estimate_harmonic_f0(&mean_power, sr, n_fft)?;
 
     let mut log_gain = if b_clamped.abs() >= 1e-6 {
         let formant_prominence = extract_cepstral_formant_envelope(&mean_power, sr, n_fft)?;
-        let rd0 = estimate_baseline_rd(&mean_power, &freqs, f0_src, sr, n_fft);
+        let rd0 = estimate_baseline_rd(&mean_power, freqs, f0_src, sr, n_fft);
         let table = get_lf_glottal_table();
 
         let (rd_base, psi_target, tilt_scale) = if b_clamped < 0.0 {
@@ -685,8 +713,8 @@ pub fn pre_emphasis_base_tension_with_config(
         };
 
         let rd_target = interp_1d_linear(psi_target, &table.psi_grid, &table.rd_grid);
-        let log_g0 = interp_lf_log_spectrum(rd_base, f0_src, &freqs);
-        let log_gt = interp_lf_log_spectrum(rd_target, f0_src, &freqs);
+        let log_g0 = interp_lf_log_spectrum(rd_base, f0_src, freqs);
+        let log_gt = interp_lf_log_spectrum(rd_target, f0_src, freqs);
 
         let mut lg: Vec<f32> = log_g0
             .iter()
@@ -700,7 +728,7 @@ pub fn pre_emphasis_base_tension_with_config(
             })
             .collect();
 
-        lg = apply_formant_plateau_protection(&lg, &formant_prominence, &freqs, sr, n_fft, 0.50);
+        lg = apply_formant_plateau_protection(&lg, &formant_prominence, freqs, sr, n_fft, 0.50);
         lg
     } else {
         vec![0.0_f32; n_freq]
@@ -721,7 +749,7 @@ pub fn pre_emphasis_base_tension_with_config(
 
     // 5c. Singer's Formant (Hr): 3200 Hz (B = 1000 Hz) additive-magnitude bell/notch
     if hr_clamped.abs() >= 1e-6 {
-        let h_res_r = klatt_resonator_response(&freqs, 3200.0, 1000.0, sr);
+        let h_res_r = klatt_resonator_response(freqs, 3200.0, 1000.0, sr);
         let beta_hr = if hr_clamped > 0.0 {
             0.1 * hr_clamped
         } else {
@@ -751,21 +779,15 @@ pub fn pre_emphasis_base_tension_with_config(
         })
         .collect();
 
-    for f in 0..n_freq {
-        let gf = gain[f];
-        for t in 0..n_frames {
-            spec[[f, t]] *= gf;
+    for t in 0..n_frames {
+        let row = spec.frame_mut(t);
+        for (c, &gf) in row.iter_mut().zip(gain.iter()) {
+            *c *= gf;
         }
     }
 
-    let mut filtered_wave = istft_1d(
-        spec.view(),
-        n_fft,
-        hop_size,
-        &window,
-        true,
-        Some(wave_padded.len()),
-    )?;
+    let mut filtered_wave =
+        istft_1d_frames(spec, n_fft, hop_size, window, true, Some(wave_padded.len()))?;
 
     // 7. Psychoacoustic middle-ear loudness preservation W(f)
     let mut l_orig = 0.0_f64;
@@ -818,120 +840,55 @@ pub fn pre_emphasis_base_tension_with_config(
     }
 }
 
-/// Voiced-only high-frequency (> 1.6 kHz) aspiration noise coupling with 5-frame boundary
-/// anchor stabilization, keeping unvoiced consonants and silence bit-identical.
-pub fn couple_aperiodic_to_tension(
+fn couple_with_voiced_stats(
     aperiodic_wave: &[f32],
-    orig_voiced_wave: &[f32],
     mod_voiced_wave: &[f32],
-    b: f64,
-    ho: f64,
-    hr: f64,
+    vo_stats: &VoicedEnergyStats,
+    pad_len: usize,
+    hf_start: usize,
+    hf_end: usize,
+    ctx: &TensionStftCtx<'_>,
 ) -> Result<Vec<f32>, DspError> {
-    couple_aperiodic_to_tension_with_config(
-        aperiodic_wave,
-        orig_voiced_wave,
-        mod_voiced_wave,
-        b,
-        ho,
-        hr,
-        &TensionConfig::default(),
-    )
-}
-
-/// Voiced-only aspiration coupling with explicit STFT configuration.
-pub fn couple_aperiodic_to_tension_with_config(
-    aperiodic_wave: &[f32],
-    orig_voiced_wave: &[f32],
-    mod_voiced_wave: &[f32],
-    b: f64,
-    ho: f64,
-    hr: f64,
-    config: &TensionConfig,
-) -> Result<Vec<f32>, DspError> {
-    config.validate()?;
-    let n_samples = aperiodic_wave.len();
-    if orig_voiced_wave.len() != n_samples || mod_voiced_wave.len() != n_samples {
-        return Err(DspError::ShapeMismatch {
-            expected: format!("all waveforms len == {n_samples}"),
-            actual: format!(
-                "orig={}, mod={}",
-                orig_voiced_wave.len(),
-                mod_voiced_wave.len()
-            ),
-        });
-    }
-    if n_samples == 0 || (b.abs() < 1e-6 && ho.abs() < 1e-6 && hr.abs() < 1e-6) {
+    if vo_stats.max_vo < 1e-10 {
         return Ok(aperiodic_wave.to_vec());
     }
 
-    let sr = config.sample_rate;
+    let config = ctx.config;
+    let window = ctx.window;
+    let freqs = ctx.freqs;
+    let n_samples = aperiodic_wave.len();
     let n_fft = config.n_fft;
     let hop_size = config.hop_size;
-    let win_size = config.win_size;
-
-    let min_stft_len = n_fft / 2 + 1;
-    let mut pad_len = (hop_size - (n_samples % hop_size)) % hop_size;
-    if n_samples + pad_len < min_stft_len {
-        pad_len = min_stft_len - n_samples;
-    }
 
     let ap_pad = constant_pad_1d(aperiodic_wave, 0, pad_len, 0.0);
-    let vo_pad = constant_pad_1d(orig_voiced_wave, 0, pad_len, 0.0);
     let vm_pad = constant_pad_1d(mod_voiced_wave, 0, pad_len, 0.0);
 
-    let window = periodic_hann_window(win_size);
-    let mut spec_ap = stft_1d(&ap_pad, n_fft, hop_size, &window, true, PadMode::Reflect)?;
-    let spec_vo = stft_1d(&vo_pad, n_fft, hop_size, &window, true, PadMode::Reflect)?;
-    let spec_vm = stft_1d(&vm_pad, n_fft, hop_size, &window, true, PadMode::Reflect)?;
+    let mut spec_ap = stft_1d_frames(&ap_pad, n_fft, hop_size, window, true, PadMode::Reflect)?;
+    let spec_vm = stft_1d_frames(&vm_pad, n_fft, hop_size, window, true, PadMode::Reflect)?;
 
-    let (n_freq, n_frames) = spec_ap.dim();
-    let df = sr as f64 / n_fft as f64;
-    let freqs: Vec<f32> = (0..n_freq).map(|k| (k as f64 * df) as f32).collect();
-
+    let n_frames = spec_ap.n_frames;
     let mut p_ap = vec![0.0_f64; n_frames];
-    let mut p_vo = vec![0.0_f64; n_frames];
-    let mut eh_orig = vec![0.0_f64; n_frames];
     let mut eh_mod = vec![0.0_f64; n_frames];
-    let mut max_vo = 0.0_f64;
 
     for t in 0..n_frames {
         let mut s_ap = 0.0_f64;
-        let mut s_vo = 0.0_f64;
-        let mut hf_o = 0.0_f64;
+        for c in spec_ap.frame(t) {
+            s_ap += (c.re * c.re + c.im * c.im) as f64;
+        }
         let mut hf_m = 0.0_f64;
-        for f in 0..n_freq {
-            let ca = spec_ap[[f, t]];
-            let co = spec_vo[[f, t]];
-            let cm = spec_vm[[f, t]];
-            let pa = (ca.re * ca.re + ca.im * ca.im) as f64;
-            let po = (co.re * co.re + co.im * co.im) as f64;
-            let pm = (cm.re * cm.re + cm.im * cm.im) as f64;
-            s_ap += pa;
-            s_vo += po;
-            if freqs[f] >= 1600.0 && freqs[f] <= 9000.0 {
-                hf_o += po;
-                hf_m += pm;
-            }
+        for c in &spec_vm.frame(t)[hf_start..hf_end] {
+            hf_m += (c.re * c.re + c.im * c.im) as f64;
         }
         p_ap[t] = s_ap;
-        p_vo[t] = s_vo;
-        eh_orig[t] = hf_o;
         eh_mod[t] = hf_m;
-        if s_vo > max_vo {
-            max_vo = s_vo;
-        }
-    }
-
-    if max_vo < 1e-10 {
-        return Ok(aperiodic_wave.to_vec());
     }
 
     let mut voiced_bool = vec![false; n_frames];
     let mut any_voiced = false;
     for t in 0..n_frames {
-        let harm_ratio = p_vo[t] / (p_vo[t] + p_ap[t] + 1e-12);
-        let rel_level = p_vo[t] / (max_vo + 1e-12);
+        let p_vo_t = vo_stats.p_vo[t];
+        let harm_ratio = p_vo_t / (p_vo_t + p_ap[t] + 1e-12);
+        let rel_level = p_vo_t / (vo_stats.max_vo + 1e-12);
         if rel_level > 3e-4 && harm_ratio > 0.55 {
             voiced_bool[t] = true;
             any_voiced = true;
@@ -942,7 +899,7 @@ pub fn couple_aperiodic_to_tension_with_config(
     }
 
     let delta_l_frames: Vec<f32> = (0..n_frames)
-        .map(|t| (0.5 * ((eh_mod[t] + 1e-12) / (eh_orig[t] + 1e-12)).ln()) as f32)
+        .map(|t| (0.5 * ((eh_mod[t] + 1e-12) / (vo_stats.eh_orig[t] + 1e-12)).ln()) as f32)
         .collect();
 
     // 5-frame onset/offset boundary anchor stabilization on contiguous voiced intervals
@@ -1016,22 +973,17 @@ pub fn couple_aperiodic_to_tension_with_config(
         })
         .collect();
 
-    for f in 0..n_freq {
-        let fp = freq_profile[f];
-        for t in 0..n_frames {
-            let g = (fp * coupled_log[t]).exp();
-            spec_ap[[f, t]] *= g;
+    for (t, &cl_t) in coupled_log.iter().enumerate() {
+        if cl_t == 0.0 {
+            continue;
+        }
+        let row = spec_ap.frame_mut(t);
+        for (c, &fp) in row.iter_mut().zip(freq_profile.iter()) {
+            *c *= (fp * cl_t).exp();
         }
     }
 
-    let ap_filtered = istft_1d(
-        spec_ap.view(),
-        n_fft,
-        hop_size,
-        &window,
-        true,
-        Some(ap_pad.len()),
-    )?;
+    let ap_filtered = istft_1d_frames(&spec_ap, n_fft, hop_size, window, true, Some(ap_pad.len()))?;
 
     // Interpolate voiced_weight to sample level (left=0, right=0) so unvoiced consonants are bit-identical
     let mut ap_out = Vec::with_capacity(n_samples);
@@ -1059,4 +1011,243 @@ pub fn couple_aperiodic_to_tension_with_config(
     }
 
     Ok(ap_out)
+}
+
+/// Applies Ht v3 LF glottal tension (`b = -Ht / 50`), Ho openness, and Hr singer's formant
+/// filtering with default 44.1 kHz / 2048-FFT parameters.
+pub fn pre_emphasis_base_tension(
+    wave: &[f32],
+    b: f64,
+    ho: f64,
+    hr: f64,
+) -> Result<Vec<f32>, DspError> {
+    pre_emphasis_base_tension_with_config(wave, b, ho, hr, &TensionConfig::default())
+}
+
+/// Applies Ht v3 LF glottal tension, Ho openness, and Hr singer's formant filtering
+/// using explicit STFT configuration.
+pub fn pre_emphasis_base_tension_with_config(
+    wave: &[f32],
+    b: f64,
+    ho: f64,
+    hr: f64,
+    config: &TensionConfig,
+) -> Result<Vec<f32>, DspError> {
+    config.validate()?;
+    if b.abs() < 1e-6 && ho.abs() < 1e-6 && hr.abs() < 1e-6 {
+        return Ok(wave.to_vec());
+    }
+    let original_length = wave.len();
+    if original_length == 0 {
+        return Ok(Vec::new());
+    }
+
+    let n_fft = config.n_fft;
+    let hop_size = config.hop_size;
+    let pad_length = compute_tension_pad_len(original_length, n_fft, hop_size);
+    let wave_padded = constant_pad_1d(wave, 0, pad_length, 0.0);
+
+    let window = periodic_hann_window(config.win_size);
+    let mut spec = stft_1d_frames(
+        &wave_padded,
+        n_fft,
+        hop_size,
+        &window,
+        true,
+        PadMode::Reflect,
+    )?;
+
+    let df = config.sample_rate as f64 / n_fft as f64;
+    let freqs: Vec<f32> = (0..spec.n_freq).map(|k| (k as f64 * df) as f32).collect();
+    let ctx = TensionStftCtx {
+        config,
+        window: &window,
+        freqs: &freqs,
+    };
+
+    apply_tension_on_frames(&mut spec, &wave_padded, original_length, b, ho, hr, &ctx)
+}
+
+/// Voiced-only high-frequency (> 1.6 kHz) aspiration noise coupling with 5-frame boundary
+/// anchor stabilization, keeping unvoiced consonants and silence bit-identical.
+pub fn couple_aperiodic_to_tension(
+    aperiodic_wave: &[f32],
+    orig_voiced_wave: &[f32],
+    mod_voiced_wave: &[f32],
+    b: f64,
+    ho: f64,
+    hr: f64,
+) -> Result<Vec<f32>, DspError> {
+    couple_aperiodic_to_tension_with_config(
+        aperiodic_wave,
+        orig_voiced_wave,
+        mod_voiced_wave,
+        b,
+        ho,
+        hr,
+        &TensionConfig::default(),
+    )
+}
+
+/// Voiced-only aspiration coupling with explicit STFT configuration.
+pub fn couple_aperiodic_to_tension_with_config(
+    aperiodic_wave: &[f32],
+    orig_voiced_wave: &[f32],
+    mod_voiced_wave: &[f32],
+    b: f64,
+    ho: f64,
+    hr: f64,
+    config: &TensionConfig,
+) -> Result<Vec<f32>, DspError> {
+    config.validate()?;
+    let n_samples = aperiodic_wave.len();
+    if orig_voiced_wave.len() != n_samples || mod_voiced_wave.len() != n_samples {
+        return Err(DspError::ShapeMismatch {
+            expected: format!("all waveforms len == {n_samples}"),
+            actual: format!(
+                "orig={}, mod={}",
+                orig_voiced_wave.len(),
+                mod_voiced_wave.len()
+            ),
+        });
+    }
+    if n_samples == 0 || (b.abs() < 1e-6 && ho.abs() < 1e-6 && hr.abs() < 1e-6) {
+        return Ok(aperiodic_wave.to_vec());
+    }
+
+    let n_fft = config.n_fft;
+    let hop_size = config.hop_size;
+    let pad_len = compute_tension_pad_len(n_samples, n_fft, hop_size);
+    let vo_pad = constant_pad_1d(orig_voiced_wave, 0, pad_len, 0.0);
+
+    let window = periodic_hann_window(config.win_size);
+    let spec_vo = stft_1d_frames(&vo_pad, n_fft, hop_size, &window, true, PadMode::Reflect)?;
+    let df = config.sample_rate as f64 / n_fft as f64;
+    let freqs: Vec<f32> = (0..spec_vo.n_freq)
+        .map(|k| (k as f64 * df) as f32)
+        .collect();
+    let (hf_start, hf_end) = hf_band_range(&freqs);
+    let vo_stats = compute_voiced_stats(&spec_vo, hf_start, hf_end);
+    drop(spec_vo);
+    let ctx = TensionStftCtx {
+        config,
+        window: &window,
+        freqs: &freqs,
+    };
+
+    couple_with_voiced_stats(
+        aperiodic_wave,
+        mod_voiced_wave,
+        &vo_stats,
+        pad_len,
+        hf_start,
+        hf_end,
+        &ctx,
+    )
+}
+
+/// Combined Ht v3 / Ho / Hr harmonic tension and voiced-only aspiration coupling
+/// with default configuration, eliminating the redundant STFT of `harmonic_wave`.
+pub fn apply_tension_and_coupling(
+    harmonic_wave: &[f32],
+    aperiodic_wave: &[f32],
+    b: f64,
+    ho: f64,
+    hr: f64,
+    voicing_nonzero: bool,
+    breath_nonzero: bool,
+) -> Result<(Vec<f32>, Vec<f32>), DspError> {
+    apply_tension_and_coupling_with_config(
+        harmonic_wave,
+        aperiodic_wave,
+        b,
+        ho,
+        hr,
+        voicing_nonzero,
+        breath_nonzero,
+        &TensionConfig::default(),
+    )
+}
+
+/// Combined Ht v3 / Ho / Hr harmonic tension and voiced-only aspiration coupling:
+/// reuses the already-computed `harmonic_wave` STFT frame energies (`p_vo`, `eh_orig`, `max_vo`)
+/// directly in the coupling step, eliminating 1 full-length STFT losslessly.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_tension_and_coupling_with_config(
+    harmonic_wave: &[f32],
+    aperiodic_wave: &[f32],
+    b: f64,
+    ho: f64,
+    hr: f64,
+    voicing_nonzero: bool,
+    breath_nonzero: bool,
+    config: &TensionConfig,
+) -> Result<(Vec<f32>, Vec<f32>), DspError> {
+    config.validate()?;
+    let n_samples = harmonic_wave.len();
+    if aperiodic_wave.len() != n_samples {
+        return Err(DspError::ShapeMismatch {
+            expected: format!("aperiodic_wave.len() == {n_samples}"),
+            actual: format!("aperiodic_wave.len() == {}", aperiodic_wave.len()),
+        });
+    }
+    if n_samples == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    if !voicing_nonzero && !breath_nonzero {
+        return Ok((vec![0.0_f32; n_samples], aperiodic_wave.to_vec()));
+    }
+    if b.abs() < 1e-6 && ho.abs() < 1e-6 && hr.abs() < 1e-6 {
+        return Ok((harmonic_wave.to_vec(), aperiodic_wave.to_vec()));
+    }
+
+    let n_fft = config.n_fft;
+    let hop_size = config.hop_size;
+    let pad_len = compute_tension_pad_len(n_samples, n_fft, hop_size);
+    let wave_padded = constant_pad_1d(harmonic_wave, 0, pad_len, 0.0);
+    let window = periodic_hann_window(config.win_size);
+
+    let mut spec_vo = stft_1d_frames(
+        &wave_padded,
+        n_fft,
+        hop_size,
+        &window,
+        true,
+        PadMode::Reflect,
+    )?;
+    let df = config.sample_rate as f64 / n_fft as f64;
+    let freqs: Vec<f32> = (0..spec_vo.n_freq)
+        .map(|k| (k as f64 * df) as f32)
+        .collect();
+    let (hf_start, hf_end) = hf_band_range(&freqs);
+
+    let vo_stats = if breath_nonzero {
+        Some(compute_voiced_stats(&spec_vo, hf_start, hf_end))
+    } else {
+        None
+    };
+
+    let ctx = TensionStftCtx {
+        config,
+        window: &window,
+        freqs: &freqs,
+    };
+
+    let seg_mod = apply_tension_on_frames(&mut spec_vo, &wave_padded, n_samples, b, ho, hr, &ctx)?;
+    drop(spec_vo);
+
+    let ap_mod = match vo_stats {
+        Some(stats) => couple_with_voiced_stats(
+            aperiodic_wave,
+            &seg_mod,
+            &stats,
+            pad_len,
+            hf_start,
+            hf_end,
+            &ctx,
+        )?,
+        None => aperiodic_wave.to_vec(),
+    };
+
+    Ok((seg_mod, ap_mod))
 }

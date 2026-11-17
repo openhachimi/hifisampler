@@ -31,6 +31,7 @@ pub const ORT_PARALLEL: c_int = 1;
 
 pub const ORT_ENABLE_ALL: c_int = 99;
 
+pub const ORT_DEVICE_ALLOCATOR: c_int = 0;
 pub const ORT_ARENA_ALLOCATOR: c_int = 1;
 pub const ORT_MEM_TYPE_DEFAULT: c_int = 0;
 

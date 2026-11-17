@@ -8,7 +8,7 @@ use crate::ffi::{
     f16_bits_to_f32, f32_to_f16_bits, OrtAllocator, OrtMemoryInfo, OrtSession as RawOrtSession,
     OrtSessionOptions, OrtTensorTypeAndShapeInfo, OrtTypeInfo, OrtValue,
     ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16,
-    ORT_ARENA_ALLOCATOR, ORT_ENABLE_ALL, ORT_MEM_TYPE_DEFAULT, ORT_SEQUENTIAL,
+    ORT_DEVICE_ALLOCATOR, ORT_ENABLE_ALL, ORT_MEM_TYPE_DEFAULT, ORT_SEQUENTIAL,
 };
 use crate::runtime::{status_to_error, OrtRuntime};
 
@@ -150,6 +150,17 @@ impl OrtSession {
         inputs: &[(&str, &[i64], &[f32])],
         output_names: &[&str],
     ) -> Result<Vec<TensorOutput>, OnnxError> {
+        self.run_f32_timed(inputs, output_names)
+            .map(|(outputs, _)| outputs)
+    }
+
+    /// Run `f32` inference like [`Self::run_f32`], also returning `gpu_wait_ms` spent waiting
+    /// on the shared runtime GPU mutex (`0.0` on CPU).
+    pub fn run_f32_timed(
+        &self,
+        inputs: &[(&str, &[i64], &[f32])],
+        output_names: &[&str],
+    ) -> Result<(Vec<TensorOutput>, f64), OnnxError> {
         if inputs.is_empty() {
             return Err(OnnxError::InvalidInput {
                 message: "at least one input tensor is required".to_string(),
@@ -163,14 +174,8 @@ impl OrtSession {
 
         let api = self.runtime.api();
 
-        #[allow(dead_code)]
-        enum BackingBuffer {
-            F32(Vec<f32>),
-            F16(Vec<u16>),
-        }
-
         let mut c_input_names = Vec::with_capacity(inputs.len());
-        let mut backing_buffers = Vec::with_capacity(inputs.len());
+        let mut f16_buffers: Vec<Vec<u16>> = Vec::new();
         let mut input_guards = Vec::with_capacity(inputs.len());
 
         for &(name, dims, data) in inputs {
@@ -194,29 +199,19 @@ impl OrtSession {
                 .map(|m| m.elem_type)
                 .unwrap_or(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
 
-            let (buf, elem_type, byte_len, ptr) =
+            let (elem_type, byte_len, ptr) =
                 if meta_elem_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 {
                     let mut f16_vec: Vec<u16> = data.iter().copied().map(f32_to_f16_bits).collect();
                     let byte_len = f16_vec.len() * std::mem::size_of::<u16>();
                     let ptr = f16_vec.as_mut_ptr() as *mut c_void;
-                    (
-                        BackingBuffer::F16(f16_vec),
-                        ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16,
-                        byte_len,
-                        ptr,
-                    )
+                    f16_buffers.push(f16_vec);
+                    (ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16, byte_len, ptr)
                 } else {
-                    let mut f32_vec = data.to_vec();
-                    let byte_len = f32_vec.len() * std::mem::size_of::<f32>();
-                    let ptr = f32_vec.as_mut_ptr() as *mut c_void;
-                    (
-                        BackingBuffer::F32(f32_vec),
-                        ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
-                        byte_len,
-                        ptr,
-                    )
+                    // Safe: `inputs` outlives `api.run()` and `input_guards` (dropped right after `run`).
+                    let byte_len = std::mem::size_of_val(data);
+                    let ptr = data.as_ptr() as *mut c_void;
+                    (ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, byte_len, ptr)
                 };
-            backing_buffers.push(buf);
 
             let mut ort_val: *mut OrtValue = std::ptr::null_mut();
             let st = unsafe {
@@ -254,11 +249,13 @@ impl OrtSession {
             c_output_names.iter().map(|s| s.as_ptr()).collect();
         let mut raw_outputs: Vec<*mut OrtValue> = vec![std::ptr::null_mut(); output_names.len()];
 
-        {
-            let _gpu_guard = if self.execution_provider.is_gpu_ep() {
-                Some(self.runtime.lock_gpu())
+        let gpu_wait_ms = {
+            let (gpu_wait_ms, _gpu_guard) = if self.execution_provider.is_gpu_ep() {
+                let wait_start = std::time::Instant::now();
+                let guard = self.runtime.lock_gpu();
+                (wait_start.elapsed().as_secs_f64() * 1000.0, Some(guard))
             } else {
-                None
+                (0.0, None)
             };
             let st = unsafe {
                 api.run(
@@ -281,10 +278,11 @@ impl OrtSession {
                 }
                 return Err(status_to_error(api, st));
             }
-        }
-        // Keep backing_buffers alive through `api.run` above.
-        drop(backing_buffers);
+            gpu_wait_ms
+        };
+        // Release OrtValue wrappers before dropping temporary FP16 backing buffers.
         drop(input_guards);
+        drop(f16_buffers);
 
         let output_guards: Vec<OrtValueGuard> = raw_outputs
             .into_iter()
@@ -361,7 +359,7 @@ impl OrtSession {
             results.push((dims, values));
         }
 
-        Ok(results)
+        Ok((results, gpu_wait_ms))
     }
 }
 
@@ -391,7 +389,7 @@ fn finish_session(
     let api = runtime.api();
     let mut mem_info: *mut OrtMemoryInfo = std::ptr::null_mut();
     let st = unsafe {
-        api.create_cpu_memory_info(ORT_ARENA_ALLOCATOR, ORT_MEM_TYPE_DEFAULT, &mut mem_info)
+        api.create_cpu_memory_info(ORT_DEVICE_ALLOCATOR, ORT_MEM_TYPE_DEFAULT, &mut mem_info)
     };
     if !st.is_null() {
         unsafe { api.release_session(session) };
@@ -682,6 +680,19 @@ fn try_create_session(
         }
     }
 
+    if let Some(st) = unsafe {
+        api.add_session_config_entry(
+            so_guard.opts,
+            c"session.intra_op.allow_spinning".as_ptr(),
+            c"0".as_ptr(),
+        )
+    } {
+        if !st.is_null() {
+            let err = status_to_error(api, st);
+            log::debug!("session.intra_op.allow_spinning=0 ignored: {}", err);
+        }
+    }
+
     append_execution_provider(runtime, so_guard.opts, config, provider)?;
 
     create_session_checked(api, runtime, model_path, so_guard.opts)
@@ -739,18 +750,6 @@ fn append_execution_provider(
     match provider {
         ExecutionProvider::Cpu => {
             let _ = config;
-            // CPU is ORT's default fallback provider; also attempt arena_extend_strategy config entry if supported.
-            if let Ok(key) = CString::new("ep.cpu.arena_extend_strategy") {
-                if let Ok(val) = CString::new("kSameAsRequested") {
-                    if let Some(st) =
-                        unsafe { api.add_session_config_entry(so, key.as_ptr(), val.as_ptr()) }
-                    {
-                        if !st.is_null() {
-                            unsafe { api.release_status(st) };
-                        }
-                    }
-                }
-            }
             Ok(())
         }
         ExecutionProvider::DirectMl => {

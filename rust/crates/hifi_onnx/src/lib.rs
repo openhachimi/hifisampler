@@ -108,4 +108,29 @@ mod tests {
         assert!(f16_bits_to_f32(f32_to_f16_bits(f32::INFINITY)).is_infinite());
         assert!(f16_bits_to_f32(f32_to_f16_bits(f32::NAN)).is_nan());
     }
+
+    #[test]
+    fn session_config_defaults_and_uniform_worker_threads() {
+        let cfg = SessionConfig::default();
+        assert!(!cfg.enable_cpu_mem_arena);
+
+        let cfg_w1 = SessionConfig {
+            workers_hint: 1,
+            ..SessionConfig::default()
+        };
+        let cfg_w2 = SessionConfig {
+            workers_hint: 2,
+            ..SessionConfig::default()
+        };
+
+        // DirectML and CPU share identical `(physical / workers_hint).max(1)` scaling.
+        assert_eq!(
+            cfg_w1.effective_intra_op_threads(&ExecutionProvider::DirectMl),
+            cfg_w1.effective_intra_op_threads(&ExecutionProvider::Cpu)
+        );
+        assert_eq!(
+            cfg_w2.effective_intra_op_threads(&ExecutionProvider::DirectMl),
+            cfg_w2.effective_intra_op_threads(&ExecutionProvider::Cpu)
+        );
+    }
 }

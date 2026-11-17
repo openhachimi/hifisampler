@@ -22,6 +22,7 @@ pub use pitch::{
     midi_to_hz, resample_mel_and_pitch, Akima1DInterpolator, ResampleTimeParams, ResampledFeatures,
 };
 pub use tension::{
+    apply_tension_and_coupling, apply_tension_and_coupling_with_config,
     couple_aperiodic_to_tension, couple_aperiodic_to_tension_with_config,
     pre_emphasis_base_tension, pre_emphasis_base_tension_with_config, TensionConfig,
 };

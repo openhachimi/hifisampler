@@ -116,6 +116,10 @@ impl ResampleJob {
 }
 
 /// Abstract ONNX inference sessions for HN-SEP and PC-NSF-HiFiGAN vocoder.
+///
+/// Implementers MUST guarantee internal thread-safety and GPU serialization (for example via
+/// `OrtRuntime::lock_gpu()`), allowing multiple HTTP workers to invoke DSP and ONNX overlap
+/// concurrently without an outer mutex in `RealResampleEngine`.
 pub trait OnnxRunner: Send + Sync {
     fn hnsep_uses_gpu(&self) -> bool;
     fn vocoder_uses_gpu(&self) -> bool;

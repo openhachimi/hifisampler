@@ -481,15 +481,17 @@ fn test_stress_concurrent_writes_and_reads() {
         let dir_clone = Arc::clone(&dir_path);
         handles.push(thread::spawn(move || {
             let cache_path = dir_clone.join(format!("thread_{}.hifi.bin", tid));
-            let mel = Array2::from_shape_vec((128, 16), vec![tid as f32; 128 * 16]).unwrap();
+            let val = (tid + 1) as f32;
+            let scale = (tid + 1) as f64;
+            let mel = Array2::from_shape_vec((128, 16), vec![val; 128 * 16]).unwrap();
 
             // Save cache
-            save_cache(&cache_path, &mel, tid as f64).unwrap();
+            save_cache(&cache_path, &mel, scale).unwrap();
 
             // Read cache
             let loaded = load_cache(&cache_path, None).unwrap().unwrap();
-            assert_eq!(loaded.scale, tid as f64);
-            assert_eq!(loaded.mel_origin[[0, 0]], tid as f32);
+            assert_eq!(loaded.scale, scale);
+            assert_eq!(loaded.mel_origin[[0, 0]], val);
         }));
     }
 

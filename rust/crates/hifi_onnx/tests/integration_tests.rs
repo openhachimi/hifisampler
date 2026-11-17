@@ -110,14 +110,25 @@ fn vocoder_cpu_inference_and_dynamic_shapes() {
         assert!(wav.iter().all(|x| x.is_finite()));
     }
 
-    // Also verify `[128, T]` helper matching `hifi_dsp` layout.
+    // Also verify `[128, T]` helper matching `hifi_dsp` layout and timed CPU zero wait.
     let mel_mels_by_frames = Array2::<f32>::from_elem((128, 24), -5.0);
     let f0_slice = vec![330.0f32; 24];
-    let wav2 = vocoder
-        .synthesize_mels_by_frames(mel_mels_by_frames.view(), &f0_slice)
-        .expect("synthesize_mels_by_frames must succeed");
+    let (wav2, wait_ms) = vocoder
+        .synthesize_mels_by_frames_timed(mel_mels_by_frames.view(), &f0_slice)
+        .expect("synthesize_mels_by_frames_timed must succeed");
     assert_eq!(wav2.len(), 24 * 512);
     assert!(wav2.iter().all(|x| x.is_finite()));
+    assert_eq!(wait_ms, 0.0);
+
+    // Ensure opt-in `enable_cpu_mem_arena = true` toggle remains functional.
+    let mut arena_cfg = SessionConfig::with_device(DevicePreference::Cpu);
+    arena_cfg.enable_cpu_mem_arena = true;
+    let arena_vocoder = VocoderSession::load_with_config(&vocoder_path, &arena_cfg)
+        .expect("Vocoder with explicit enable_cpu_mem_arena=true must succeed");
+    let wav_arena = arena_vocoder
+        .synthesize_mels_by_frames(mel_mels_by_frames.view(), &f0_slice)
+        .unwrap();
+    assert_eq!(wav_arena.len(), wav2.len());
 }
 
 #[test]
@@ -302,14 +313,16 @@ fn concurrent_gpu_or_cpu_sessions_are_thread_safe() {
         let h = Arc::clone(&hnsep);
         handles.push(thread::spawn(move || {
             let spec = Array4::<f32>::from_elem((1, 2, 1025, 32), 0.05 * (i + 1) as f32);
-            let mask = h.forward(spec.view()).unwrap();
+            let (mask, h_wait_ms) = h.forward_timed(spec.view()).unwrap();
             assert!(mask.iter().all(|x| x.is_finite()));
+            assert!(h_wait_ms >= 0.0 && h_wait_ms.is_finite());
 
             let mel = Array3::<f32>::from_elem((1, 24, 128), -5.0);
             let f0 = Array2::<f32>::from_elem((1, 24), 220.0 + i as f32 * 20.0);
-            let wav = v.synthesize(mel.view(), f0.view()).unwrap();
+            let (wav, v_wait_ms) = v.synthesize_timed(mel.view(), f0.view()).unwrap();
             assert_eq!(wav.len(), 24 * 512);
             assert!(wav.iter().all(|x| x.is_finite()));
+            assert!(v_wait_ms >= 0.0 && v_wait_ms.is_finite());
         }));
     }
     for handle in handles {

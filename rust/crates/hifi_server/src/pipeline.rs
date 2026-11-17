@@ -11,8 +11,7 @@ use hifi_core::audio::{
 use hifi_core::cache::{CacheManager, CachedFeatures};
 use hifi_core::utau::{pitch_string_to_cents, UtauFlags};
 use hifi_dsp::{
-    couple_aperiodic_to_tension_with_config, dynamic_range_compression_default,
-    pre_emphasis_base_tension_with_config, resample_mel_and_pitch, HnsepStft, MelConfig,
+    apply_tension_and_coupling_with_config, resample_mel_and_pitch, HnsepStft, MelConfig,
     MelSpectrogram, ResampleTimeParams, TensionConfig,
 };
 use hifi_effects::{
@@ -20,8 +19,9 @@ use hifi_effects::{
     apply_volume_and_peak_limit, peak_abs, prepare_vocal_fry_excitation, VocalFryInput,
 };
 use hifi_lufs::loudness_norm;
+use std::borrow::Cow;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Full synthesis pipeline orchestrator backed by `hifi_core`, `hifi_lufs`, `hifi_dsp`,
@@ -33,7 +33,6 @@ pub struct RealResampleEngine {
     pub mel_analyzer: MelSpectrogram,
     pub hnsep_stft: HnsepStft,
     pub onnx: Arc<dyn OnnxRunner>,
-    pub gpu_infer_lock: Mutex<()>,
 }
 
 impl RealResampleEngine {
@@ -60,7 +59,6 @@ impl RealResampleEngine {
             mel_analyzer,
             hnsep_stft,
             onnx,
-            gpu_infer_lock: Mutex::new(()),
         })
     }
 
@@ -68,7 +66,7 @@ impl RealResampleEngine {
         flags.ht() != 0 || flags.ho() != 0 || flags.hr() != 0 || flags.hb() != flags.hv()
     }
 
-    fn read_wave_cached(&self, in_file: &Path) -> Result<Vec<f32>, ResampleError> {
+    fn read_wave_cached(&self, in_file: &Path) -> Result<Arc<AudioBuffer>, ResampleError> {
         let resolved = resolve_audio_path(in_file).map_err(|e| match e {
             AudioError::FileNotFound(_) => {
                 ResampleError::InputNotFound(in_file.display().to_string())
@@ -76,32 +74,35 @@ impl RealResampleEngine {
             other => ResampleError::Internal(other.to_string()),
         })?;
 
-        if let Some(cached) = self.cache_manager.load_wav_cache(&resolved) {
-            return Ok(cached.samples);
+        if let Some(cached) = self.cache_manager.load_wav_cache_arc(&resolved) {
+            return Ok(cached);
         }
 
-        let buf = read_wav_with_target_rate(&resolved, Some(self.config.sample_rate)).map_err(
-            |e| match e {
-                AudioError::FileNotFound(_) => {
-                    ResampleError::InputNotFound(resolved.display().to_string())
-                }
-                other => ResampleError::Internal(other.to_string()),
-            },
-        )?;
-        self.cache_manager.save_wav_cache(&resolved, &buf);
-        Ok(buf.samples)
+        let buf = Arc::new(
+            read_wav_with_target_rate(&resolved, Some(self.config.sample_rate)).map_err(
+                |e| match e {
+                    AudioError::FileNotFound(_) => {
+                        ResampleError::InputNotFound(resolved.display().to_string())
+                    }
+                    other => ResampleError::Internal(other.to_string()),
+                },
+            )?,
+        );
+        self.cache_manager
+            .save_wav_cache_arc(&resolved, Arc::clone(&buf));
+        Ok(buf)
     }
 
     fn get_features(
         &self,
         job: &ResampleJob,
-    ) -> Result<(CachedFeatures, bool, bool, usize), ResampleError> {
+    ) -> Result<(Arc<CachedFeatures>, bool, bool, usize), ResampleError> {
         let features_path = build_feature_cache_path(&job.in_file, &job.flags);
         let force_generate = job.flags.force_generate();
         let lock = self.cache_manager.get_lock(&features_path);
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
 
-        if let Some(hit) = self.cache_manager.load_features_cache(
+        if let Some(hit) = self.cache_manager.load_features_cache_arc(
             &features_path,
             force_generate,
             Some(&job.in_file),
@@ -117,8 +118,10 @@ impl RealResampleEngine {
                 .unwrap_or("cache")
         );
 
-        let mut wave = self.read_wave_cached(&job.in_file)?;
-        let input_samples = wave.len();
+        let wave_buf = self.read_wave_cached(&job.in_file)?;
+        let raw_wave: &[f32] = &wave_buf.samples;
+        let input_samples = raw_wave.len();
+        let mut wave: Cow<'_, [f32]> = Cow::Borrowed(raw_wave);
 
         let breath = job.flags.hb();
         let voicing = job.flags.hv();
@@ -131,40 +134,32 @@ impl RealResampleEngine {
         if Self::needs_hnsep(&job.flags) {
             let hnsep_path = hnsep_disk_cache_path(&job.in_file);
             let hlock = self.cache_manager.get_lock(&hnsep_path);
-            let harmonic = {
+            let harmonic: Arc<Vec<f32>> = {
                 let _hguard = hlock.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(cached_h) =
                     self.hnsep_cache
                         .load(&hnsep_path, &job.in_file, force_generate)
                 {
                     hnsep_cache_hit = true;
-                    (*cached_h).clone()
+                    cached_h
                 } else {
                     let prepared = self
                         .hnsep_stft
-                        .prepare_input(&wave)
+                        .prepare_input(raw_wave)
                         .map_err(|e| ResampleError::Internal(e.to_string()))?;
-                    let mask = if self.onnx.hnsep_uses_gpu() {
-                        let _gpu = self
-                            .gpu_infer_lock
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner());
-                        self.onnx.run_hnsep_mask(&prepared.tensor)?
-                    } else {
-                        self.onnx.run_hnsep_mask(&prepared.tensor)?
-                    };
+                    let mask = self.onnx.run_hnsep_mask(&prepared.tensor)?;
                     let separated = self
                         .hnsep_stft
                         .reconstruct_from_mask(&prepared, mask.view())
                         .map_err(|e| ResampleError::Internal(e.to_string()))?;
-                    let saved = self.hnsep_cache.save(&hnsep_path, &job.in_file, separated);
-                    (*saved).clone()
+                    self.hnsep_cache.save(&hnsep_path, &job.in_file, separated)
                 }
             };
 
-            let aperiodic: Vec<f32> = wave
+            let harmonic_slice: &[f32] = &harmonic;
+            let aperiodic: Vec<f32> = raw_wave
                 .iter()
-                .zip(harmonic.iter())
+                .zip(harmonic_slice.iter())
                 .map(|(&w, &h)| w - h)
                 .collect();
 
@@ -176,60 +171,47 @@ impl RealResampleEngine {
                     hop_size: self.config.hop_size,
                     win_size: self.config.win_size,
                 };
-                let seg_mod = if voicing > 0 || breath > 0 {
-                    pre_emphasis_base_tension_with_config(
-                        &harmonic,
-                        b_tension,
-                        openness as f64,
-                        singer_formant as f64,
-                        &tension_cfg,
-                    )
-                    .map_err(|e| ResampleError::Internal(e.to_string()))?
-                } else {
-                    vec![0.0_f32; harmonic.len()]
-                };
-                let ap_mod = if breath > 0 {
-                    couple_aperiodic_to_tension_with_config(
-                        &aperiodic,
-                        &harmonic,
-                        &seg_mod,
-                        b_tension,
-                        openness as f64,
-                        singer_formant as f64,
-                        &tension_cfg,
-                    )
-                    .map_err(|e| ResampleError::Internal(e.to_string()))?
-                } else {
-                    aperiodic
-                };
+                let (seg_mod, ap_mod) = apply_tension_and_coupling_with_config(
+                    harmonic_slice,
+                    &aperiodic,
+                    b_tension,
+                    openness as f64,
+                    singer_formant as f64,
+                    voicing > 0,
+                    breath > 0,
+                    &tension_cfg,
+                )
+                .map_err(|e| ResampleError::Internal(e.to_string()))?;
                 let b_scale = breath as f32 / 100.0;
                 let v_scale = voicing as f32 / 100.0;
-                wave = ap_mod
-                    .iter()
-                    .zip(seg_mod.iter())
-                    .map(|(&a, &s)| b_scale * a + v_scale * s)
-                    .collect();
+                wave = Cow::Owned(
+                    ap_mod
+                        .iter()
+                        .zip(seg_mod.iter())
+                        .map(|(&a, &s)| b_scale * a + v_scale * s)
+                        .collect(),
+                );
             } else {
                 let b_scale = breath as f32 / 100.0;
                 let v_scale = voicing as f32 / 100.0;
-                wave = aperiodic
-                    .iter()
-                    .zip(harmonic.iter())
-                    .map(|(&a, &h)| b_scale * a + v_scale * h)
-                    .collect();
+                wave = Cow::Owned(
+                    aperiodic
+                        .iter()
+                        .zip(harmonic_slice.iter())
+                        .map(|(&a, &h)| b_scale * a + v_scale * h)
+                        .collect(),
+                );
             }
         } else if breath != 100 || voicing != 100 {
             let scale_factor = breath as f32 / 100.0;
-            for x in &mut wave {
-                *x *= scale_factor;
-            }
+            wave = Cow::Owned(raw_wave.iter().map(|&x| x * scale_factor).collect());
         }
 
         let wave_max = peak_abs(&wave);
         let scale = if wave_max >= 0.5 {
             let s = 0.5 / wave_max;
             let s32 = s as f32;
-            for x in &mut wave {
+            for x in wave.to_mut().iter_mut() {
                 *x *= s32;
             }
             s
@@ -237,15 +219,14 @@ impl RealResampleEngine {
             1.0
         };
 
-        let mel_raw = self
+        let mel_origin = self
             .mel_analyzer
-            .compute_with_gender(&wave, gender as f64, 1.0)
+            .compute_compressed_with_gender(&wave, gender as f64, 1.0)
             .map_err(|e| ResampleError::Internal(e.to_string()))?;
-        let mel_origin = dynamic_range_compression_default(mel_raw.view());
 
         let saved = self
             .cache_manager
-            .save_features_cache(
+            .save_features_cache_arc(
                 &features_path,
                 &mel_origin,
                 scale,
@@ -315,15 +296,7 @@ impl RealResampleEngine {
         };
 
         let t_synth0 = Instant::now();
-        let wav_con = if self.onnx.vocoder_uses_gpu() {
-            let _gpu = self
-                .gpu_infer_lock
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            self.onnx.run_vocoder(mel_for_vocoder, f0_for_vocoder)?
-        } else {
-            self.onnx.run_vocoder(mel_for_vocoder, f0_for_vocoder)?
-        };
+        let wav_con = self.onnx.run_vocoder(mel_for_vocoder, f0_for_vocoder)?;
 
         let mut render = if wav_con.is_empty() {
             Vec::new()

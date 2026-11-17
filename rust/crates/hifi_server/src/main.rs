@@ -19,10 +19,14 @@ struct RealOnnxRunner {
 }
 
 impl RealOnnxRunner {
-    fn load_and_warmup(cfg: &ServerConfig, server_root: &Path) -> Result<(Self, bool), String> {
+    fn load_and_warmup(
+        cfg: &ServerConfig,
+        server_root: &Path,
+        http_workers: usize,
+    ) -> Result<(Self, bool), String> {
         let session_cfg = SessionConfig {
             device: map_device_preference(cfg.device_preference),
-            workers_hint: cfg.max_workers.resolve(false),
+            workers_hint: http_workers,
             ..SessionConfig::default()
         };
 
@@ -167,8 +171,11 @@ fn load_session_with_fallbacks<T>(
 
 fn main() {
     let code = run_server_with_factory(Box::new(|cfg, root| {
-        let (runner, directml_active) = RealOnnxRunner::load_and_warmup(cfg, root)?;
-        let workers = cfg.max_workers.resolve(directml_active);
+        let workers = cfg.max_workers.resolve_http_workers();
+        let (runner, directml_active) = RealOnnxRunner::load_and_warmup(cfg, root, workers)?;
+        tracing::info!(
+            "HTTP inference concurrency configured: workers={workers}, directml_active={directml_active}"
+        );
         let engine = Arc::new(RealResampleEngine::new(cfg.clone(), Arc::new(runner))?);
         Ok((engine, workers))
     }));

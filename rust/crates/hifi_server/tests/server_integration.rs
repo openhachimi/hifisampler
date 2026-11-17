@@ -307,3 +307,99 @@ async fn idle_watchdog_and_parent_pid_watcher_trigger_shutdown() {
         .expect("parent watcher should trigger on nonexistent pid");
     watcher.await.unwrap();
 }
+
+#[test]
+fn concurrent_workers_overlap_without_outer_gpu_lock() {
+    use std::sync::{Condvar, Mutex};
+
+    struct ConcurrentBarrierRunner {
+        in_flight: Mutex<usize>,
+        cv: Condvar,
+        peak_concurrent: AtomicUsize,
+    }
+
+    impl OnnxRunner for ConcurrentBarrierRunner {
+        fn hnsep_uses_gpu(&self) -> bool {
+            true
+        }
+
+        fn vocoder_uses_gpu(&self) -> bool {
+            true
+        }
+
+        fn run_hnsep_mask(&self, stft_tensor: &Array4<f32>) -> Result<Array4<f32>, ResampleError> {
+            let (_, _, f, t) = stft_tensor.dim();
+            Ok(Array4::<f32>::zeros((1, 2, f, t)))
+        }
+
+        fn run_vocoder(
+            &self,
+            _mel: ArrayView2<f32>,
+            f0: &[f32],
+        ) -> Result<Vec<f32>, ResampleError> {
+            let mut count = self.in_flight.lock().unwrap();
+            *count += 1;
+            self.peak_concurrent.fetch_max(*count, Ordering::SeqCst);
+            if *count < 2 {
+                let (guard, timed_out) = self
+                    .cv
+                    .wait_timeout_while(count, Duration::from_secs(3), |c| *c < 2)
+                    .unwrap();
+                count = guard;
+                assert!(
+                    !timed_out.timed_out(),
+                    "two workers should enter OnnxRunner concurrently when outer gpu_infer_lock is removed"
+                );
+            } else {
+                self.cv.notify_all();
+            }
+            drop(count);
+            Ok(vec![0.0; f0.len().max(1) * 512])
+        }
+    }
+
+    let tmp = std::env::temp_dir().join(format!("hifi_conc_{}", Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let wav1 = tmp.join("note1.wav");
+    let wav2 = tmp.join("note2.wav");
+    generate_sine_wav(&wav1, 0.25);
+    generate_sine_wav(&wav2, 0.25);
+    let out1 = tmp.join("out1.wav");
+    let out2 = tmp.join("out2.wav");
+
+    let runner = Arc::new(ConcurrentBarrierRunner {
+        in_flight: Mutex::new(0),
+        cv: Condvar::new(),
+        peak_concurrent: AtomicUsize::new(0),
+    });
+    let engine =
+        Arc::new(RealResampleEngine::new(ServerConfig::default(), runner.clone()).unwrap());
+    let stats = Arc::new(StatsCollector::default());
+
+    let e1 = engine.clone();
+    let s1 = stats.clone();
+    let args1 = vec![
+        wav1.to_string_lossy().into_owned(),
+        out1.to_string_lossy().into_owned(),
+        "C4".to_string(),
+        "100".to_string(),
+    ];
+    let t1 = std::thread::spawn(move || e1.resample(&args1, &s1));
+
+    let e2 = engine.clone();
+    let s2 = stats.clone();
+    let args2 = vec![
+        wav2.to_string_lossy().into_owned(),
+        out2.to_string_lossy().into_owned(),
+        "D4".to_string(),
+        "100".to_string(),
+    ];
+    let t2 = std::thread::spawn(move || e2.resample(&args2, &s2));
+
+    t1.join().unwrap().unwrap();
+    t2.join().unwrap().unwrap();
+    assert_eq!(runner.peak_concurrent.load(Ordering::SeqCst), 2);
+    assert_eq!(stats.snapshot(0, true, None).success_count, 2);
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}

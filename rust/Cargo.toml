@@ -41,4 +41,5 @@ hifi_lufs = { path = "crates/hifi_lufs" }
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+strip = "symbols"
+panic = "unwind"

@@ -59,11 +59,14 @@ pub fn can_send_as_plain_text(args: &[String]) -> bool {
 }
 
 /// Build HTTP request `(payload, media_type)` respecting `HIFISAMPLER_PROTOCOL`.
+///
+/// Defaults to `"auto"` when `HIFISAMPLER_PROTOCOL` is unset or empty so safe args use `text/plain`.
 pub fn build_request_payload(args: &[String]) -> (String, &'static str) {
     let proto = std::env::var("HIFISAMPLER_PROTOCOL")
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "auto".to_string());
     build_request_payload_with_protocol(args, &proto)
 }
 
@@ -71,7 +74,13 @@ pub fn build_request_payload_with_protocol(
     args: &[String],
     protocol: &str,
 ) -> (String, &'static str) {
-    if (protocol == "text" || protocol == "auto") && can_send_as_plain_text(args) {
+    let proto = protocol.trim().to_ascii_lowercase();
+    let effective = if proto.is_empty() {
+        "auto"
+    } else {
+        proto.as_str()
+    };
+    if (effective == "text" || effective == "auto") && can_send_as_plain_text(args) {
         return (args.join(" "), "text/plain");
     }
     let body = serde_json::json!({ "args": args }).to_string();
@@ -231,7 +240,11 @@ mod tests {
     #[test]
     fn payload_selection_matches_csharp_rules() {
         let simple = vec!["in.wav".into(), "out.wav".into(), "C4".into(), "100".into()];
-        let (p_json, m_json) = build_request_payload_with_protocol(&simple, "");
+        let (p_default, m_default) = build_request_payload_with_protocol(&simple, "");
+        assert_eq!(m_default, "text/plain");
+        assert_eq!(p_default, "in.wav out.wav C4 100");
+
+        let (p_json, m_json) = build_request_payload_with_protocol(&simple, "json");
         assert_eq!(m_json, "application/json");
         assert!(p_json.contains(r#""args""#));
 
@@ -247,6 +260,25 @@ mod tests {
         ];
         let (_p_auto, m_auto) = build_request_payload_with_protocol(&with_spaces, "auto");
         assert_eq!(m_auto, "application/json");
+
+        let with_empty = vec![
+            "in.wav".into(),
+            "out.wav".into(),
+            "C4".into(),
+            "100".into(),
+            "".into(),
+        ];
+        let (_p_empty, m_empty) = build_request_payload_with_protocol(&with_empty, "");
+        assert_eq!(m_empty, "application/json");
+
+        let with_quotes = vec![
+            "in\"1.wav".into(),
+            "out.wav".into(),
+            "C4".into(),
+            "100".into(),
+        ];
+        let (_p_q, m_q) = build_request_payload_with_protocol(&with_quotes, "auto");
+        assert_eq!(m_q, "application/json");
     }
 
     #[test]

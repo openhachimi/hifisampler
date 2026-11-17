@@ -3,11 +3,14 @@
 //! Clean-room port of `util/onnx_dsp.py` (`NumpyMelSpectrogram`, `dynamic_range_compression_np`)
 //! and `util/utils.py` (`slaney_mel_filterbank`).
 
+use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
-use ndarray::{Array2, Array3, ArrayView2};
+use ndarray::{s, Array2, Array3, ArrayView2};
 
-use crate::hnsep_stft::{periodic_hann_window, reflect_pad_1d, stft_1d, PadMode};
+use crate::hnsep_stft::{
+    cached_forward_rfft_plan, pad_window_to_nfft, periodic_hann_window, reflect_pad_1d,
+};
 use crate::DspError;
 
 /// Maximum number of cached Hann windows per `MelSpectrogram` instance.
@@ -168,6 +171,8 @@ impl WindowLru {
 pub struct MelSpectrogram {
     config: MelConfig,
     mel_basis: Array2<f32>,
+    /// Precomputed sparse non-zero filterbank intervals `(k_start, contiguous_weights)` per Mel row.
+    sparse_mel_rows: Vec<(usize, Vec<f32>)>,
     hann_cache: Mutex<WindowLru>,
 }
 
@@ -214,9 +219,23 @@ impl MelSpectrogram {
             Some(config.f_max),
         );
 
+        let n_freqs = mel_basis.ncols();
+        let mut sparse_mel_rows = Vec::with_capacity(config.n_mels);
+        for m in 0..config.n_mels {
+            let row = mel_basis.row(m);
+            let first_nz = (0..n_freqs).find(|&k| row[k] != 0.0);
+            let last_nz = (0..n_freqs).rfind(|&k| row[k] != 0.0);
+            if let (Some(k0), Some(k1)) = (first_nz, last_nz) {
+                sparse_mel_rows.push((k0, row.slice(s![k0..=k1]).to_vec()));
+            } else {
+                sparse_mel_rows.push((0, Vec::new()));
+            }
+        }
+
         Ok(Self {
             config,
             mel_basis,
+            sparse_mel_rows,
             hann_cache: Mutex::new(WindowLru::new(MAX_WINDOW_CACHE_SIZE)),
         })
     }
@@ -248,7 +267,8 @@ impl MelSpectrogram {
         cache.get_or_insert(win_size_new)
     }
 
-    /// Computes a `[n_mels, n_frames]` Mel spectrogram for a mono waveform.
+    /// Computes a `[n_mels, n_frames]` Mel spectrogram for a mono waveform via fused
+    /// per-frame RFFT + sparse filterbank dot-product (no intermediate STFT matrix).
     pub fn compute(
         &self,
         audio: &[f32],
@@ -280,43 +300,85 @@ impl MelSpectrogram {
         let win_size_u = win_size_new as usize;
         let hop_u = hop_length as usize;
         let window = self.get_window(win_size_u);
+        let window_padded: Cow<'_, [f32]> = if window.len() == n_fft_u {
+            Cow::Borrowed(&window[..])
+        } else {
+            Cow::Owned(pad_window_to_nfft(&window, n_fft_u)?)
+        };
 
         let pad_left = (win_size_new - hop_length).div_euclid(2);
         let pad_right = (win_size_new - hop_length + 1).div_euclid(2);
-        let y_padded = reflect_pad_1d(audio, pad_left, pad_right);
+        let mut y_padded = reflect_pad_1d(audio, pad_left, pad_right);
+        if self.config.center {
+            let pad_c = (n_fft_u / 2) as isize;
+            y_padded = reflect_pad_1d(&y_padded, pad_c, pad_c);
+        }
 
-        let spec = stft_1d(
-            &y_padded,
-            n_fft_u,
-            hop_u,
-            &window,
-            self.config.center,
-            PadMode::Reflect,
-        )?;
+        if y_padded.len() < n_fft_u {
+            return Err(DspError::SignalTooShort {
+                actual: y_padded.len(),
+                minimum: n_fft_u,
+            });
+        }
 
-        let n_frames = spec.ncols();
+        let n_frames = (y_padded.len() - n_fft_u) / hop_u + 1;
         let target_bins = self.config.n_fft / 2 + 1;
-        let src_bins = spec.nrows();
+        let src_bins = n_fft_u / 2 + 1;
+        let copy_bins = src_bins.min(target_bins);
 
-        let mag = if key_shift != 0.0 {
-            let scale = (self.config.win_size as f64 / win_size_u as f64) as f32;
-            let mut m = Array2::<f32>::zeros((target_bins, n_frames));
-            let copy_bins = src_bins.min(target_bins);
-            for f in 0..copy_bins {
-                for t in 0..n_frames {
-                    m[[f, t]] = spec[[f, t]].norm() * scale;
-                }
-            }
-            m
+        let plan = cached_forward_rfft_plan(n_fft_u)?;
+        let (mut time_buf, mut out_spec, mut scratch, mut complex_buf) = plan.new_scratch(n_fft_u);
+        let mut mag_buf = vec![0.0_f32; target_bins];
+
+        let scale = if key_shift != 0.0 {
+            (self.config.win_size as f64 / win_size_u as f64) as f32
         } else {
-            spec.mapv(|c| c.norm())
+            1.0
         };
 
-        Ok(self.mel_basis.dot(&mag))
+        let mut mel = Array2::<f32>::zeros((self.config.n_mels, n_frames));
+        let mel_slice = mel.as_slice_mut().expect("fresh Array2 is contiguous");
+
+        for t in 0..n_frames {
+            let start = t * hop_u;
+            let frame_samples = &y_padded[start..start + n_fft_u];
+            for ((dst, &s), &w) in time_buf
+                .iter_mut()
+                .zip(frame_samples.iter())
+                .zip(window_padded.iter())
+            {
+                *dst = s * w;
+            }
+            plan.process(&mut time_buf, &mut out_spec, &mut scratch, &mut complex_buf)?;
+
+            if key_shift != 0.0 {
+                for (dst, c) in mag_buf[..copy_bins].iter_mut().zip(&out_spec[..copy_bins]) {
+                    *dst = (c.re * c.re + c.im * c.im).sqrt() * scale;
+                }
+            } else {
+                for (dst, c) in mag_buf[..copy_bins].iter_mut().zip(&out_spec[..copy_bins]) {
+                    *dst = (c.re * c.re + c.im * c.im).sqrt();
+                }
+            }
+
+            for (m, (k_start, weights)) in self.sparse_mel_rows.iter().enumerate() {
+                if weights.is_empty() {
+                    continue;
+                }
+                let mag_slice = &mag_buf[*k_start..(*k_start + weights.len())];
+                let mut acc = 0.0_f32;
+                for (&w, &mag) in weights.iter().zip(mag_slice.iter()) {
+                    acc += w * mag;
+                }
+                mel_slice[m * n_frames + t] = acc;
+            }
+        }
+
+        Ok(mel)
     }
 
     /// Computes a `[n_mels, n_frames]` Mel spectrogram using the UTAU `g` (gender) flag
-    /// clamped to `[-100, 100]` (`key_shift = -gender * 0.06`, `speed = 1.0`).
+    /// clamped to `[-100, 100]` (`key_shift = -gender * 0.06`).
     pub fn compute_with_gender(
         &self,
         audio: &[f32],
@@ -325,6 +387,19 @@ impl MelSpectrogram {
     ) -> Result<Array2<f32>, DspError> {
         let g = gender.clamp(-100.0, 100.0);
         self.compute(audio, -g * 0.06, speed)
+    }
+
+    /// Computes a gender-adjusted `[n_mels, n_frames]` Mel spectrogram and applies natural-log
+    /// dynamic range compression in-place (`ln(max(x, 1e-9))`).
+    pub fn compute_compressed_with_gender(
+        &self,
+        audio: &[f32],
+        gender: f64,
+        speed: f64,
+    ) -> Result<Array2<f32>, DspError> {
+        let mut mel = self.compute_with_gender(audio, gender, speed)?;
+        dynamic_range_compression_inplace(&mut mel, 1.0, DEFAULT_DRC_CLIP_VAL);
+        Ok(mel)
     }
 
     /// Computes a `[batch, n_mels, n_frames]` Mel spectrogram for a 2D batch `[batch, samples]`.
@@ -350,7 +425,7 @@ impl MelSpectrogram {
         };
         let (n_mels, n_frames) = first.dim();
         let mut out = Array3::<f32>::zeros((n_batch, n_mels, n_frames));
-        out.slice_mut(ndarray::s![0, .., ..]).assign(&first);
+        out.slice_mut(s![0, .., ..]).assign(&first);
 
         for b in 1..n_batch {
             let row = batch.row(b);
@@ -360,7 +435,7 @@ impl MelSpectrogram {
                 let owned: Vec<f32> = row.iter().copied().collect();
                 self.compute(&owned, key_shift, speed)?
             };
-            out.slice_mut(ndarray::s![b, .., ..]).assign(&mel);
+            out.slice_mut(s![b, .., ..]).assign(&mel);
         }
         Ok(out)
     }

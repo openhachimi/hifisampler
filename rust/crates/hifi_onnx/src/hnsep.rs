@@ -188,11 +188,15 @@ impl HnsepSession {
         })
     }
 
-    /// Run HN-SEP bounded complex mask inference on `[B, 2, F, T]` (`channel 0 = real`, `channel 1 = imag`).
+    /// Run HN-SEP bounded complex mask inference on `[B, 2, F, T]` (`channel 0 = real`, `channel 1 = imag`),
+    /// returning `(mask, gpu_wait_ms)`.
     ///
     /// Supports both `[B, 2, 1025, T]` (exact `n_fft/2 + 1`) and `[B, 2, 1024, T]` transparently,
     /// returning an output mask tensor matching the caller's input `[B, 2, F, T]` dimensions.
-    pub fn forward(&self, spec: ArrayView4<'_, f32>) -> Result<Array4<f32>, OnnxError> {
+    pub fn forward_timed(
+        &self,
+        spec: ArrayView4<'_, f32>,
+    ) -> Result<(Array4<f32>, f64), OnnxError> {
         let (batch, channels, freq_bins, time_frames) = spec.dim();
         if batch == 0 || channels != 2 || time_frames == 0 {
             return Err(OnnxError::ShapeMismatch {
@@ -234,7 +238,7 @@ impl HnsepSession {
             })?;
         let in_dims = [batch as i64, 2i64, target_freq as i64, time_frames as i64];
 
-        let mut outputs = self.inner.run_f32(
+        let (mut outputs, gpu_wait_ms) = self.inner.run_f32_timed(
             &[(&self.input_name, &in_dims, input_slice)],
             &[&self.output_name],
         )?;
@@ -259,10 +263,10 @@ impl HnsepSession {
             }
         })?;
 
-        if of == freq_bins {
-            Ok(raw_arr)
+        let matched = if of == freq_bins {
+            raw_arr
         } else if of == 1025 && freq_bins == 1024 {
-            Ok(raw_arr.slice(s![.., .., ..1024, ..]).to_owned())
+            raw_arr.slice(s![.., .., ..1024, ..]).to_owned()
         } else if of == 1024 && freq_bins == 1025 {
             let mut padded = Array4::<f32>::zeros((ob, oc, 1025, ot));
             padded.slice_mut(s![.., .., ..1024, ..]).assign(&raw_arr);
@@ -270,21 +274,32 @@ impl HnsepSession {
             padded
                 .slice_mut(s![.., .., 1024..1025, ..])
                 .assign(&last_bin);
-            Ok(padded)
+            padded
         } else {
-            Err(OnnxError::ShapeMismatch {
+            return Err(OnnxError::ShapeMismatch {
                 expected: format!("[{batch}, 2, {freq_bins}, {time_frames}]"),
                 actual: format!("[{ob}, {oc}, {of}, {ot}]"),
-            })
-        }
+            });
+        };
+
+        Ok((matched, gpu_wait_ms))
     }
 
-    /// Convenience wrapper accepting separate `[B, F, T]` real & imaginary tensors.
-    pub fn forward_complex(
+    /// Run HN-SEP bounded complex mask inference on `[B, 2, F, T]` (`channel 0 = real`, `channel 1 = imag`).
+    ///
+    /// Supports both `[B, 2, 1025, T]` (exact `n_fft/2 + 1`) and `[B, 2, 1024, T]` transparently,
+    /// returning an output mask tensor matching the caller's input `[B, 2, F, T]` dimensions.
+    pub fn forward(&self, spec: ArrayView4<'_, f32>) -> Result<Array4<f32>, OnnxError> {
+        self.forward_timed(spec).map(|(arr, _)| arr)
+    }
+
+    /// Convenience wrapper accepting separate `[B, F, T]` real & imaginary tensors,
+    /// returning `(mask_real, mask_imag, gpu_wait_ms)`.
+    pub fn forward_complex_timed(
         &self,
         real: ArrayView3<'_, f32>,
         imag: ArrayView3<'_, f32>,
-    ) -> Result<(Array3<f32>, Array3<f32>), OnnxError> {
+    ) -> Result<(Array3<f32>, Array3<f32>, f64), OnnxError> {
         if real.dim() != imag.dim() {
             return Err(OnnxError::ShapeMismatch {
                 expected: format!("imag shape {:?}", real.dim()),
@@ -295,10 +310,20 @@ impl HnsepSession {
         let mut stacked = Array4::<f32>::zeros((b, 2, f, t));
         stacked.slice_mut(s![.., 0, .., ..]).assign(&real);
         stacked.slice_mut(s![.., 1, .., ..]).assign(&imag);
-        let mask = self.forward(stacked.view())?;
+        let (mask, gpu_wait_ms) = self.forward_timed(stacked.view())?;
         let mask_real = mask.slice(s![.., 0, .., ..]).to_owned();
         let mask_imag = mask.slice(s![.., 1, .., ..]).to_owned();
-        Ok((mask_real, mask_imag))
+        Ok((mask_real, mask_imag, gpu_wait_ms))
+    }
+
+    /// Convenience wrapper accepting separate `[B, F, T]` real & imaginary tensors.
+    pub fn forward_complex(
+        &self,
+        real: ArrayView3<'_, f32>,
+        imag: ArrayView3<'_, f32>,
+    ) -> Result<(Array3<f32>, Array3<f32>), OnnxError> {
+        self.forward_complex_timed(real, imag)
+            .map(|(r, i, _)| (r, i))
     }
 
     /// Run a short dummy forward pass to warm up execution provider kernels.

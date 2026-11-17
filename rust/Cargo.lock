@@ -362,6 +362,7 @@ name = "hifi_effects"
 version = "0.1.0"
 dependencies = [
  "approx",
+ "hifi_dsp",
  "ndarray",
 ]
 

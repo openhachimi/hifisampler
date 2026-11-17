@@ -11,10 +11,12 @@ use hifi_dsp::tension::{
     solve_lf_unit_period_params,
 };
 use hifi_dsp::{
-    apply_bounded_mask, apply_bounded_mask_tensor, couple_aperiodic_to_tension,
+    apply_bounded_mask, apply_bounded_mask_tensor, apply_tension_and_coupling_with_config,
+    couple_aperiodic_to_tension, couple_aperiodic_to_tension_with_config,
     dynamic_range_compression, dynamic_range_compression_default, midi_to_hz, periodic_hann_window,
-    pre_emphasis_base_tension, reflect_pad_1d, resample_mel_and_pitch, slaney_mel_filterbank,
-    Akima1DInterpolator, HnsepStft, MelConfig, MelSpectrogram, PadMode, ResampleTimeParams,
+    pre_emphasis_base_tension, pre_emphasis_base_tension_with_config, reflect_pad_1d,
+    resample_mel_and_pitch, slaney_mel_filterbank, Akima1DInterpolator, HnsepStft, MelConfig,
+    MelSpectrogram, PadMode, ResampleTimeParams, TensionConfig,
 };
 use ndarray::{Array2, Array4};
 use num_complex::Complex32;
@@ -646,4 +648,63 @@ fn test_edge_cases_batch_akima_hnsep() {
         resample_mel_and_pitch(one_frame.view(), &[0], &ResampleTimeParams::default()).unwrap();
     assert_eq!(r1.mel_render.nrows(), 128);
     assert!(r1.mel_render.ncols() >= 1);
+}
+
+#[test]
+fn test_stft_shape_and_fused_mel_tension_parity() {
+    let fix = load_fixtures();
+    let audio = fix["audio_main"].as_f32();
+
+    // 1. Assert stft_1d output dim() == (1025, T) for standard n_fft=2048
+    let win = periodic_hann_window(2048);
+    let spec = stft_1d(audio, 2048, 512, &win, true, PadMode::Reflect).unwrap();
+    let expected_frames = audio.len() / 512 + 1;
+    assert_eq!(spec.dim(), (1025, expected_frames));
+
+    // 2. Assert MelSpectrogram::compute_compressed_with_gender matches compute_with_gender + DRC
+    let mel = MelSpectrogram::with_defaults();
+    for &gender in &[0.0_f64, 1.0, -15.0, 25.0] {
+        let raw = mel.compute_with_gender(audio, gender, 1.0).unwrap();
+        let ref_drc = dynamic_range_compression_default(raw.view());
+        let got_drc = mel
+            .compute_compressed_with_gender(audio, gender, 1.0)
+            .unwrap();
+        assert_eq!(got_drc.dim(), ref_drc.dim());
+        assert_eq!(got_drc.as_slice().unwrap(), ref_drc.as_slice().unwrap());
+    }
+
+    // 3. Assert apply_tension_and_coupling_with_config is lossless vs standalone functions
+    let cfg = TensionConfig::default();
+    let harm = fix["voiced_part_1d"].as_f32();
+    let ap = fix["ap_noise_1d"].as_f32();
+    for &(b, ho, hr) in &[(-1.2, 45.0, -35.0), (2.0, -40.0, 30.0), (0.0, 0.0, 0.0)] {
+        let standalone_v = pre_emphasis_base_tension_with_config(harm, b, ho, hr, &cfg).unwrap();
+        let standalone_ap =
+            couple_aperiodic_to_tension_with_config(ap, harm, &standalone_v, b, ho, hr, &cfg)
+                .unwrap();
+
+        let (fused_v, fused_ap) =
+            apply_tension_and_coupling_with_config(harm, ap, b, ho, hr, true, true, &cfg).unwrap();
+        assert_eq!(fused_v.len(), standalone_v.len());
+        assert_eq!(fused_ap.len(), standalone_ap.len());
+        assert!(
+            max_abs_diff_f32(&fused_v, &standalone_v) < 1e-6,
+            "fused_v mismatch for b={b}, ho={ho}, hr={hr}"
+        );
+        assert!(
+            max_abs_diff_f32(&fused_ap, &standalone_ap) < 1e-6,
+            "fused_ap mismatch for b={b}, ho={ho}, hr={hr}"
+        );
+
+        let (v_only, ap_unchanged) =
+            apply_tension_and_coupling_with_config(harm, ap, b, ho, hr, true, false, &cfg).unwrap();
+        assert!(max_abs_diff_f32(&v_only, &standalone_v) < 1e-6);
+        assert_eq!(ap_unchanged, ap);
+    }
+
+    let (zero_v, untouched_ap) =
+        apply_tension_and_coupling_with_config(harm, ap, -1.0, 20.0, 10.0, false, false, &cfg)
+            .unwrap();
+    assert!(zero_v.iter().all(|&x| x == 0.0));
+    assert_eq!(untouched_ap, ap);
 }

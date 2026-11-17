@@ -63,6 +63,9 @@ pub enum AudioError {
     #[error("Invalid sample rate: {0}")]
     InvalidSampleRate(u32),
 
+    #[error("Sample count {0} exceeds WAV 32-bit sample counter limit")]
+    SampleCountOverflow(usize),
+
     #[error("Resampling error: {0}")]
     Resample(#[from] hifi_lufs::LufsError),
 
@@ -253,27 +256,35 @@ pub fn write_wav(path: &Path, audio: &AudioBuffer) -> Result<(), AudioError> {
     };
 
     {
+        let n_samples = u32::try_from(audio.samples.len())
+            .map_err(|_| AudioError::SampleCountOverflow(audio.samples.len()))?;
         let file = File::create(&tmp_path)?;
         let buf_writer = BufWriter::new(file);
         let mut writer = WavWriter::new(buf_writer, spec)?;
 
-        for &sample in &audio.samples {
-            let sample_f64 = if sample.is_nan() { 0.0 } else { sample as f64 };
-            // Exact libsndfile 1.2.2 PCM_16 quantization formula:
-            // floor(sample * 32768.0).clamp(-32768.0, 32767.0)
-            let scaled = sample_f64 * 32768.0;
-            let floored = scaled.floor();
-            let clamped = floored.clamp(-32768.0, 32767.0);
-            writer.write_sample(clamped as i16)?;
+        {
+            let mut sample_writer = writer.get_i16_writer(n_samples);
+            for &sample in &audio.samples {
+                let sample_f64 = if sample.is_nan() { 0.0 } else { sample as f64 };
+                // Exact libsndfile 1.2.2 PCM_16 quantization formula:
+                // floor(sample * 32768.0).clamp(-32768.0, 32767.0)
+                let scaled = sample_f64 * 32768.0;
+                let floored = scaled.floor();
+                let clamped = floored.clamp(-32768.0, 32767.0);
+                sample_writer.write_sample(clamped as i16);
+            }
+            sample_writer.flush()?;
         }
 
         writer.finalize()?;
     }
 
-    fs::rename(&tmp_path, path).map_err(|e| AudioError::AtomicRenameFailed {
-        tmp: tmp_path.clone(),
-        dest: path.to_path_buf(),
-        source: e,
+    crate::cache::rename_with_retry(&tmp_path, path).map_err(|e| {
+        AudioError::AtomicRenameFailed {
+            tmp: tmp_path.clone(),
+            dest: path.to_path_buf(),
+            source: e,
+        }
     })?;
 
     // Disarm cleanup guard on successful rename

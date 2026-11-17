@@ -223,17 +223,18 @@ fn test_akima_matches_scipy() {
         52.132571428571424,
         64.0,
     ];
-    let akima = Akima1DInterpolator::new(&ax, &ay);
-    let got = akima.eval_clamped(&aq);
+    let akima = Akima1DInterpolator::new(&ax, &ay).expect("valid Akima inputs");
+    let got = akima.evaluate_clamped(&aq);
     for (g, e) in got.iter().zip(expected.iter()) {
         assert_abs_diff_eq!(g, e, epsilon = 1e-12);
     }
 
     // 2-point linear edge case & flat curve safety
-    let lin = Akima1DInterpolator::new(&[0.0, 2.0], &[10.0, 20.0]);
-    assert_abs_diff_eq!(lin.eval(0.5), 12.5, epsilon = 1e-12);
-    let flat = Akima1DInterpolator::new(&[0.0, 1.0, 2.0, 3.0], &[5.0, 5.0, 5.0, 5.0]);
-    assert_abs_diff_eq!(flat.eval(1.7), 5.0, epsilon = 1e-12);
+    let lin = Akima1DInterpolator::new(&[0.0, 2.0], &[10.0, 20.0]).expect("2-point Akima");
+    assert_abs_diff_eq!(lin.evaluate(0.5), 12.5, epsilon = 1e-12);
+    let flat =
+        Akima1DInterpolator::new(&[0.0, 1.0, 2.0, 3.0], &[5.0, 5.0, 5.0, 5.0]).expect("flat Akima");
+    assert_abs_diff_eq!(flat.evaluate(1.7), 5.0, epsilon = 1e-12);
 }
 
 #[test]

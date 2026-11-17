@@ -1,5 +1,4 @@
-use hifi_core::cache::{load_cache, save_cache, stat_sig, StatSig};
-use ndarray::Array2;
+use hifi_core::cache::{load_cache_with_options, save_cache_with_options, stat_sig, StatSig};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -88,7 +87,7 @@ impl HnsepCache {
             }
         }
 
-        if let Ok(Some(cached)) = load_cache(disk_path, Some(source_wav)) {
+        if let Ok(Some(cached)) = load_cache_with_options(disk_path, Some(source_wav), false) {
             let harmonic = Arc::new(cached.mel_origin.into_raw_vec_and_offset().0);
             self.put_mem(&key, disk_sig, src_sig, harmonic.clone());
             return Some(harmonic);
@@ -100,15 +99,13 @@ impl HnsepCache {
     /// Save separated harmonic waveform to disk `.hifi.bin` (best-effort) and RAM LRU.
     pub fn save(&self, disk_path: &Path, source_wav: &Path, harmonic: Vec<f32>) -> Arc<Vec<f32>> {
         let arc = Arc::new(harmonic);
-        let rows = 1usize;
-        let cols = arc.len();
-        if let Ok(arr) = Array2::from_shape_vec((rows, cols), (*arc).clone()) {
-            if let Err(err) = save_cache(disk_path, &arr, 1.0) {
-                tracing::debug!(
-                    "Could not write HN-SEP disk cache '{}': {err}",
-                    disk_path.display()
-                );
-            }
+        if let Err(err) =
+            save_cache_with_options(disk_path, 1, arc.len(), arc.as_slice(), 1.0, false)
+        {
+            tracing::debug!(
+                "Could not write HN-SEP disk cache '{}': {err}",
+                disk_path.display()
+            );
         }
 
         let key = cache_key(disk_path);
@@ -197,6 +194,22 @@ mod tests {
         cache.save(&disk, &src, vec![0.25, -0.5, 0.75]);
         let hit = cache.load(&disk, &src, false).unwrap();
         assert_eq!(&*hit, &[0.25_f32, -0.5, 0.75]);
+
+        // Cold cache reads back from disk `.hifi.bin` (and accepts valid silent all-zero harmonic).
+        let cold_cache = HnsepCache::default();
+        let disk_hit = cold_cache.load(&disk, &src, false).unwrap();
+        assert_eq!(&*disk_hit, &[0.25_f32, -0.5, 0.75]);
+
+        let silent_src = dir.join("silent.wav");
+        std::fs::write(&silent_src, b"RIFF").unwrap();
+        let silent_disk = hnsep_disk_cache_path(&silent_src);
+        cold_cache.save(&silent_disk, &silent_src, vec![0.0, 0.0, 0.0]);
+        let cold_silent = HnsepCache::default();
+        assert_eq!(
+            &*cold_silent.load(&silent_disk, &silent_src, false).unwrap(),
+            &[0.0_f32, 0.0, 0.0]
+        );
+
         assert!(cache.load(&disk, &src, true).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);

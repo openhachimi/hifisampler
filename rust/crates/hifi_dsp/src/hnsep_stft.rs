@@ -3,8 +3,9 @@
 //! Clean-room port of `_stft_np`, `_istft_ola_np`, `_reflect_pad_1d_batch`, and
 //! `NumpyHnsepModel` framing/masking from `util/onnx_dsp.py`.
 
+use std::collections::HashMap;
 use std::f64::consts::PI;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use ndarray::{Array2, Array4, ArrayView2, ArrayView4};
 use num_complex::Complex32;
@@ -12,6 +13,8 @@ use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 use rustfft::{Fft, FftPlanner};
 
 use crate::DspError;
+
+const TRANSPOSE_TILE: usize = 16;
 
 /// Padding mode used when `center = true` in STFT.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -302,10 +305,113 @@ impl InverseRfftPlan {
     }
 }
 
+static FORWARD_RFFT_CACHE: OnceLock<Mutex<HashMap<usize, Arc<ForwardRfftPlan>>>> = OnceLock::new();
+static INVERSE_RFFT_CACHE: OnceLock<Mutex<HashMap<usize, Arc<InverseRfftPlan>>>> = OnceLock::new();
+
+pub(crate) fn cached_forward_rfft_plan(n_fft: usize) -> Result<Arc<ForwardRfftPlan>, DspError> {
+    let cache = FORWARD_RFFT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(plan) = cache.lock().expect("forward FFT cache lock").get(&n_fft) {
+        return Ok(Arc::clone(plan));
+    }
+    let built = Arc::new(ForwardRfftPlan::new(n_fft)?);
+    let mut guard = cache.lock().expect("forward FFT cache lock");
+    let entry = guard.entry(n_fft).or_insert_with(|| Arc::clone(&built));
+    Ok(Arc::clone(entry))
+}
+
+pub(crate) fn cached_inverse_rfft_plan(n_fft: usize) -> Result<Arc<InverseRfftPlan>, DspError> {
+    let cache = INVERSE_RFFT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(plan) = cache.lock().expect("inverse FFT cache lock").get(&n_fft) {
+        return Ok(Arc::clone(plan));
+    }
+    let built = Arc::new(InverseRfftPlan::new(n_fft)?);
+    let mut guard = cache.lock().expect("inverse FFT cache lock");
+    let entry = guard.entry(n_fft).or_insert_with(|| Arc::clone(&built));
+    Ok(Arc::clone(entry))
+}
+
+/// Frame-contiguous complex STFT buffer laid out as `[n_frames, n_freq]`, eliminating
+/// column-stride L1 cache thrashing during per-frame FFTs and frame-wise spectral loops.
+#[derive(Debug, Clone)]
+pub(crate) struct FramesSpectrum {
+    pub data: Vec<Complex32>,
+    pub n_frames: usize,
+    pub n_freq: usize,
+}
+
+impl FramesSpectrum {
+    pub(crate) fn zeros(n_frames: usize, n_freq: usize) -> Self {
+        Self {
+            data: vec![Complex32::default(); n_frames * n_freq],
+            n_frames,
+            n_freq,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn frame(&self, t: usize) -> &[Complex32] {
+        let start = t * self.n_freq;
+        &self.data[start..start + self.n_freq]
+    }
+
+    #[inline]
+    pub(crate) fn frame_mut(&mut self, t: usize) -> &mut [Complex32] {
+        let start = t * self.n_freq;
+        &mut self.data[start..start + self.n_freq]
+    }
+
+    pub(crate) fn to_freq_major(&self) -> Array2<Complex32> {
+        let mut out = Array2::<Complex32>::zeros((self.n_freq, self.n_frames));
+        let dst = out.as_slice_mut().expect("fresh Array2 is contiguous");
+        let n_frames = self.n_frames;
+        let n_freq = self.n_freq;
+        for f0 in (0..n_freq).step_by(TRANSPOSE_TILE) {
+            let f_end = (f0 + TRANSPOSE_TILE).min(n_freq);
+            for t0 in (0..n_frames).step_by(TRANSPOSE_TILE) {
+                let t_end = (t0 + TRANSPOSE_TILE).min(n_frames);
+                for f in f0..f_end {
+                    let dst_row = f * n_frames;
+                    for t in t0..t_end {
+                        dst[dst_row + t] = self.data[t * n_freq + f];
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    pub(crate) fn from_freq_major(spec: ArrayView2<Complex32>) -> Self {
+        let (n_freq, n_frames) = spec.dim();
+        let mut frames = Self::zeros(n_frames, n_freq);
+        if let Some(src) = spec.as_slice() {
+            for f0 in (0..n_freq).step_by(TRANSPOSE_TILE) {
+                let f_end = (f0 + TRANSPOSE_TILE).min(n_freq);
+                for t0 in (0..n_frames).step_by(TRANSPOSE_TILE) {
+                    let t_end = (t0 + TRANSPOSE_TILE).min(n_frames);
+                    for t in t0..t_end {
+                        let dst_row = t * n_freq;
+                        for f in f0..f_end {
+                            frames.data[dst_row + f] = src[f * n_frames + t];
+                        }
+                    }
+                }
+            }
+        } else {
+            for t in 0..n_frames {
+                let dst = frames.frame_mut(t);
+                for f in 0..n_freq {
+                    dst[f] = spec[[f, t]];
+                }
+            }
+        }
+        frames
+    }
+}
+
 /// Computes a single 1D real-to-complex FFT returning `n_fft / 2 + 1` bins.
 pub(crate) fn rfft_1d(input: &[f32]) -> Result<Vec<Complex32>, DspError> {
     let n_fft = input.len();
-    let plan = ForwardRfftPlan::new(n_fft)?;
+    let plan = cached_forward_rfft_plan(n_fft)?;
     let (mut time_buf, mut out_spec, mut scratch, mut complex_buf) = plan.new_scratch(n_fft);
     time_buf.copy_from_slice(input);
     plan.process(&mut time_buf, &mut out_spec, &mut scratch, &mut complex_buf)?;
@@ -321,7 +427,7 @@ pub(crate) fn irfft_1d(spec: &[Complex32], n_fft: usize) -> Result<Vec<f32>, Dsp
             actual: format!("len == {}", spec.len()),
         });
     }
-    let plan = InverseRfftPlan::new(n_fft)?;
+    let plan = cached_inverse_rfft_plan(n_fft)?;
     let (mut in_spec, mut out_time, mut scratch, mut complex_buf) = plan.new_scratch(n_fft);
     in_spec.copy_from_slice(spec);
     plan.process(&mut in_spec, &mut out_time, &mut scratch, &mut complex_buf)?;
@@ -344,7 +450,7 @@ pub(crate) fn irfft_real_1d(spec_real: &[f32], n_fft: usize) -> Result<Vec<f32>,
     irfft_1d(&complex_spec, n_fft)
 }
 
-fn pad_window_to_nfft(window: &[f32], n_fft: usize) -> Result<Vec<f32>, DspError> {
+pub(crate) fn pad_window_to_nfft(window: &[f32], n_fft: usize) -> Result<Vec<f32>, DspError> {
     if window.is_empty() {
         return Err(DspError::InvalidParameter {
             name: "window",
@@ -366,18 +472,15 @@ fn pad_window_to_nfft(window: &[f32], n_fft: usize) -> Result<Vec<f32>, DspError
     Ok(padded)
 }
 
-/// Computes onesided complex STFT matching `_stft_np` in `util/onnx_dsp.py` and
-/// `torch.stft(..., normalized=False, onesided=True)`.
-///
-/// Output shape is `[n_fft / 2 + 1, n_frames]`.
-pub fn stft_1d(
+/// Frame-contiguous STFT producing `[n_frames, n_fft / 2 + 1]`.
+pub(crate) fn stft_1d_frames(
     x: &[f32],
     n_fft: usize,
     hop_length: usize,
     window: &[f32],
     center: bool,
     pad_mode: PadMode,
-) -> Result<Array2<Complex32>, DspError> {
+) -> Result<FramesSpectrum, DspError> {
     if n_fft == 0 {
         return Err(DspError::InvalidParameter {
             name: "n_fft",
@@ -413,38 +516,35 @@ pub fn stft_1d(
 
     let n_frames = (x_padded.len() - n_fft) / hop_length + 1;
     let n_freq = n_fft / 2 + 1;
-    let mut spec = Array2::<Complex32>::zeros((n_freq, n_frames));
+    let mut frames = FramesSpectrum::zeros(n_frames, n_freq);
 
-    let plan = ForwardRfftPlan::new(n_fft)?;
-    let (mut time_buf, mut out_spec, mut scratch, mut complex_buf) = plan.new_scratch(n_fft);
+    let plan = cached_forward_rfft_plan(n_fft)?;
+    let (mut time_buf, _, mut scratch, mut complex_buf) = plan.new_scratch(n_fft);
 
     for t in 0..n_frames {
         let start = t * hop_length;
-        let frame = &x_padded[start..start + n_fft];
+        let frame_samples = &x_padded[start..start + n_fft];
         for ((dst, &s), &w) in time_buf
             .iter_mut()
-            .zip(frame.iter())
+            .zip(frame_samples.iter())
             .zip(window_padded.iter())
         {
             *dst = s * w;
         }
-        plan.process(&mut time_buf, &mut out_spec, &mut scratch, &mut complex_buf)?;
-        for (f, &val) in out_spec.iter().enumerate() {
-            spec[[f, t]] = val;
-        }
+        plan.process(
+            &mut time_buf,
+            frames.frame_mut(t),
+            &mut scratch,
+            &mut complex_buf,
+        )?;
     }
 
-    Ok(spec)
+    Ok(frames)
 }
 
-/// Computes overlap-add inverse STFT matching `_istft_ola_np` in `util/onnx_dsp.py` and
-/// `torch.istft(..., normalized=False, onesided=True)`.
-///
-/// Expects `spec` shape `[n_fft / 2 + 1, n_frames]`.
-/// When `length` is `Some(target_len)` (used to match `torch.istft(..., length=...)`),
-/// trims or zero-pads the centered/uncropped output to `target_len`.
-pub fn istft_1d(
-    spec: ArrayView2<Complex32>,
+/// Frame-contiguous overlap-add inverse STFT consuming `[n_frames, n_fft / 2 + 1]`.
+pub(crate) fn istft_1d_frames(
+    frames: &FramesSpectrum,
     n_fft: usize,
     hop_length: usize,
     window: &[f32],
@@ -464,13 +564,13 @@ pub fn istft_1d(
         });
     }
     let n_freq = n_fft / 2 + 1;
-    if spec.nrows() != n_freq {
+    if frames.n_freq != n_freq {
         return Err(DspError::ShapeMismatch {
-            expected: format!("[{n_freq}, n_frames]"),
-            actual: format!("[{}, {}]", spec.nrows(), spec.ncols()),
+            expected: format!("[n_frames, {n_freq}]"),
+            actual: format!("[{}, {}]", frames.n_frames, frames.n_freq),
         });
     }
-    let n_frames = spec.ncols();
+    let n_frames = frames.n_frames;
     if n_frames == 0 {
         return Err(DspError::InvalidParameter {
             name: "spec",
@@ -484,13 +584,11 @@ pub fn istft_1d(
     let mut win_sum = vec![0.0_f32; out_len];
     let win_sq: Vec<f32> = window_padded.iter().map(|&w| w * w).collect();
 
-    let plan = InverseRfftPlan::new(n_fft)?;
+    let plan = cached_inverse_rfft_plan(n_fft)?;
     let (mut in_spec, mut out_time, mut scratch, mut complex_buf) = plan.new_scratch(n_fft);
 
     for t in 0..n_frames {
-        for f in 0..n_freq {
-            in_spec[f] = spec[[f, t]];
-        }
+        in_spec.copy_from_slice(frames.frame(t));
         plan.process(&mut in_spec, &mut out_time, &mut scratch, &mut complex_buf)?;
 
         let start = t * hop_length;
@@ -528,6 +626,58 @@ pub fn istft_1d(
             Ok(result)
         }
     }
+}
+
+/// Computes onesided complex STFT matching `_stft_np` in `util/onnx_dsp.py` and
+/// `torch.stft(..., normalized=False, onesided=True)`.
+///
+/// Output shape is `[n_fft / 2 + 1, n_frames]`.
+pub fn stft_1d(
+    x: &[f32],
+    n_fft: usize,
+    hop_length: usize,
+    window: &[f32],
+    center: bool,
+    pad_mode: PadMode,
+) -> Result<Array2<Complex32>, DspError> {
+    Ok(stft_1d_frames(x, n_fft, hop_length, window, center, pad_mode)?.to_freq_major())
+}
+
+/// Computes overlap-add inverse STFT matching `_istft_ola_np` in `util/onnx_dsp.py` and
+/// `torch.istft(..., normalized=False, onesided=True)`.
+///
+/// Expects `spec` shape `[n_fft / 2 + 1, n_frames]`.
+/// When `length` is `Some(target_len)` (used to match `torch.istft(..., length=...)`),
+/// trims or zero-pads the centered/uncropped output to `target_len`.
+pub fn istft_1d(
+    spec: ArrayView2<Complex32>,
+    n_fft: usize,
+    hop_length: usize,
+    window: &[f32],
+    center: bool,
+    length: Option<usize>,
+) -> Result<Vec<f32>, DspError> {
+    if n_fft == 0 {
+        return Err(DspError::InvalidParameter {
+            name: "n_fft",
+            reason: "must be > 0".to_string(),
+        });
+    }
+    let n_freq = n_fft / 2 + 1;
+    if spec.nrows() != n_freq {
+        return Err(DspError::ShapeMismatch {
+            expected: format!("[{n_freq}, n_frames]"),
+            actual: format!("[{}, {}]", spec.nrows(), spec.ncols()),
+        });
+    }
+    if spec.ncols() == 0 {
+        return Err(DspError::InvalidParameter {
+            name: "spec",
+            reason: "n_frames must be > 0".to_string(),
+        });
+    }
+    let frames = FramesSpectrum::from_freq_major(spec);
+    istft_1d_frames(&frames, n_fft, hop_length, window, center, length)
 }
 
 /// Applies the HN-SEP complex bounded mask activation `tanh(|m|) * m / (|m| + eps)` in-place.
@@ -676,7 +826,7 @@ impl HnsepStft {
         let tr_pad = t_pad - tl_pad;
 
         let x_padded = constant_pad_1d(wave, tl_pad, tr_pad, 0.0);
-        let spec = stft_1d(
+        let frames = stft_1d_frames(
             &x_padded,
             self.n_fft,
             self.hop_length,
@@ -685,13 +835,30 @@ impl HnsepStft {
             PadMode::Constant(0.0),
         )?;
 
-        let (n_freq, n_frames) = spec.dim();
+        let n_freq = frames.n_freq;
+        let n_frames = frames.n_frames;
+        let mut spec = Array2::<Complex32>::zeros((n_freq, n_frames));
         let mut tensor = Array4::<f32>::zeros((1, 2, n_freq, n_frames));
-        for f in 0..n_freq {
-            for t in 0..n_frames {
-                let c = spec[[f, t]];
-                tensor[[0, 0, f, t]] = c.re;
-                tensor[[0, 1, f, t]] = c.im;
+
+        let spec_dst = spec.as_slice_mut().expect("fresh Array2 is contiguous");
+        let tensor_dst = tensor.as_slice_mut().expect("fresh Array4 is contiguous");
+        let plane_len = n_freq * n_frames;
+        let (re_plane, im_plane) = tensor_dst.split_at_mut(plane_len);
+
+        for f0 in (0..n_freq).step_by(TRANSPOSE_TILE) {
+            let f_end = (f0 + TRANSPOSE_TILE).min(n_freq);
+            for t0 in (0..n_frames).step_by(TRANSPOSE_TILE) {
+                let t_end = (t0 + TRANSPOSE_TILE).min(n_frames);
+                for f in f0..f_end {
+                    let dst_row = f * n_frames;
+                    for t in t0..t_end {
+                        let c = frames.data[t * n_freq + f];
+                        let idx = dst_row + t;
+                        spec_dst[idx] = c;
+                        re_plane[idx] = c.re;
+                        im_plane[idx] = c.im;
+                    }
+                }
             }
         }
 
@@ -713,9 +880,58 @@ impl HnsepStft {
         if prepared.orig_len == 0 {
             return Ok(Vec::new());
         }
-        let spec_pred = hnsep_bounded_mask_multiply(prepared.spec.view(), mask_tensor)?;
-        let x_pred = istft_1d(
-            spec_pred.view(),
+        let (n_freq, n_frames) = prepared.spec.dim();
+        let (mb, mc, mf, mt) = mask_tensor.dim();
+        if mb != 1 || mc != 2 || mt != n_frames || (mf != n_freq && mf + 1 != n_freq) {
+            return Err(DspError::ShapeMismatch {
+                expected: format!(
+                    "[1, 2, {n_freq} (or {}), {n_frames}]",
+                    n_freq.saturating_sub(1)
+                ),
+                actual: format!("[{mb}, {mc}, {mf}, {mt}]"),
+            });
+        }
+
+        let mut frames_pred = FramesSpectrum::zeros(n_frames, n_freq);
+        match (prepared.spec.as_slice(), mask_tensor.as_slice()) {
+            (Some(spec_src), Some(mask_src)) => {
+                let mask_plane = mf * n_frames;
+                let re_mask = &mask_src[..mask_plane];
+                let im_mask = &mask_src[mask_plane..2 * mask_plane];
+                for f0 in (0..n_freq).step_by(TRANSPOSE_TILE) {
+                    let f_end = (f0 + TRANSPOSE_TILE).min(n_freq);
+                    for t0 in (0..n_frames).step_by(TRANSPOSE_TILE) {
+                        let t_end = (t0 + TRANSPOSE_TILE).min(n_frames);
+                        for f in f0..f_end {
+                            let s_row = f * n_frames;
+                            let m_row = f.min(mf - 1) * n_frames;
+                            for t in t0..t_end {
+                                let s = spec_src[s_row + t];
+                                let m = Complex32::new(re_mask[m_row + t], im_mask[m_row + t]);
+                                frames_pred.data[t * n_freq + f] = s * m;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {
+                for t in 0..n_frames {
+                    let dst = frames_pred.frame_mut(t);
+                    for (f, slot) in dst.iter_mut().enumerate() {
+                        let mf_idx = f.min(mf - 1);
+                        let s = prepared.spec[[f, t]];
+                        let m = Complex32::new(
+                            mask_tensor[[0, 0, mf_idx, t]],
+                            mask_tensor[[0, 1, mf_idx, t]],
+                        );
+                        *slot = s * m;
+                    }
+                }
+            }
+        }
+
+        let x_pred = istft_1d_frames(
+            &frames_pred,
             self.n_fft,
             self.hop_length,
             &self.window,
@@ -747,9 +963,31 @@ impl HnsepStft {
                 actual: format!("{:?}", mask.dim()),
             });
         }
-        let spec_pred = &prepared.spec * &mask;
-        let x_pred = istft_1d(
-            spec_pred.view(),
+        let (n_freq, n_frames) = prepared.spec.dim();
+        let mut frames_pred = FramesSpectrum::zeros(n_frames, n_freq);
+        if let (Some(s_src), Some(m_src)) = (prepared.spec.as_slice(), mask.as_slice()) {
+            for f0 in (0..n_freq).step_by(TRANSPOSE_TILE) {
+                let f_end = (f0 + TRANSPOSE_TILE).min(n_freq);
+                for t0 in (0..n_frames).step_by(TRANSPOSE_TILE) {
+                    let t_end = (t0 + TRANSPOSE_TILE).min(n_frames);
+                    for f in f0..f_end {
+                        let row = f * n_frames;
+                        for t in t0..t_end {
+                            frames_pred.data[t * n_freq + f] = s_src[row + t] * m_src[row + t];
+                        }
+                    }
+                }
+            }
+        } else {
+            for t in 0..n_frames {
+                let dst = frames_pred.frame_mut(t);
+                for (f, slot) in dst.iter_mut().enumerate() {
+                    *slot = prepared.spec[[f, t]] * mask[[f, t]];
+                }
+            }
+        }
+        let x_pred = istft_1d_frames(
+            &frames_pred,
             self.n_fft,
             self.hop_length,
             &self.window,
