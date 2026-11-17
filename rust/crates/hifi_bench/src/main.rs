@@ -47,21 +47,21 @@ struct ColdCaseComparison {
     pitch: String,
     length: String,
     pitch_string: String,
-    python: StageTiming,
+    python: Option<StageTiming>,
     rust: StageTiming,
-    equivalence: AudioEquivalenceReport,
+    equivalence: Option<AudioEquivalenceReport>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WarmAndInteropResult {
-    py_warm_disk: StageTiming,
-    py_warm_ram: StageTiming,
+    py_warm_disk: Option<StageTiming>,
+    py_warm_ram: Option<StageTiming>,
     rs_warm_disk: StageTiming,
     rs_warm_ram: StageTiming,
-    py_to_rs_default: InteropCheck,
-    py_to_rs_fx: InteropCheck,
-    rs_to_py_default: InteropCheck,
-    rs_to_py_fx: InteropCheck,
+    py_to_rs_default: Option<InteropCheck>,
+    py_to_rs_fx: Option<InteropCheck>,
+    rs_to_py_default: Option<InteropCheck>,
+    rs_to_py_fx: Option<InteropCheck>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +76,7 @@ struct InteropCheck {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BatchThroughputResult {
     note_count: usize,
+    concurrency: usize,
     wall_ms: f64,
     notes_per_sec: f64,
     client_latency: LatencySummary,
@@ -89,9 +90,9 @@ struct ColdStartReport {
     py_default_server_startup_ms: Vec<f64>,
     py_onnx_server_startup_ms: Vec<f64>,
     rs_server_startup_ms: Vec<f64>,
-    py_cli_cold_ms: f64,
+    py_cli_cold_ms: Option<f64>,
     rs_cli_cold_ms: f64,
-    py_cli_warm: LatencySummary,
+    py_cli_warm: Option<LatencySummary>,
     rs_cli_warm: LatencySummary,
 }
 
@@ -117,10 +118,14 @@ struct FullBenchmarkReport {
     cold_start: ColdStartReport,
     cold_cases: Vec<ColdCaseComparison>,
     warm_and_interop: WarmAndInteropResult,
-    mixed_batch_py: BatchThroughputResult,
+    mixed_batch_py: Option<BatchThroughputResult>,
     mixed_batch_rs: BatchThroughputResult,
-    warm_batch_py: BatchThroughputResult,
+    warm_batch_py: Option<BatchThroughputResult>,
     warm_batch_rs: BatchThroughputResult,
+    concurrent_mixed_batch_py: Option<BatchThroughputResult>,
+    concurrent_mixed_batch_rs: BatchThroughputResult,
+    concurrent_warm_batch_py: Option<BatchThroughputResult>,
+    concurrent_warm_batch_rs: BatchThroughputResult,
     memory: MemoryReport,
 }
 
@@ -496,12 +501,7 @@ fn measure_cli_warm(
     Ok(LatencySummary::from_samples(&times))
 }
 
-fn run_batch(
-    port: u16,
-    in_wav: &Path,
-    out_dir: &Path,
-    mixed: bool,
-) -> Result<BatchThroughputResult, String> {
+fn build_batch_jobs(in_wav: &Path, out_dir: &Path, mixed: bool) -> Vec<Vec<String>> {
     let pitches = ["C4", "D4", "E4", "F4", "G4", "A4", "B4", "C5", "G4", "E4"];
     let flag_sets = if mixed {
         vec!["", "P100", "g-10", "A30", "Hb120Hv90"]
@@ -511,36 +511,98 @@ fn run_batch(
     let lengths = ["220", "280", "350", "400"];
     let total_notes = 20usize;
 
+    (0..total_notes)
+        .map(|i| {
+            let out_wav = out_dir.join(format!("batch_{i}.wav"));
+            let pitch = pitches[i % pitches.len()];
+            let flags = flag_sets[i % flag_sets.len()];
+            let length = lengths[i % lengths.len()];
+            vec![
+                in_wav.to_string_lossy().into_owned(),
+                out_wav.to_string_lossy().into_owned(),
+                pitch.to_string(),
+                "100".to_string(),
+                flags.to_string(),
+                "0".to_string(),
+                length.to_string(),
+                "0".to_string(),
+                "0".to_string(),
+                "100".to_string(),
+                "0".to_string(),
+                "!120".to_string(),
+                "AA".to_string(),
+            ]
+        })
+        .collect()
+}
+
+fn partition_job_indices(total: usize, workers: usize) -> Vec<Vec<usize>> {
+    let w = workers.clamp(1, total.max(1));
+    let mut buckets = vec![Vec::new(); w];
+    for idx in 0..total {
+        buckets[idx % w].push(idx);
+    }
+    buckets
+}
+
+fn run_batch(
+    port: u16,
+    in_wav: &Path,
+    out_dir: &Path,
+    mixed: bool,
+    concurrency: usize,
+) -> Result<BatchThroughputResult, String> {
+    let jobs = build_batch_jobs(in_wav, out_dir, mixed);
+    let total_notes = jobs.len();
+    let workers = concurrency.clamp(1, total_notes);
+
     let stats_before = fetch_stats(port)?;
     let req_before = stats_before["total_requests"].as_u64().unwrap_or(0);
     let hits_before = stats_before["cache_hits"].as_u64().unwrap_or(0);
 
     let mut client_times = Vec::with_capacity(total_notes);
     let wall_t0 = Instant::now();
-    for i in 0..total_notes {
-        let out_wav = out_dir.join(format!("batch_{i}.wav"));
-        let pitch = pitches[i % pitches.len()];
-        let flags = flag_sets[i % flag_sets.len()];
-        let length = lengths[i % lengths.len()];
-        let args = vec![
-            in_wav.to_string_lossy().into_owned(),
-            out_wav.to_string_lossy().into_owned(),
-            pitch.to_string(),
-            "100".to_string(),
-            flags.to_string(),
-            "0".to_string(),
-            length.to_string(),
-            "0".to_string(),
-            "0".to_string(),
-            "100".to_string(),
-            "0".to_string(),
-            "!120".to_string(),
-            "AA".to_string(),
-        ];
-        let ms = post_note(port, &args)?;
-        client_times.push(ms);
+    if workers == 1 {
+        for args in &jobs {
+            client_times.push(post_note(port, args)?);
+        }
+    } else {
+        let buckets = partition_job_indices(total_notes, workers);
+        let per_worker: Vec<Result<Vec<f64>, String>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = buckets
+                .iter()
+                .map(|indices| {
+                    let jobs_ref = &jobs;
+                    scope.spawn(move || -> Result<Vec<f64>, String> {
+                        let mut times = Vec::with_capacity(indices.len());
+                        for &idx in indices {
+                            times.push(post_note(port, &jobs_ref[idx])?);
+                        }
+                        Ok(times)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err("Concurrent batch worker panicked".to_string()))
+                })
+                .collect()
+        });
+        for res in per_worker {
+            client_times.extend(res?);
+        }
     }
     let wall_ms = wall_t0.elapsed().as_secs_f64() * 1000.0;
+
+    for i in 0..total_notes {
+        let out_wav = out_dir.join(format!("batch_{i}.wav"));
+        if !out_wav.is_file() {
+            return Err(format!("Batch output missing: {}", out_wav.display()));
+        }
+    }
+
     let stats_after = fetch_stats(port)?;
     let req_delta = stats_after["total_requests"].as_u64().unwrap_or(0) - req_before;
     let hits_delta = stats_after["cache_hits"].as_u64().unwrap_or(0) - hits_before;
@@ -550,7 +612,7 @@ fn run_batch(
         0.0
     };
 
-    let mut srv_totals: Vec<f64> = stats_after["recent"]
+    let srv_totals: Vec<f64> = stats_after["recent"]
         .as_array()
         .map(|arr| {
             arr.iter()
@@ -560,10 +622,10 @@ fn run_batch(
         })
         .unwrap_or_default();
     let batch_srv_summary = LatencySummary::from_samples(&srv_totals);
-    srv_totals.clear();
 
     Ok(BatchThroughputResult {
         note_count: total_notes,
+        concurrency: workers,
         wall_ms,
         notes_per_sec: (total_notes as f64 * 1000.0) / wall_ms.max(1e-6),
         client_latency: LatencySummary::from_samples(&client_times),
@@ -640,10 +702,17 @@ fn run_interop_check(
     })
 }
 
-fn main() -> Result<(), String> {
-    let args: Vec<String> = std::env::args().collect();
+#[derive(Debug, PartialEq, Eq)]
+struct CliArgs {
+    explicit_root: Option<PathBuf>,
+    json_out: Option<PathBuf>,
+    rust_only: bool,
+}
+
+fn parse_cli_args(args: &[String]) -> Result<CliArgs, String> {
     let mut explicit_root: Option<PathBuf> = None;
     let mut json_out: Option<PathBuf> = None;
+    let mut rust_only = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -656,13 +725,32 @@ fn main() -> Result<(), String> {
                 i += 1;
                 json_out = Some(PathBuf::from(args.get(i).ok_or("--json-out needs value")?));
             }
+            "--rust-only" => {
+                rust_only = true;
+            }
             other => return Err(format!("Unknown argument: {other}")),
         }
         i += 1;
     }
 
-    let repo = resolve_repo_root(explicit_root.as_deref())?;
-    eprintln!("[hifi_bench] Repo root: {}", repo.display());
+    Ok(CliArgs {
+        explicit_root,
+        json_out,
+        rust_only,
+    })
+}
+
+fn main() -> Result<(), String> {
+    let args: Vec<String> = std::env::args().collect();
+    let cli = parse_cli_args(&args)?;
+    let rust_only = cli.rust_only;
+
+    let repo = resolve_repo_root(cli.explicit_root.as_deref())?;
+    eprintln!(
+        "[hifi_bench] Repo root: {} (rust_only={})",
+        repo.display(),
+        rust_only
+    );
 
     let rs_client = repo.join("rust/target/release/hifisampler.exe");
     let rs_server_bin = repo.join("rust/target/release/hifiserver.exe");
@@ -701,39 +789,42 @@ fn main() -> Result<(), String> {
     eprintln!("[hifi_bench] 1/6 Measuring server cold-start latency...");
     let mut py_default_startups = Vec::new();
     let mut py_default_peak_rss = None;
-    for r in 0..2 {
-        let p = find_free_port()?;
-        let mut srv = spawn_py_default_server(&repo, p, work_dir.join(format!("py_def_{r}.log")))?;
-        let ms = srv.wait_ready(Duration::from_secs(60))?;
-        py_default_startups.push(ms);
-        if r == 1 {
-            // Render one note so default server memory reflects real initialized inference
-            let out_tmp = work_dir.join("py_def_mem_probe.wav");
-            let src_tmp = work_dir.join("py_def_mem_src.wav");
-            fs::copy(&synth_wav, &src_tmp).map_err(|e| e.to_string())?;
-            let _ = post_note(
-                p,
-                &note_args(
-                    &src_tmp,
-                    &out_tmp,
-                    &NoteCase {
-                        name: "probe",
-                        pitch: "A4",
-                        velocity: "100",
-                        flags: "Ht20",
-                        offset: "0",
-                        length: "300",
-                        consonant: "0",
-                        cutoff: "0",
-                        tempo: "!120",
-                        pitch_string: "AA",
-                        use_real_vocal: false,
-                    },
-                ),
-            )?;
-            py_default_peak_rss = srv.peak_rss_bytes();
+    if !rust_only {
+        for r in 0..2 {
+            let p = find_free_port()?;
+            let mut srv =
+                spawn_py_default_server(&repo, p, work_dir.join(format!("py_def_{r}.log")))?;
+            let ms = srv.wait_ready(Duration::from_secs(60))?;
+            py_default_startups.push(ms);
+            if r == 1 {
+                // Render one note so default server memory reflects real initialized inference
+                let out_tmp = work_dir.join("py_def_mem_probe.wav");
+                let src_tmp = work_dir.join("py_def_mem_src.wav");
+                fs::copy(&synth_wav, &src_tmp).map_err(|e| e.to_string())?;
+                let _ = post_note(
+                    p,
+                    &note_args(
+                        &src_tmp,
+                        &out_tmp,
+                        &NoteCase {
+                            name: "probe",
+                            pitch: "A4",
+                            velocity: "100",
+                            flags: "Ht20",
+                            offset: "0",
+                            length: "300",
+                            consonant: "0",
+                            cutoff: "0",
+                            tempo: "!120",
+                            pitch_string: "AA",
+                            use_real_vocal: false,
+                        },
+                    ),
+                )?;
+                py_default_peak_rss = srv.peak_rss_bytes();
+            }
+            srv.shutdown();
         }
-        srv.shutdown();
     }
 
     // Measure CLI cold-start (auto-spawn server + 1 note) for C#->Py and Rust->Rust
@@ -744,23 +835,31 @@ fn main() -> Result<(), String> {
         fs::copy(&synth_wav, &src).map_err(|e| e.to_string())?;
         measure_cli_cold(&rs_client, &repo, &src, &out, &work_dir.join("home_cli_rs"))?
     };
-    let py_cli_cold_ms = if cs_client.is_file() {
+    let py_cli_cold_ms = if !rust_only && cs_client.is_file() {
         let src = work_dir.join("cli_cold_py_in.wav");
         let out = work_dir.join("cli_cold_py_out.wav");
         fs::copy(&synth_wav, &src).map_err(|e| e.to_string())?;
-        measure_cli_cold(&cs_client, &repo, &src, &out, &work_dir.join("home_cli_py"))?
+        Some(measure_cli_cold(
+            &cs_client,
+            &repo,
+            &src,
+            &out,
+            &work_dir.join("home_cli_py"),
+        )?)
     } else {
-        0.0
+        None
     };
 
     // Start long-lived Python (with hnsep/vr/model.onnx) and Rust servers for stages 2..6
     let mut py_onnx_startups = Vec::new();
     let mut rs_startups = Vec::new();
     {
-        let p_py = find_free_port()?;
-        let mut s_py = spawn_py_onnx_server(&repo, p_py, work_dir.join("py_onnx_boot0.log"))?;
-        py_onnx_startups.push(s_py.wait_ready(Duration::from_secs(60))?);
-        s_py.shutdown();
+        if !rust_only {
+            let p_py = find_free_port()?;
+            let mut s_py = spawn_py_onnx_server(&repo, p_py, work_dir.join("py_onnx_boot0.log"))?;
+            py_onnx_startups.push(s_py.wait_ready(Duration::from_secs(60))?);
+            s_py.shutdown();
+        }
 
         let p_rs = find_free_port()?;
         let mut s_rs = spawn_rs_server(&repo, p_rs, work_dir.join("rs_boot0.log"))?;
@@ -768,9 +867,15 @@ fn main() -> Result<(), String> {
         s_rs.shutdown();
     }
 
-    let py_port = find_free_port()?;
-    let mut py_srv = spawn_py_onnx_server(&repo, py_port, work_dir.join("py_onnx_main.log"))?;
-    py_onnx_startups.push(py_srv.wait_ready(Duration::from_secs(60))?);
+    let mut py_srv = if !rust_only {
+        let py_port = find_free_port()?;
+        let mut srv = spawn_py_onnx_server(&repo, py_port, work_dir.join("py_onnx_main.log"))?;
+        py_onnx_startups.push(srv.wait_ready(Duration::from_secs(60))?);
+        Some(srv)
+    } else {
+        None
+    };
+    let py_port_opt = py_srv.as_ref().map(|s| s.port);
 
     let rs_port = find_free_port()?;
     let mut rs_srv = spawn_rs_server(&repo, rs_port, work_dir.join("rs_main.log"))?;
@@ -811,7 +916,7 @@ fn main() -> Result<(), String> {
         5,
     )?;
 
-    let py_cli_warm = if cs_client.is_file() {
+    let py_cli_warm = if let (Some(py_port), true) = (py_port_opt, cs_client.is_file()) {
         let py_cli_warm_dir = work_dir.join("cli_warm_py");
         fs::create_dir_all(&py_cli_warm_dir).map_err(|e| e.to_string())?;
         let _ = post_note(
@@ -834,7 +939,7 @@ fn main() -> Result<(), String> {
                 },
             ),
         )?;
-        measure_cli_warm(
+        Some(measure_cli_warm(
             &cs_client,
             &repo,
             py_port,
@@ -842,9 +947,9 @@ fn main() -> Result<(), String> {
             &py_cli_warm_dir,
             &work_dir.join("home_warm_py"),
             5,
-        )?
+        )?)
     } else {
-        LatencySummary::from_samples(&[])
+        None
     };
 
     // 2 & 6. Cold Render (cache miss) stage timings & audio equivalence
@@ -960,40 +1065,43 @@ fn main() -> Result<(), String> {
 
     let mut cold_cases = Vec::new();
     for c in &cases {
-        let py_dir = work_dir.join("cold_py").join(c.name);
         let rs_dir = work_dir.join("cold_rs").join(c.name);
-        fs::create_dir_all(&py_dir).map_err(|e| e.to_string())?;
         fs::create_dir_all(&rs_dir).map_err(|e| e.to_string())?;
-
         let src_template = if c.use_real_vocal {
             &real_vocal_copy
         } else {
             &synth_wav
         };
-        let py_in = py_dir.join("input.wav");
         let rs_in = rs_dir.join("input.wav");
-        fs::copy(src_template, &py_in).map_err(|e| e.to_string())?;
         fs::copy(src_template, &rs_in).map_err(|e| e.to_string())?;
-
-        let py_out = py_dir.join("out.wav");
         let rs_out = rs_dir.join("out.wav");
-
-        let py_wall = post_note(py_port, &note_args(&py_in, &py_out, c))?;
-        let py_timing = latest_stage_timing(py_port, py_wall)?;
 
         let rs_wall = post_note(rs_port, &note_args(&rs_in, &rs_out, c))?;
         let rs_timing = latest_stage_timing(rs_port, rs_wall)?;
 
-        let equivalence = compare_wav_files(&py_out, &rs_out)?;
+        let (py_opt, eq_opt) = if let Some(py_port) = py_port_opt {
+            let py_dir = work_dir.join("cold_py").join(c.name);
+            fs::create_dir_all(&py_dir).map_err(|e| e.to_string())?;
+            let py_in = py_dir.join("input.wav");
+            fs::copy(src_template, &py_in).map_err(|e| e.to_string())?;
+            let py_out = py_dir.join("out.wav");
+            let py_wall = post_note(py_port, &note_args(&py_in, &py_out, c))?;
+            let py_timing = latest_stage_timing(py_port, py_wall)?;
+            let equivalence = compare_wav_files(&py_out, &rs_out)?;
+            (Some(py_timing), Some(equivalence))
+        } else {
+            (None, None)
+        };
+
         cold_cases.push(ColdCaseComparison {
             name: c.name.to_string(),
             flags: c.flags.to_string(),
             pitch: c.pitch.to_string(),
             length: c.length.to_string(),
             pitch_string: c.pitch_string.to_string(),
-            python: py_timing,
+            python: py_opt,
             rust: rs_timing,
-            equivalence,
+            equivalence: eq_opt,
         });
     }
 
@@ -1014,10 +1122,14 @@ fn main() -> Result<(), String> {
     };
 
     // RAM cache hits using the existing cold_py/cold_rs Ht50Ho40Hr-30 directory
-    let py_ram_in = work_dir.join("cold_py/Ht50Ho40Hr-30/input.wav");
-    let py_ram_out = work_dir.join("cold_py/Ht50Ho40Hr-30/out_warm_ram.wav");
-    let py_ram_wall = post_note(py_port, &note_args(&py_ram_in, &py_ram_out, &warm_case))?;
-    let py_warm_ram = latest_stage_timing(py_port, py_ram_wall)?;
+    let py_warm_ram = if let Some(py_port) = py_port_opt {
+        let py_ram_in = work_dir.join("cold_py/Ht50Ho40Hr-30/input.wav");
+        let py_ram_out = work_dir.join("cold_py/Ht50Ho40Hr-30/out_warm_ram.wav");
+        let py_ram_wall = post_note(py_port, &note_args(&py_ram_in, &py_ram_out, &warm_case))?;
+        Some(latest_stage_timing(py_port, py_ram_wall)?)
+    } else {
+        None
+    };
 
     let rs_ram_in = work_dir.join("cold_rs/Ht50Ho40Hr-30/input.wav");
     let rs_ram_out = work_dir.join("cold_rs/Ht50Ho40Hr-30/out_warm_ram.wav");
@@ -1025,32 +1137,14 @@ fn main() -> Result<(), String> {
     let rs_warm_ram = latest_stage_timing(rs_port, rs_ram_wall)?;
 
     // Disk cache hits using fresh servers (no L1 RAM entry) on a pre-cached directory
-    let py_disk_dir = work_dir.join("warm_disk_py");
     let rs_disk_dir = work_dir.join("warm_disk_rs");
-    fs::create_dir_all(&py_disk_dir).map_err(|e| e.to_string())?;
     fs::create_dir_all(&rs_disk_dir).map_err(|e| e.to_string())?;
-    let py_disk_in = py_disk_dir.join("input.wav");
     let rs_disk_in = rs_disk_dir.join("input.wav");
-    fs::copy(&synth_wav, &py_disk_in).map_err(|e| e.to_string())?;
     fs::copy(&synth_wav, &rs_disk_in).map_err(|e| e.to_string())?;
-    let _ = post_note(
-        py_port,
-        &note_args(&py_disk_in, &py_disk_dir.join("seed.wav"), &warm_case),
-    )?;
     let _ = post_note(
         rs_port,
         &note_args(&rs_disk_in, &rs_disk_dir.join("seed.wav"), &warm_case),
     )?;
-
-    let py_disk_srv_port = find_free_port()?;
-    let mut py_disk_srv =
-        spawn_py_onnx_server(&repo, py_disk_srv_port, work_dir.join("py_disk.log"))?;
-    let _ = py_disk_srv.wait_ready(Duration::from_secs(60))?;
-    let py_disk_wall = post_note(
-        py_disk_srv_port,
-        &note_args(&py_disk_in, &py_disk_dir.join("warm.wav"), &warm_case),
-    )?;
-    let py_warm_disk = latest_stage_timing(py_disk_srv_port, py_disk_wall)?;
 
     let rs_disk_srv_port = find_free_port()?;
     let mut rs_disk_srv = spawn_rs_server(&repo, rs_disk_srv_port, work_dir.join("rs_disk.log"))?;
@@ -1061,41 +1155,72 @@ fn main() -> Result<(), String> {
     )?;
     let rs_warm_disk = latest_stage_timing(rs_disk_srv_port, rs_disk_wall)?;
 
-    let interop_dir = work_dir.join("interop");
-    let py_to_rs_default = run_interop_check(
-        py_port,
-        rs_disk_srv_port,
-        &synth_wav,
-        &interop_dir,
-        "py_to_rs_def",
-        "",
-    )?;
-    let py_to_rs_fx = run_interop_check(
-        py_port,
-        rs_disk_srv_port,
-        &synth_wav,
-        &interop_dir,
-        "py_to_rs_fx",
-        "Ht50Ho40Hr-30",
-    )?;
-    let rs_to_py_default = run_interop_check(
-        rs_port,
-        py_disk_srv_port,
-        &synth_wav,
-        &interop_dir,
-        "rs_to_py_def",
-        "",
-    )?;
-    let rs_to_py_fx = run_interop_check(
-        rs_port,
-        py_disk_srv_port,
-        &synth_wav,
-        &interop_dir,
-        "rs_to_py_fx",
-        "Ht50Ho40Hr-30",
-    )?;
+    let (py_warm_disk, py_to_rs_default, py_to_rs_fx, rs_to_py_default, rs_to_py_fx) =
+        if let Some(py_port) = py_port_opt {
+            let py_disk_dir = work_dir.join("warm_disk_py");
+            fs::create_dir_all(&py_disk_dir).map_err(|e| e.to_string())?;
+            let py_disk_in = py_disk_dir.join("input.wav");
+            fs::copy(&synth_wav, &py_disk_in).map_err(|e| e.to_string())?;
+            let _ = post_note(
+                py_port,
+                &note_args(&py_disk_in, &py_disk_dir.join("seed.wav"), &warm_case),
+            )?;
 
-    py_disk_srv.shutdown();
+            let py_disk_srv_port = find_free_port()?;
+            let mut py_disk_srv =
+                spawn_py_onnx_server(&repo, py_disk_srv_port, work_dir.join("py_disk.log"))?;
+            let _ = py_disk_srv.wait_ready(Duration::from_secs(60))?;
+            let py_disk_wall = post_note(
+                py_disk_srv_port,
+                &note_args(&py_disk_in, &py_disk_dir.join("warm.wav"), &warm_case),
+            )?;
+            let py_warm_disk = latest_stage_timing(py_disk_srv_port, py_disk_wall)?;
+
+            let interop_dir = work_dir.join("interop");
+            let py_to_rs_default = run_interop_check(
+                py_port,
+                rs_disk_srv_port,
+                &synth_wav,
+                &interop_dir,
+                "py_to_rs_def",
+                "",
+            )?;
+            let py_to_rs_fx = run_interop_check(
+                py_port,
+                rs_disk_srv_port,
+                &synth_wav,
+                &interop_dir,
+                "py_to_rs_fx",
+                "Ht50Ho40Hr-30",
+            )?;
+            let rs_to_py_default = run_interop_check(
+                rs_port,
+                py_disk_srv_port,
+                &synth_wav,
+                &interop_dir,
+                "rs_to_py_def",
+                "",
+            )?;
+            let rs_to_py_fx = run_interop_check(
+                rs_port,
+                py_disk_srv_port,
+                &synth_wav,
+                &interop_dir,
+                "rs_to_py_fx",
+                "Ht50Ho40Hr-30",
+            )?;
+            py_disk_srv.shutdown();
+            (
+                Some(py_warm_disk),
+                Some(py_to_rs_default),
+                Some(py_to_rs_fx),
+                Some(rs_to_py_default),
+                Some(rs_to_py_fx),
+            )
+        } else {
+            (None, None, None, None, None)
+        };
+
     rs_disk_srv.shutdown();
 
     let warm_and_interop = WarmAndInteropResult {
@@ -1109,76 +1234,113 @@ fn main() -> Result<(), String> {
         rs_to_py_fx,
     };
 
-    // 4. Multi-note batch throughput (mixed cold+warm & pure warm)
-    eprintln!("[hifi_bench] 4/6 Measuring 20-note batch throughput...");
-    let mix_py_dir = work_dir.join("batch_mix_py");
-    let mix_rs_dir = work_dir.join("batch_mix_rs");
-    fs::create_dir_all(&mix_py_dir).map_err(|e| e.to_string())?;
-    fs::create_dir_all(&mix_rs_dir).map_err(|e| e.to_string())?;
-    let mix_py_in = mix_py_dir.join("batch_src.wav");
-    let mix_rs_in = mix_rs_dir.join("batch_src.wav");
-    fs::copy(&synth_wav, &mix_py_in).map_err(|e| e.to_string())?;
-    fs::copy(&synth_wav, &mix_rs_in).map_err(|e| e.to_string())?;
-    let mixed_batch_py = run_batch(py_port, &mix_py_in, &mix_py_dir, true)?;
-    let mixed_batch_rs = run_batch(rs_port, &mix_rs_in, &mix_rs_dir, true)?;
+    let prewarm_case = NoteCase {
+        name: "pw",
+        pitch: "C4",
+        velocity: "100",
+        flags: "",
+        offset: "0",
+        length: "250",
+        consonant: "0",
+        cutoff: "0",
+        tempo: "!120",
+        pitch_string: "AA",
+        use_real_vocal: false,
+    };
 
-    let warm_py_dir = work_dir.join("batch_warm_py");
+    // 4. Multi-note batch throughput (sequential + 2-worker concurrent phrase bursts)
+    eprintln!("[hifi_bench] 4/6 Measuring 20-note sequential & 2-worker concurrent bursts...");
+    let mix_rs_dir = work_dir.join("batch_mix_rs");
+    fs::create_dir_all(&mix_rs_dir).map_err(|e| e.to_string())?;
+    let mix_rs_in = mix_rs_dir.join("batch_src.wav");
+    fs::copy(&synth_wav, &mix_rs_in).map_err(|e| e.to_string())?;
+    let mixed_batch_rs = run_batch(rs_port, &mix_rs_in, &mix_rs_dir, true, 1)?;
+
     let warm_rs_dir = work_dir.join("batch_warm_rs");
-    fs::create_dir_all(&warm_py_dir).map_err(|e| e.to_string())?;
     fs::create_dir_all(&warm_rs_dir).map_err(|e| e.to_string())?;
-    let warm_py_in = warm_py_dir.join("batch_src.wav");
     let warm_rs_in = warm_rs_dir.join("batch_src.wav");
-    fs::copy(&synth_wav, &warm_py_in).map_err(|e| e.to_string())?;
     fs::copy(&synth_wav, &warm_rs_in).map_err(|e| e.to_string())?;
-    // Pre-warm default cache
     let _ = post_note(
-        py_port,
-        &note_args(
-            &warm_py_in,
-            &warm_py_dir.join("prewarm.wav"),
-            &NoteCase {
-                name: "pw",
-                pitch: "C4",
-                velocity: "100",
-                flags: "",
-                offset: "0",
-                length: "250",
-                consonant: "0",
-                cutoff: "0",
-                tempo: "!120",
-                pitch_string: "AA",
-                use_real_vocal: false,
-            },
-        ),
+        rs_port,
+        &note_args(&warm_rs_in, &warm_rs_dir.join("prewarm.wav"), &prewarm_case),
     )?;
+    let warm_batch_rs = run_batch(rs_port, &warm_rs_in, &warm_rs_dir, false, 1)?;
+
+    let cmix_rs_dir = work_dir.join("batch_concurrent_mix_rs");
+    fs::create_dir_all(&cmix_rs_dir).map_err(|e| e.to_string())?;
+    let cmix_rs_in = cmix_rs_dir.join("batch_src.wav");
+    fs::copy(&synth_wav, &cmix_rs_in).map_err(|e| e.to_string())?;
+    let concurrent_mixed_batch_rs = run_batch(rs_port, &cmix_rs_in, &cmix_rs_dir, true, 2)?;
+
+    let cwarm_rs_dir = work_dir.join("batch_concurrent_warm_rs");
+    fs::create_dir_all(&cwarm_rs_dir).map_err(|e| e.to_string())?;
+    let cwarm_rs_in = cwarm_rs_dir.join("batch_src.wav");
+    fs::copy(&synth_wav, &cwarm_rs_in).map_err(|e| e.to_string())?;
     let _ = post_note(
         rs_port,
         &note_args(
-            &warm_rs_in,
-            &warm_rs_dir.join("prewarm.wav"),
-            &NoteCase {
-                name: "pw",
-                pitch: "C4",
-                velocity: "100",
-                flags: "",
-                offset: "0",
-                length: "250",
-                consonant: "0",
-                cutoff: "0",
-                tempo: "!120",
-                pitch_string: "AA",
-                use_real_vocal: false,
-            },
+            &cwarm_rs_in,
+            &cwarm_rs_dir.join("prewarm.wav"),
+            &prewarm_case,
         ),
     )?;
-    let warm_batch_py = run_batch(py_port, &warm_py_in, &warm_py_dir, false)?;
-    let warm_batch_rs = run_batch(rs_port, &warm_rs_in, &warm_rs_dir, false)?;
+    let concurrent_warm_batch_rs = run_batch(rs_port, &cwarm_rs_in, &cwarm_rs_dir, false, 2)?;
+
+    let (mixed_batch_py, warm_batch_py, concurrent_mixed_batch_py, concurrent_warm_batch_py) =
+        if let Some(py_port) = py_port_opt {
+            let mix_py_dir = work_dir.join("batch_mix_py");
+            fs::create_dir_all(&mix_py_dir).map_err(|e| e.to_string())?;
+            let mix_py_in = mix_py_dir.join("batch_src.wav");
+            fs::copy(&synth_wav, &mix_py_in).map_err(|e| e.to_string())?;
+            let seq_mix = run_batch(py_port, &mix_py_in, &mix_py_dir, true, 1)?;
+
+            let warm_py_dir = work_dir.join("batch_warm_py");
+            fs::create_dir_all(&warm_py_dir).map_err(|e| e.to_string())?;
+            let warm_py_in = warm_py_dir.join("batch_src.wav");
+            fs::copy(&synth_wav, &warm_py_in).map_err(|e| e.to_string())?;
+            let _ = post_note(
+                py_port,
+                &note_args(&warm_py_in, &warm_py_dir.join("prewarm.wav"), &prewarm_case),
+            )?;
+            let seq_warm = run_batch(py_port, &warm_py_in, &warm_py_dir, false, 1)?;
+
+            let cmix_py_dir = work_dir.join("batch_concurrent_mix_py");
+            fs::create_dir_all(&cmix_py_dir).map_err(|e| e.to_string())?;
+            let cmix_py_in = cmix_py_dir.join("batch_src.wav");
+            fs::copy(&synth_wav, &cmix_py_in).map_err(|e| e.to_string())?;
+            let conc_mix = run_batch(py_port, &cmix_py_in, &cmix_py_dir, true, 2)?;
+
+            let cwarm_py_dir = work_dir.join("batch_concurrent_warm_py");
+            fs::create_dir_all(&cwarm_py_dir).map_err(|e| e.to_string())?;
+            let cwarm_py_in = cwarm_py_dir.join("batch_src.wav");
+            fs::copy(&synth_wav, &cwarm_py_in).map_err(|e| e.to_string())?;
+            let _ = post_note(
+                py_port,
+                &note_args(
+                    &cwarm_py_in,
+                    &cwarm_py_dir.join("prewarm.wav"),
+                    &prewarm_case,
+                ),
+            )?;
+            let conc_warm = run_batch(py_port, &cwarm_py_in, &cwarm_py_dir, false, 2)?;
+
+            (
+                Some(seq_mix),
+                Some(seq_warm),
+                Some(conc_mix),
+                Some(conc_warm),
+            )
+        } else {
+            (None, None, None, None)
+        };
 
     // 5. Peak memory RSS
     eprintln!("[hifi_bench] 5/6 Capturing peak RSS...");
-    let py_onnx_peak_rss = py_srv.peak_rss_bytes();
+    let py_onnx_peak_rss = py_srv.as_ref().and_then(|s| s.peak_rss_bytes());
     let rs_server_peak_rss = rs_srv.peak_rss_bytes();
-    py_srv.shutdown();
+    if let Some(ref mut srv) = py_srv {
+        srv.shutdown();
+    }
     rs_srv.shutdown();
 
     let report = FullBenchmarkReport {
@@ -1200,6 +1362,10 @@ fn main() -> Result<(), String> {
         mixed_batch_rs,
         warm_batch_py,
         warm_batch_rs,
+        concurrent_mixed_batch_py,
+        concurrent_mixed_batch_rs,
+        concurrent_warm_batch_py,
+        concurrent_warm_batch_rs,
         memory: MemoryReport {
             py_default_peak_rss_bytes: py_default_peak_rss,
             py_onnx_peak_rss_bytes: py_onnx_peak_rss,
@@ -1209,7 +1375,7 @@ fn main() -> Result<(), String> {
 
     let json_text =
         serde_json::to_string_pretty(&report).map_err(|e| format!("JSON serialize failed: {e}"))?;
-    if let Some(out_path) = json_out {
+    if let Some(out_path) = cli.json_out {
         if let Some(parent) = out_path.parent() {
             let _ = fs::create_dir_all(parent);
         }
@@ -1221,4 +1387,38 @@ fn main() -> Result<(), String> {
 
     let _ = fs::remove_dir_all(&work_dir);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_args_parse_flags_cleanly() {
+        let args = vec![
+            "hifi_bench".to_string(),
+            "--rust-only".to_string(),
+            "--root".to_string(),
+            "C:/Project/hifi".to_string(),
+            "--json-out".to_string(),
+            "out.json".to_string(),
+        ];
+        let parsed = parse_cli_args(&args).expect("should parse valid args");
+        assert!(parsed.rust_only);
+        assert_eq!(parsed.explicit_root, Some(PathBuf::from("C:/Project/hifi")));
+        assert_eq!(parsed.json_out, Some(PathBuf::from("out.json")));
+    }
+
+    #[test]
+    fn batch_jobs_and_partitioning_cover_all_twenty_notes() {
+        let jobs = build_batch_jobs(Path::new("in.wav"), Path::new("out_dir"), true);
+        assert_eq!(jobs.len(), 20);
+        let buckets = partition_job_indices(jobs.len(), 2);
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(buckets[0].len(), 10);
+        assert_eq!(buckets[1].len(), 10);
+        let mut seen: Vec<usize> = buckets.into_iter().flatten().collect();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..20).collect::<Vec<usize>>());
+    }
 }
