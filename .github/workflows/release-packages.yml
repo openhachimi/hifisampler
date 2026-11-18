@@ -20,34 +20,47 @@ permissions:
   contents: write
 
 jobs:
+  select-matrix:
+    name: Select Target Platforms
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - id: set
+        env:
+          PLATFORMS_INPUT: ${{ inputs.platforms }}
+        shell: bash
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+
+          all_targets = [
+              {"id": "win64", "runner": "windows-latest", "pkg_platform": "win64-dml", "ort_pkg": "onnxruntime-directml==1.24.4"},
+              {"id": "macos-arm64", "runner": "macos-15", "pkg_platform": "macos-arm64-coreml", "ort_pkg": "onnxruntime==1.24.4"},
+              {"id": "macos-x64", "runner": "macos-15-intel", "pkg_platform": "macos-x64-coreml", "ort_pkg": "onnxruntime==1.23.2"},
+              {"id": "linux-x64", "runner": "ubuntu-latest", "pkg_platform": "linux-x64-aio", "ort_pkg": "onnxruntime==1.24.4"},
+              {"id": "linux-arm64", "runner": "ubuntu-24.04-arm", "pkg_platform": "linux-arm64-aio", "ort_pkg": "onnxruntime==1.24.4"},
+          ]
+          sel = os.environ.get("PLATFORMS_INPUT", "all").strip().lower()
+          if not sel or sel == "all":
+              chosen = all_targets
+          elif sel == "unix":
+              chosen = [m for m in all_targets if m["id"] != "win64"]
+          else:
+              wanted = {x.strip() for x in sel.split(",") if x.strip()}
+              chosen = [m for m in all_targets if m["id"] in wanted]
+          if not chosen:
+              raise SystemExit(f"No platforms matched PLATFORMS_INPUT={sel!r}")
+          print("matrix=" + json.dumps({"include": chosen}))
+          PY
+
   package-melos:
     name: Build & Package Melos (${{ matrix.id }})
+    needs: select-matrix
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - id: win64
-            runner: windows-latest
-            pkg_platform: win64-dml
-            ort_pkg: onnxruntime-directml==1.24.4
-          - id: macos-arm64
-            runner: macos-15
-            pkg_platform: macos-arm64-coreml
-            ort_pkg: onnxruntime==1.24.4
-          - id: macos-x64
-            runner: macos-15-intel
-            pkg_platform: macos-x64-coreml
-            ort_pkg: onnxruntime==1.23.2
-          - id: linux-x64
-            runner: ubuntu-latest
-            pkg_platform: linux-x64-aio
-            ort_pkg: onnxruntime==1.24.4
-          - id: linux-arm64
-            runner: ubuntu-24.04-arm
-            pkg_platform: linux-arm64-aio
-            ort_pkg: onnxruntime==1.24.4
-    if: ${{ inputs.platforms == 'all' || (inputs.platforms == 'unix' && matrix.id != 'win64') || contains(inputs.platforms, matrix.id) }}
+      matrix: ${{ fromJson(needs.select-matrix.outputs.matrix) }}
 
     steps:
       - name: Checkout melos branch / tag
