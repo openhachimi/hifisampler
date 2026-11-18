@@ -6,6 +6,17 @@
 
 **如果您用于人力 VOCALOID（音MAD），推荐使用我们的 [Hachimisampler](https://github.com/openhachimi/hachimisampler)。**
 
+## 下一代 Rust 引擎分支：Melos（`melos` 分支）
+
+当前 `main` 分支为 Python 版 **hifisampler**；如果您需要纯 Rust 重写的下一代引擎，请前往独立的 **[`melos` 分支（Melos）](https://github.com/openhachimi/hifisampler/tree/melos)**：
+
+- **直接支持原生 OpenUtau 客户端的整句连续 Mel 合成（`melos` + `melos-wavtool`）**：无需更换 OpenUtau 客户端，即可将“逐音独立合成 WAV 再做波形交叉淡化”升级为**整句连续 Mel 频谱 + F0 拼接、单次 GPU 声码器直出**（含首尾上下文帧填充与裁切），消除音符交叠处的相位抵消凹陷，连音过渡更自然，整句渲染提速约 **1.5x–2.3x**。
+- **纯 Rust 原生架构 + 一键整合包**：脱离 Python / PyTorch 运行时依赖，超轻量客户端（约 500 KiB）配合原生 ONNX Runtime（DirectML / CUDA / CoreML / CPU）推理服务端，并支持独立单音兼容用法与全套表现力表情参数。
+
+👉 **前往查看：[Melos 中文文档 (`melos` 分支)](https://github.com/openhachimi/hifisampler/blob/melos/README_zh_cn.md) | [`melos` 分支代码主页](https://github.com/openhachimi/hifisampler/tree/melos)**
+
+---
+
 ## 为什么叫 hifisampler?
 
 hifisampler 由 [straycatresampler](https://github.com/UtaUtaUtau/straycat) 修改而来，用神经网络声码器 pc-nsf-hifigan 替换了传统的 WORLD 声码器。

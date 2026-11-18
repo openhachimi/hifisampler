@@ -6,6 +6,17 @@ A neural UTAU / OpenUtau resampler based on [pc-nsf-hifigan](https://github.com/
 
 **For Jinriki VOCALOID / OtoMAD use, please check out our [Hachimisampler](https://github.com/openhachimi/hachimisampler).**
 
+## Next-Gen Rust Engine Branch: Melos (`melos` branch)
+
+The `main` branch maintains the Python-based **hifisampler**. For the next-generation pure-Rust rewrite, check out the dedicated **[`melos` branch (Melos)](https://github.com/openhachimi/hifisampler/tree/melos)**:
+
+- **Full-Phrase Continuous Mel Synthesis (`melos` + `melos-wavtool`)**: Directly supports the native OpenUtau client and classic UTAU. Replaces isolated per-note WAV rendering + waveform crossfading with **continuous Mel + F0 splicing and a single GPU vocoder pass per phrase** (with front/tail context padding & crop), eliminating phase-cancellation dips at legato transitions and speeding up phrase renders by **1.5x–2.3x**.
+- **Pure-Rust Runtime & All-in-One Package**: Zero Python or PyTorch runtime dependencies in production (~500 KiB CLI clients + native DirectML / CUDA / CoreML / CPU ONNX Runtime server), faster cold starts, lower memory footprint, and full expression flag support.
+
+👉 **Explore Melos: [Melos Documentation (`melos` branch)](https://github.com/openhachimi/hifisampler/tree/melos) | [Melos EN README](https://github.com/openhachimi/hifisampler/blob/melos/README.md)**
+
+---
+
 ## Why is it called hifisampler?
 
 hifisampler was modified from [straycatresampler](https://github.com/UtaUtaUtau/straycat), replacing the traditional WORLD vocoder with the neural vocoder pc-nsf-hifigan.
