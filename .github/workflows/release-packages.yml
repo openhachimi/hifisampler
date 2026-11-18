@@ -61,7 +61,7 @@ jobs:
 
           $items = @(
             "backend", "client", "util", "hnsep",
-            "config.default.yaml", "config.yaml", "hifisampler.exe", "hifisampler.sh", "hifisampler.yaml",
+            "config.default.yaml", "config.py", "hifisampler.exe", "hifisampler.sh", "hifisampler.yaml",
             "hifiserver.py", "launch_server.py", "LICENSE", "pyproject.toml",
             "README.md", "README_zh_cn.md", "requirements.txt", "start.bat", "start.sh"
           )
@@ -144,13 +144,53 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $envPy = Join-Path $PWD "stage\hifisampler\env\python.exe"
+          $stage = Join-Path $PWD "stage\hifisampler"
+          $envPy = Join-Path $stage "env\python.exe"
           if ("${{ matrix.flavor }}" -eq "cuda") {
             & $envPy -c "import sys, torch, onnxruntime as ort, aiohttp, soundfile, pyloudnorm, numba; print('Python:', sys.executable); print('Torch:', torch.__version__, 'CUDA:', torch.version.cuda); assert torch.version.cuda, 'CUDA version empty!'"
           } else {
             & $envPy -c "import sys, torch, onnxruntime as ort, aiohttp, soundfile, pyloudnorm, numba; print('Python:', sys.executable); print('ORT providers:', ort.get_available_providers()); assert 'DmlExecutionProvider' in ort.get_available_providers(), 'DmlExecutionProvider missing!'"
           }
           if ($LASTEXITCODE -ne 0) { throw "Environment verification failed!" }
+
+          Push-Location $stage
+          try {
+            $requiredFiles = @(
+              "config.py", "config.default.yaml", "config.yaml",
+              "hifiserver.py", "launch_server.py", "hifisampler.exe", "hifisampler.yaml",
+              "start.bat", "backend\models.py", "backend\resampler.py", "backend\server.py",
+              "pc_nsf_hifigan_44.1k_hop512_128bin_2025.02\model.onnx",
+              "hnsep\vr\model.pt"
+            )
+            if ("${{ matrix.flavor }}" -eq "cuda") {
+              $requiredFiles += "pc_nsf_hifigan_44.1k_hop512_128bin_2025.02\model.ckpt"
+            }
+            foreach ($req in $requiredFiles) {
+              if (-not (Test-Path $req)) { throw "Missing required staged file: $req" }
+            }
+
+            & $envPy -c "import torch, hifiserver, launch_server; from config import CONFIG; CONFIG.device_preference = 'cpu'; CONFIG.device = torch.device('cpu'); from backend import models, server, resampler; models.initialize_models(); print('Stage smoke OK:', hifiserver.version, CONFIG.model_type)"
+            if ($LASTEXITCODE -ne 0) { throw "Staged application smoke test failed!" }
+
+            $tmpHome = Join-Path $env:RUNNER_TEMP "hifi_home_${{ matrix.flavor }}"
+            New-Item -ItemType Directory -Force -Path $tmpHome | Out-Null
+            $prevUserProfile = $env:USERPROFILE
+            try {
+              $env:USERPROFILE = $tmpHome
+              cmd /c "start.bat --register-only <nul"
+              if ($LASTEXITCODE -ne 0) { throw "start.bat --register-only failed with exit code $LASTEXITCODE" }
+              if (-not (Test-Path (Join-Path $tmpHome ".hifisampler\server.json"))) {
+                throw "start.bat --register-only did not write server.json locator beacon!"
+              }
+            } finally {
+              $env:USERPROFILE = $prevUserProfile
+              if (Test-Path $tmpHome) { Remove-Item -Recurse -Force $tmpHome }
+            }
+
+            Get-ChildItem $stage -Recurse -Directory -Filter "__pycache__" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
+          } finally {
+            Pop-Location
+          }
 
       - name: Compress and Upload Release Asset (${{ matrix.flavor }})
         env:
