@@ -40,20 +40,26 @@
 
 ## 如何使用？
 
-### 方式一：使用 All-in-One 一键整合包（Windows 推荐，开箱即用）
+### 方式一：使用 All-in-One 一键整合包（Windows / macOS / Linux 推荐，开箱即用）
 
 无需安装 Rust、Python 或手动配置任何环境与模型依赖：
 
-1. 前往 [Releases](https://github.com/openhachimi/hifisampler/releases) 下载对应版本的 Melos All-in-One 一键整合包（例如 `melos-v0.2.0-win64-dml.zip`，Release 标题 `v0.2.0-melos`；Windows 全显卡通用：内置 DirectML 加速与完整 ONNX 模型，支持 AMD / Intel / NVIDIA 独显、核显及纯 CPU）并解压。
+1. 前往 [Releases](https://github.com/openhachimi/hifisampler/releases) 下载对应系统的 Melos All-in-One 一键整合包（Release 标题 `v0.2.0-melos`）：
+   - **Windows x64**：`melos-v0.2.0-win64-dml.zip`（内置 DirectML 加速与完整 ONNX 模型，支持 AMD / Intel / NVIDIA 独显、核显及纯 CPU）
+   - **macOS（Apple Silicon M 系列）**：`melos-v0.2.0-macos-arm64-coreml.tar.gz`（内置 arm64 CoreML / CPU ONNX Runtime 与完整 ONNX 模型）
+   - **macOS（Intel）**：`melos-v0.2.0-macos-x64-coreml.tar.gz`（内置 x86_64 CoreML / CPU ONNX Runtime 与完整 ONNX 模型）
+   - **Linux x64 / ARM64**：`melos-v0.2.0-linux-x64-aio.tar.gz` / `melos-v0.2.0-linux-arm64-aio.tar.gz`（内置 ONNX Runtime 与完整 ONNX 模型；若需只含 Apache-2.0 纯程序的压缩包，也可按平台选择 `*-bins-only.*`）
    - **版本号约定（与 `main` 分支区分）**：为避免与同仓库的 `hifisampler`（`main` 分支，采用奇数次版本号 `0.1.0` / `0.3.0` / `0.5.0`……）混淆，**Melos（`melos` 分支）从 `0.2.0` 起步并采用偶数次版本号**（`0.2.0`、`0.4.0`、`0.6.0`……）。同时 Melos 默认使用独立端口 `8574` 与独立信标 `~/.melos/server.json`，可与旧版同机共存互不干扰。
-2. **首次使用时运行一次目录中的 `start.bat`**（会自动注册引擎路径并启动后台推理服务）。
-   - 注册完成后，日常在 OpenUtau 中**无需手动提前运行 `start.bat`**——每次渲染时 `melos.exe` 检测到服务端未运行，都会自动在后台按需拉起服务端并在就绪后完成渲染。
+2. **首次使用时初始化注册并预热服务**：
+   - **Windows**：双击运行一次目录中的 `start.bat`（会自动生成 `config.yaml`、注册 `~/.melos/server.json` 并启动后台推理服务）。
+   - **macOS / Linux**：解压后先清理一次 macOS 下载隔离属性（仅 macOS 需要：`xattr -cr ./melos`），然后运行 `bash ./melos/start.sh --register-only`（或直接 `bash ./melos/start.sh` 前台启动观察日志）。
+   - 注册完成后，日常在 OpenUtau 中**无需手动提前运行启动脚本**——每次渲染时 `melos` / `melos.exe` 检测到服务端未运行，都会自动在后台按需拉起服务端并在就绪后完成渲染。
 3. **接入原生 OpenUtau 客户端（保持默认的 `CLASSIC` 渲染器）**：
    - **整句连续 Mel 合成（推荐）**：
-     1. 将整合包中的 `melos.exe` 与 `melos.yaml` 复制到 OpenUtau 的 `Resamplers` 文件夹；
-     2. 将 `melos-wavtool.exe` 复制到 OpenUtau 的 `Wavtools` 文件夹（注：`melos.exe` 内置双角色自动识别，直接将 `melos.exe` 复制一份放入 `Wavtools` 文件夹同样可用）；
-     3. 在 OpenUtau 轨道头将 **重采样器（Resampler）** 设为 `melos.exe`，将 **拼接器（Wavtool）** 设为 `melos-wavtool.exe`。
-   - **单音兼容用法（可选）**：若需搭配 OpenUtau 内置 `convergence` / `simple` 拼接器，仅将 `melos.exe` 与 `melos.yaml` 放入 `Resamplers` 文件夹即可，`melos.exe` 会自动回退为标准单音合成。
+     1. 将整合包中的 `melos.exe`（macOS / Linux 为 `melos`）与 `melos.yaml` 复制到 OpenUtau 的 `Resamplers` 文件夹（macOS / Linux 默认位于 `~/.local/share/OpenUtau/Resamplers/` 或 `~/Library/Application Support/OpenUtau/Resamplers/`）；
+     2. 将 `melos-wavtool.exe`（macOS / Linux 为 `melos-wavtool`）复制到 OpenUtau 的 `Wavtools` 文件夹（注：`melos` 内置双角色自动识别，复制一份 `melos` / `melos.exe` 放入 `Wavtools` 文件夹同样可用）；
+     3. 在 OpenUtau 轨道头将 **重采样器（Resampler）** 设为 `melos.exe`（/ `melos`），将 **拼接器（Wavtool）** 设为 `melos-wavtool.exe`（/ `melos-wavtool`）。
+   - **单音兼容用法（可选）**：若需搭配 OpenUtau 内置 `convergence` / `simple` 拼接器，仅将 `melos.exe`（/ `melos`）与 `melos.yaml` 放入 `Resamplers` 文件夹即可，`melos` 会自动回退为标准单音合成。
 4. 在钢琴卷帘左下角点击 **`⚙`（表情设置） ->「添加渲染器建议的所有表情」->「应用」**，即可使用全部表情参数。
 
 ---

@@ -40,20 +40,26 @@ Traditional UTAU / OpenUtau resamplers are constrained to per-note synthesis, pr
 
 ## How to Use?
 
-### Method 1: All-in-One (AIO) Package (Recommended on Windows — Ready Out of the Box)
+### Method 1: All-in-One (AIO) Package (Recommended — Windows / macOS / Linux)
 
 No Rust toolchain, Python installation, or manual dependency/model setup required:
 
-1. Download the Melos All-in-One package from [Releases](https://github.com/openhachimi/hifisampler/releases) (e.g. `melos-v0.2.0-win64-dml.zip` under `v0.2.0-melos` — universal Windows archive bundling DirectML GPU acceleration for AMD / Intel / NVIDIA discrete & integrated GPUs as well as CPU, plus pre-packaged ONNX models) and extract it.
+1. Download the Melos All-in-One archive for your platform from [Releases](https://github.com/openhachimi/hifisampler/releases) (under `v0.2.0-melos`):
+   - **Windows x64**: `melos-v0.2.0-win64-dml.zip` (DirectML GPU + CPU ONNX Runtime for AMD / Intel / NVIDIA GPUs + pre-packaged ONNX models)
+   - **macOS Apple Silicon (M-series)**: `melos-v0.2.0-macos-arm64-coreml.tar.gz` (arm64 CoreML / CPU ONNX Runtime + ONNX models)
+   - **macOS Intel**: `melos-v0.2.0-macos-x64-coreml.tar.gz` (x86_64 CoreML / CPU ONNX Runtime + ONNX models)
+   - **Linux x64 / ARM64**: `melos-v0.2.0-linux-x64-aio.tar.gz` / `melos-v0.2.0-linux-arm64-aio.tar.gz` (CPU ONNX Runtime + ONNX models; pure Apache-2.0 `*-bins-only.*` archives without weights/runtime libraries are also provided per platform)
    - **Versioning Convention**: To clearly distinguish releases in the shared repository, **Melos (`melos` branch) starts at `0.2.0` and uses even minor versions (`0.2.0`, `0.4.0`, `0.6.0`, ...)**, whereas **hifisampler (`main` branch) uses odd minor versions (`0.1.0`, `0.3.0`, `0.5.0`, ...)**. Melos also defaults to isolated port `8574` and beacon `~/.melos/server.json`, allowing safe side-by-side coexistence.
-2. **Double-click `start.bat` once on first use** (registers the server location and starts the background inference service).
-   - Once registered, you **do not need to open `start.bat` manually** in daily OpenUtau use — `melos.exe` automatically starts `hifiserver.exe` in the background on demand whenever rendering starts.
+2. **Initialize registration once on first use**:
+   - **Windows**: Double-click `start.bat` once (creates `config.yaml`, registers `~/.melos/server.json`, and warms up the server).
+   - **macOS / Linux**: Extract the tarball; on macOS clear quarantine once (`xattr -cr ./melos`), then run `bash ./melos/start.sh --register-only` (or `bash ./melos/start.sh` to start in the foreground).
+   - Once registered, you **do not need to open the launcher manually** in daily OpenUtau use — `melos` / `melos.exe` automatically starts `hifiserver` in the background on demand whenever rendering starts.
 3. **Connect to the native OpenUtau client (using the default `CLASSIC` renderer)**:
    - **Full-Phrase Continuous Mel Mode (Recommended)**:
-     1. Copy `melos.exe` and `melos.yaml` into OpenUtau's `Resamplers` folder.
-     2. Copy `melos-wavtool.exe` into OpenUtau's `Wavtools` folder *(Tip: `melos.exe` includes automatic Resampler/Wavtool dual-role detection, so copying `melos.exe` into `Wavtools` works too).*
-     3. In your OpenUtau track header, set **Resampler** = `melos.exe` and **Wavtool** = `melos-wavtool.exe`.
-   - **Single-Note Compatibility Mode (Optional)**: If you prefer OpenUtau's built-in `convergence` or `simple` wavtools, copy only `melos.exe` + `melos.yaml` into `Resamplers`; `melos.exe` automatically detects non-Melos wavtools and falls back cleanly to single-note WAV synthesis.
+     1. Copy `melos.exe` (or `melos` on macOS / Linux) and `melos.yaml` into OpenUtau's `Resamplers` folder.
+     2. Copy `melos-wavtool.exe` (or `melos-wavtool` on macOS / Linux) into OpenUtau's `Wavtools` folder *(Tip: `melos` includes automatic Resampler/Wavtool dual-role detection, so copying `melos` into `Wavtools` works too).*
+     3. In your OpenUtau track header, set **Resampler** = `melos.exe` (/`melos`) and **Wavtool** = `melos-wavtool.exe` (/`melos-wavtool`).
+   - **Single-Note Compatibility Mode (Optional)**: If you prefer OpenUtau's built-in `convergence` or `simple` wavtools, copy only `melos.exe` (/`melos`) + `melos.yaml` into `Resamplers`; `melos` automatically detects non-Melos wavtools and falls back cleanly to single-note WAV synthesis.
 4. In OpenUtau Piano Roll, click **`⚙` (Configure Expressions) -> "Add all expressions suggested by renderers" -> "Apply"** to import all supported flags.
 
 ---
