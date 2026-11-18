@@ -12,6 +12,7 @@
 
 - **直接支持原生 OpenUtau 客户端的整句连续 Mel 合成（`melos` + `melos-wavtool`）**：无需更换 OpenUtau 客户端，即可将“逐音独立合成 WAV 再做波形交叉淡化”升级为**整句连续 Mel 频谱 + F0 拼接、单次 GPU 声码器直出**（含首尾上下文帧填充与裁切），消除音符交叠处的相位抵消凹陷，连音过渡更自然，整句渲染提速约 **1.5x–2.3x**。
 - **纯 Rust 原生架构 + 一键整合包**：脱离 Python / PyTorch 运行时依赖，超轻量客户端（约 500 KiB）配合原生 ONNX Runtime（DirectML / CUDA / CoreML / CPU）推理服务端，并支持独立单音兼容用法与全套表现力表情参数。
+- **版本号奇偶区分规则与独立并存**：为避免混淆，**Melos（`melos` 分支）采用偶数次版本号**（从 `0.2.0` 起步，后续 `0.2.0` / `0.4.0` / `0.6.0`……，对应 Release `v0.2.0-melos`），**hifisampler（`main` 分支）采用奇数次版本号**（后续 `0.1.0` / `0.3.0` / `0.5.0`……，对应 Release `v0.1.0-hifi`）。Melos 默认使用独立端口 `8574` 与信标 `~/.melos/server.json`，可与本机原有引擎互不干扰地并存。
 
 👉 **前往查看：[Melos 中文文档 (`melos` 分支)](https://github.com/openhachimi/hifisampler/blob/melos/README_zh_cn.md) | [`melos` 分支代码主页](https://github.com/openhachimi/hifisampler/tree/melos)**
 
