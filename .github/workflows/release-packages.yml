@@ -115,7 +115,12 @@ jobs:
         working-directory: ./rust
         run: |
           set -e
-          cargo test --workspace --release
+          cargo test --workspace --lib --bins --release
+          cargo test -p hifi_client --test client_cli_tests --release
+          cargo test -p hifi_core --test test_audio --test test_cache --release
+          cargo test -p hifi_dsp --test test_dsp_parity --release
+          cargo test -p hifi_effects --test test_effects --release
+          cargo test -p hifi_server --test server_integration --test test_phrase_pipeline --release
           cargo build --release -p hifi_server -p hifi_client
 
       - name: Package Melos archives and run 3-stage isolated smoke test (${{ matrix.pkg_platform }})

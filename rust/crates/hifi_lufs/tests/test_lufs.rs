@@ -11,12 +11,16 @@ use std::process::Command;
 
 fn python_exe() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let venv = manifest_dir.join("../../../.venv/Scripts/python.exe");
-    if venv.exists() {
-        venv.canonicalize().unwrap_or(venv)
-    } else {
-        PathBuf::from("python")
+    for rel in [
+        "../../../.venv/Scripts/python.exe",
+        "../../../.venv/bin/python",
+    ] {
+        let cand = manifest_dir.join(rel);
+        if cand.exists() {
+            return cand.canonicalize().unwrap_or(cand);
+        }
     }
+    PathBuf::from(if cfg!(windows) { "python" } else { "python3" })
 }
 
 fn repo_root() -> PathBuf {

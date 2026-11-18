@@ -24,11 +24,16 @@ use tempfile::tempdir;
 
 fn get_python_path() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let venv_python = manifest_dir.join("../../../.venv/Scripts/python.exe");
-    if venv_python.exists() {
-        return venv_python.canonicalize().unwrap_or(venv_python);
+    for rel in [
+        "../../../.venv/Scripts/python.exe",
+        "../../../.venv/bin/python",
+    ] {
+        let cand = manifest_dir.join(rel);
+        if cand.exists() {
+            return cand.canonicalize().unwrap_or(cand);
+        }
     }
-    PathBuf::from("python")
+    PathBuf::from(if cfg!(windows) { "python" } else { "python3" })
 }
 
 fn get_repo_root() -> PathBuf {

@@ -25,11 +25,8 @@ impl BatInspection {
         let Some(ref tool) = self.tool_path else {
             return false;
         };
-        let stem = Path::new(tool.trim())
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
+        let fname = file_name_cmp(tool);
+        let stem = fname.rsplit_once('.').map_or(fname.as_str(), |(s, _)| s);
         stem.starts_with("melos")
     }
 
@@ -108,7 +105,7 @@ fn normalize_cmp_path(s: &str) -> String {
         }
         trimmed.replace('/', "\\").to_ascii_lowercase()
     } else {
-        trimmed.to_string()
+        trimmed.replace('\\', "/")
     }
 }
 
