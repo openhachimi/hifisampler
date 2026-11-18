@@ -18,6 +18,18 @@
 
 ---
 
+## 版本选择与预览版说明（`v0.1.0` / `v0.1.1` / `v0.1.2`）
+
+> GitHub Releases 页面默认展示标记为 `Latest` 的 **`v0.1.0`** 正式版；如果您想使用新版 **`Ht` 声门张力模型** 或 **免 Flag 自动气泡音**，请前往 [Releases 页面](https://github.com/openhachimi/hifisampler/releases) 选择标记为 **`Pre-release`** 的 **`v0.1.1`** 或 **`v0.1.2`**。
+
+| 版本 | 类型 | 核心特性与适用人群 |
+| :--- | :--- | :--- |
+| **[`v0.1.0`](https://github.com/openhachimi/hifisampler/releases/tag/v0.1.0)** | 正式版 (`Latest`) | 稳定基线版本：三级内存特征缓存、DirectML 固定分桶（彻底消除动态长度重编译卡顿）、客户端按需自拉起服务端、完整 `hifisampler.yaml` 表情映射。 |
+| **[`v0.1.1`](https://github.com/openhachimi/hifisampler/releases/tag/v0.1.1)** | 预览版 (`Pre-release`) | **LF 声门模型张力（`Ht`）v3 重构**：使用 Fant LF 声门导数模型 + 2048 点最小相位倒谱滤波替代旧版线性斜坡；支持动态 `Rd` 生理映射、闭式 H1 基频锚点与耳道等响度补偿 `W(f)`（压紧不炸音不失真、松弛气声不丢基频音量），内置清辅音双门控保护的浊音气声联动及 `_htv3` 缓存隔离。 |
+| **[`v0.1.2`](https://github.com/openhachimi/hifisampler/releases/tag/v0.1.2)** | 预览版 (`Pre-release`) | **免 Flag 相对音高（`pit`）自动气泡音合成** + **完整包含 `v0.1.1` 的 `Ht` v3 改进**：无需额外 Flag，在钢琴卷帘将 `pit` 相对当前音符向下拉低（低于 `-5.6` 半音渐入、`-14` 至 `-17` 半音展开）即可自动合成连续声门气泡音；内置三阶跨八度大跳免疫检测避免常规滑音误触发，可通过 `config.yaml` 中 `processing.auto_vocal_fry`（默认 `true`）随时开关。 |
+
+---
+
 ## 为什么叫 hifisampler?
 
 hifisampler 由 [straycatresampler](https://github.com/UtaUtaUtau/straycat) 修改而来，用神经网络声码器 pc-nsf-hifigan 替换了传统的 WORLD 声码器。
@@ -34,7 +46,7 @@ pc-nsf-hifigan 采用神经网络对输入特征进行上采样，音质比传�
 
 ### 方式一：使用环境整合一键包（Windows 最简方式，免装 Python / 依赖 / 模型）
 
-1. 前往 [Release](https://github.com/openhachimi/hifisampler/releases) 根据显卡下载对应的一键整合包并解压：
+1. 前往 [Release](https://github.com/openhachimi/hifisampler/releases) 根据显卡下载对应的一键整合包并解压（正式版为 `v0.1.0`，如需新版 `Ht` 或自动气泡音可下载 `Pre-release` 中的 `v0.1.1` / `v0.1.2`，三者均提供完整一键包；已下载 `v0.1.0` 一键包的用户也可下载 `v0.1.1` / `v0.1.2` 源码 `.zip` 直接覆盖根目录升级）：
    - **`hifisampler-v*-win64-dml.zip`（通用推荐 / A卡 / I卡 / 核显 / CPU）**：内置完整 Python 环境、全部模型与 DirectML 硬件加速，体积小巧，所有 Windows 显卡开箱即用。
    - **`hifisampler-v*-win64-cuda.7z`（NVIDIA 独立显卡专属）**：内置完整 Python 环境、全部模型与 CUDA 版 PyTorch（支持 RTX 20/30/40/50 系显卡），默认开启 `ckpt + fp16` 半精度加速。
 2. **首次使用时双击运行一次解压目录中的 `start.bat`**（会自动记录服务端路径并启动服务，无需联网下载依赖）。
@@ -101,6 +113,7 @@ pc-nsf-hifigan 采用神经网络对输入特征进行上采样，音质比传�
 
 ### 常用 `config.yaml` 选项说明
 
+- **`auto_vocal_fry`**（仅 `v0.1.2+` 可用，默认 `true`）：当检测到相对当前音符深幅下潜的 `pit` 音高线时自动合成自然声门气泡音（带跨八度大跳免疫保护，开启 `HG` 怒音时自动避让；设为 `false` 可关闭）。
 - **`wave_norm`**（默认 `true`）：开启音符粒度的响度平衡，配合 `P` 参数使用。
 - **`fp16`**（默认 `false`）：使用 GPU 运行 PyTorch (`ckpt`) 模型时，设为 `true` 可开启半精度加速并降低显存占用。
 - **`idle_timeout`**（默认 `0`）：空闲自动关闭时间（单位：秒）。设为 `0` 表示服务端常驻；若设为如 `600`，则 10 分钟不渲染后服务端会自动退出以释放显卡显存，下次在 OpenUtau 渲染时客户端会自动重新拉起服务端。

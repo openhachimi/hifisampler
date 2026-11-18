@@ -18,6 +18,18 @@ The `main` branch maintains the Python-based **hifisampler**. For the next-gener
 
 ---
 
+## Releases & Experimental Pre-releases (`v0.1.0` / `v0.1.1` / `v0.1.2`)
+
+> GitHub Releases highlights **`v0.1.0`** (`Latest`) by default. If you want the **overhauled LF Glottal Tension (`Ht`)** or **zero-flag automatic vocal fry**, check the **[Releases page](https://github.com/openhachimi/hifisampler/releases)** for the **`Pre-release`** builds (**`v0.1.1`** / **`v0.1.2`**).
+
+| Version | Status | Key Highlights |
+| :--- | :--- | :--- |
+| **[`v0.1.0`](https://github.com/openhachimi/hifisampler/releases/tag/v0.1.0)** | Stable (`Latest`) | Baseline release: 3-tier in-memory cache, fixed-bucket DirectML optimization (eliminates shader-recompilation stalls), client-managed server auto-start, and OpenUtau `hifisampler.yaml` expression manifest. |
+| **[`v0.1.1`](https://github.com/openhachimi/hifisampler/releases/tag/v0.1.1)** | Preview (`Pre-release`) | **LF Glottal Tension (`Ht`) v3 Overhaul**: Replaces the linear HF tilt with a Fant LF glottal derivative model and 2048-point minimum-phase cepstral filter, featuring dynamic `Rd` mapping, closed-form H1 pivot, ear-canal loudness weighting `W(f)`, consonant-safe voiced aspiration coupling, and automatic `_htv3` cache versioning. |
+| **[`v0.1.2`](https://github.com/openhachimi/hifisampler/releases/tag/v0.1.2)** | Preview (`Pre-release`) | **Automatic Relative-`pit` Vocal Fry** + **all `Ht` v3 upgrades from `v0.1.1`**: Draw `pit` scoops below `-5.6` to `-17` semitones relative to the note to synthesize smooth glottal fry with 3-stage melodic-leap immunity (zero false triggers on octave jumps); toggleable via `processing.auto_vocal_fry` (`true` by default) in `config.yaml`. |
+
+---
+
 ## Why is it called hifisampler?
 
 hifisampler was modified from [straycatresampler](https://github.com/UtaUtaUtau/straycat), replacing the traditional WORLD vocoder with the neural vocoder pc-nsf-hifigan.
@@ -34,7 +46,7 @@ Choose any of the installation methods below based on your operating system and 
 
 ### Method 1: All-in-One Package (Easiest on Windows — Includes Python, Dependencies & Models)
 
-1. Download the matching All-in-One package from [Releases](https://github.com/openhachimi/hifisampler/releases) and extract it:
+1. Download the matching All-in-One package from [Releases](https://github.com/openhachimi/hifisampler/releases) and extract it (`v0.1.0` is marked `Latest`; check `Pre-release` for `v0.1.1` / `v0.1.2` full AIO archives, or extract the `v0.1.1` / `v0.1.2` source `.zip` over an existing `v0.1.0` AIO folder for a quick in-place upgrade):
    - **`hifisampler-v*-win64-dml.zip` (General / AMD / Intel / iGPU / CPU)**: Bundles portable Python, models, and DirectML GPU acceleration in a compact archive that works out of the box on any Windows GPU or CPU.
    - **`hifisampler-v*-win64-cuda.7z` (NVIDIA GPU Dedicated)**: Bundles portable Python, models, and CUDA PyTorch (supports RTX 20/30/40/50 series), pre-configured with `ckpt + fp16` acceleration.
 2. **Double-click `start.bat` once on first use** (registers the server location and starts the server directly without downloading dependencies).
@@ -101,6 +113,7 @@ By default, hifisampler uses **ONNX mode**, which works out of the box across al
 
 ### Useful `config.yaml` Settings
 
+- **`auto_vocal_fry`** (`v0.1.2+` only, default `true`): Automatically synthesizes natural glottal vocal fry on deep negative relative `pit` scoops (immune to melodic octave leaps and yields when `HG` growl is active; set to `false` to disable).
 - **`wave_norm`** (default `true`): Enables note-level loudness normalization (used with the `P` flag).
 - **`fp16`** (default `false`): When running PyTorch (`ckpt`) models on a GPU, set to `true` for faster half-precision inference and lower VRAM usage.
 - **`idle_timeout`** (default `0`): Auto-shutdown timer in seconds. `0` keeps the server running indefinitely; setting it to e.g. `600` will automatically shut down the server after 10 minutes of inactivity to free GPU VRAM (the client will automatically start it again on the next render).
