@@ -78,7 +78,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          uv venv .venv --python 3.12
+          uv venv .venv --clear --python 3.12
           uv pip install --python .venv "${{ matrix.ort_pkg }}"
 
       - name: Download ONNX model weights from ${{ inputs.models_tag }}
