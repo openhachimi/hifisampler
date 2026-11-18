@@ -44,7 +44,7 @@ pub fn home_dir() -> Option<PathBuf> {
 }
 
 pub fn default_beacon_path() -> Option<PathBuf> {
-    home_dir().map(|h| h.join(".hifisampler").join("server.json"))
+    home_dir().map(|h| h.join(".melos").join("server.json"))
 }
 
 pub fn resolve_venv_python(root: &Path) -> Option<PathBuf> {
@@ -62,7 +62,7 @@ pub fn resolve_venv_python(root: &Path) -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.is_file())
 }
 
-/// Atomically write `~/.hifisampler/server.json`.
+/// Atomically write `~/.melos/server.json`.
 /// Note: Intentionally preserved on shutdown so copied clients can discover `server_root`.
 pub fn write_locator_beacon(
     server_root: &Path,
@@ -72,7 +72,7 @@ pub fn write_locator_beacon(
     let target = default_beacon_path().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "Unable to determine user home directory for ~/.hifisampler/server.json",
+            "Unable to determine user home directory for ~/.melos/server.json",
         )
     })?;
     write_locator_beacon_to(&target, server_root, port, managed)?;
@@ -149,7 +149,7 @@ mod tests {
     fn atomic_beacon_write_contains_all_required_fields() {
         let dir =
             std::env::temp_dir().join(format!("hifi_beacon_test_{}", Uuid::new_v4().simple()));
-        let beacon_path = dir.join(".hifisampler").join("server.json");
+        let beacon_path = dir.join(".melos").join("server.json");
         write_locator_beacon_to(&beacon_path, &dir, 8999, true).unwrap();
 
         let text = fs::read_to_string(&beacon_path).unwrap();

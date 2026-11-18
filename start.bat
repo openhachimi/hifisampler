@@ -9,13 +9,25 @@ if not exist "config.yaml" if exist "config.default.yaml" (
 rem --- Fast path 0: native Rust hifiserver (Melos release / local build) ---
 if exist "%~dp0hifiserver.exe" (
     "%~dp0hifiserver.exe" %*
-    if errorlevel 1 pause
+    if errorlevel 1 (
+        if "%~1"=="" pause
+        exit /b 1
+    )
     goto :eof
 )
 if exist "%~dp0rust\target\release\hifiserver.exe" (
     "%~dp0rust\target\release\hifiserver.exe" %*
-    if errorlevel 1 pause
+    if errorlevel 1 (
+        if "%~1"=="" pause
+        exit /b 1
+    )
     goto :eof
+)
+
+if not exist "%~dp0hifiserver.py" (
+    echo [Melos] Error: hifiserver.exe was not found in "%~dp0".
+    if "%~1"=="" pause
+    exit /b 1
 )
 
 rem --- Fast path 1: bundled portable environment (env\python.exe) ---

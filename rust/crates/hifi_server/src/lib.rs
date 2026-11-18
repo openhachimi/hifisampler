@@ -32,17 +32,10 @@ pub type EngineFactory = Box<
 
 /// Run the `hifiserver` process with a caller-supplied backend factory.
 pub fn run_server_with_factory(factory: EngineFactory) -> i32 {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
     let cli = match parse_server_cli_args() {
         Ok(c) => c,
         Err(msg) => {
-            if msg.starts_with("HifiSampler UTAU inference server") {
+            if msg.starts_with("Melos UTAU inference server") || msg.starts_with("hifiserver ") {
                 println!("{msg}");
                 return 0;
             }
@@ -56,10 +49,7 @@ pub fn run_server_with_factory(factory: EngineFactory) -> i32 {
     if cli.register_only {
         match beacon::write_locator_beacon(&server_root, cli.port, cli.managed) {
             Ok(path) => {
-                println!(
-                    "Registered hifisampler locator beacon at: {}",
-                    path.display()
-                );
+                println!("Registered melos locator beacon at: {}", path.display());
                 return 0;
             }
             Err(err) => {
@@ -68,6 +58,8 @@ pub fn run_server_with_factory(factory: EngineFactory) -> i32 {
             }
         }
     }
+
+    init_server_tracing(cli.managed, &server_root);
 
     let instance_lock = match ServerInstanceLock::try_acquire(cli.port, Duration::from_millis(500))
     {
@@ -209,4 +201,69 @@ pub fn run_server_with_factory(factory: EngineFactory) -> i32 {
 
     drop(instance_lock);
     exit_code
+}
+
+#[cfg(windows)]
+struct ManagedLogWriter(std::sync::Arc<std::sync::Mutex<std::fs::File>>);
+
+#[cfg(windows)]
+impl std::io::Write for ManagedLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut guard = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut guard = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.flush()
+    }
+}
+
+#[cfg(windows)]
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ManagedLogWriter {
+    type Writer = ManagedLogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        ManagedLogWriter(std::sync::Arc::clone(&self.0))
+    }
+}
+
+fn init_server_tracing(managed: bool, server_root: &std::path::Path) {
+    let make_filter = || {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+    };
+
+    #[cfg(windows)]
+    if managed {
+        let log_dir = server_root.join("logs");
+        if std::fs::create_dir_all(&log_dir).is_ok() {
+            let log_path = log_dir.join("hifiserver.log");
+            if let Ok(file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+            {
+                let writer = ManagedLogWriter(std::sync::Arc::new(std::sync::Mutex::new(file)));
+                let _ = tracing_subscriber::fmt()
+                    .with_env_filter(make_filter())
+                    .with_ansi(false)
+                    .with_writer(writer)
+                    .try_init();
+                return;
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (managed, server_root);
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(make_filter())
+        .try_init();
 }

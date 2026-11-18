@@ -328,10 +328,12 @@ pub fn resolve_server_root(explicit_config: Option<&Path>) -> PathBuf {
                 .is_dir()
     };
 
-    if let Ok(home) = std::env::var("HIFISAMPLER_HOME") {
-        let p = PathBuf::from(home.trim());
-        if !home.trim().is_empty() && p.is_dir() {
-            return canonicalize_clean(&p);
+    for env_key in ["MELOS_HOME", "HIFISAMPLER_HOME"] {
+        if let Ok(home) = std::env::var(env_key) {
+            let p = PathBuf::from(home.trim());
+            if !home.trim().is_empty() && p.is_dir() {
+                return canonicalize_clean(&p);
+            }
         }
     }
 

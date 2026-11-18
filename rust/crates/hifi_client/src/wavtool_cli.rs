@@ -4,7 +4,8 @@ use crate::args::translate_wine_path;
 use crate::bat_inspector::{locate_and_inspect_temp_bat, BatInspection};
 use crate::config::{resolve_server_location, resolve_target_port};
 use crate::launcher::{
-    communicate_with_server_path, ensure_server_running, try_optimistic_post_path, FastPathOutcome,
+    communicate_with_server_path, ensure_server_running_with_mode, try_optimistic_post_path,
+    FastPathOutcome,
 };
 use serde::Serialize;
 use std::path::Path;
@@ -242,6 +243,10 @@ pub fn build_wavtool_payload_with_inspection(
 
 /// Runs `melos-wavtool` CLI workflow against `/phrase/wavtool`.
 pub fn run_wavtool(raw_args: &[String]) -> i32 {
+    if raw_args.len() == 1 && (raw_args[0] == "-V" || raw_args[0] == "--version") {
+        println!("melos-wavtool {}", env!("CARGO_PKG_VERSION"));
+        return 0;
+    }
     if raw_args.is_empty() {
         eprintln!("[Wavtool] No arguments provided.");
         return 1;
@@ -269,7 +274,7 @@ pub fn run_wavtool(raw_args: &[String]) -> i32 {
 
     let loc = resolve_server_location();
     let port = resolve_target_port();
-    if let Err(err) = ensure_server_running(port, &loc) {
+    if let Err(err) = ensure_server_running_with_mode(port, &loc, true) {
         eprintln!("[Wavtool] Exiting due to critical error: {err}");
         return 1;
     }

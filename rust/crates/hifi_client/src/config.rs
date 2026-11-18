@@ -2,7 +2,7 @@ use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const DEFAULT_PORT: u16 = 8572;
+pub const DEFAULT_PORT: u16 = 8574;
 
 #[derive(Debug, Clone, Default)]
 pub struct ServerLocation {
@@ -53,7 +53,7 @@ pub fn home_dir() -> Option<PathBuf> {
 }
 
 pub fn beacon_file_path() -> Option<PathBuf> {
-    home_dir().map(|h| h.join(".hifisampler").join("server.json"))
+    home_dir().map(|h| h.join(".melos").join("server.json"))
 }
 
 pub fn read_beacon() -> Option<ServerBeacon> {
@@ -67,15 +67,18 @@ pub fn read_beacon_from_path(path: &Path) -> Option<ServerBeacon> {
 }
 
 /// Resolve target HTTP port with priority:
-/// 1. `HIFISAMPLER_PORT` environment variable
-/// 2. `~/.hifisampler/server.json` `"port"`
-/// 3. Optional `"port"` in `config.yaml` (in `HIFISAMPLER_HOME` / exe dir / cwd)
-/// 4. Default `8572`
+/// 1. `MELOS_PORT` / `HIFISAMPLER_PORT` environment variable
+/// 2. `~/.melos/server.json` `"port"`
+/// 3. Optional `"port"` in `config.yaml` (in `MELOS_HOME` / `HIFISAMPLER_HOME` / exe dir / cwd)
+/// 4. Default `8574`
 pub fn resolve_target_port() -> u16 {
     let beacon = read_beacon();
     let config_port = find_port_in_nearby_config();
+    let env_port = ["MELOS_PORT", "HIFISAMPLER_PORT"]
+        .into_iter()
+        .find_map(|key| std::env::var(key).ok().filter(|v| !v.trim().is_empty()));
     resolve_target_port_with(
-        std::env::var("HIFISAMPLER_PORT").ok().as_deref(),
+        env_port.as_deref(),
         beacon.as_ref().and_then(|b| b.port),
         config_port,
     )
@@ -108,9 +111,11 @@ pub fn resolve_target_port_with(
 
 fn find_port_in_nearby_config() -> Option<u16> {
     let mut dirs = Vec::new();
-    if let Ok(home) = std::env::var("HIFISAMPLER_HOME") {
-        if !home.trim().is_empty() {
-            dirs.push(PathBuf::from(home));
+    for env_key in ["MELOS_HOME", "HIFISAMPLER_HOME"] {
+        if let Ok(home) = std::env::var(env_key) {
+            if !home.trim().is_empty() {
+                dirs.push(PathBuf::from(home.trim()));
+            }
         }
     }
     if let Ok(exe) = std::env::current_exe() {
@@ -300,10 +305,10 @@ fn probe_server_dir(
 }
 
 /// Resolve the server root directory and executable/script paths using:
-/// 1. `HIFISAMPLER_HOME`
+/// 1. `MELOS_HOME` / `HIFISAMPLER_HOME`
 /// 2. Symlink target directory of current executable
 /// 3. Executable's own directory (or its ancestors if inside `target/release`)
-/// 4. Global locator beacon `~/.hifisampler/server.json`
+/// 4. Global locator beacon `~/.melos/server.json`
 /// 5. Current working directory
 pub fn resolve_server_location() -> ServerLocation {
     let beacon = read_beacon();
@@ -312,11 +317,13 @@ pub fn resolve_server_location() -> ServerLocation {
         .as_ref()
         .and_then(|p| p.parent().map(Path::to_path_buf));
 
-    if let Ok(env_home) = std::env::var("HIFISAMPLER_HOME") {
-        let p = PathBuf::from(env_home.trim());
-        if !env_home.trim().is_empty() {
-            if let Some(loc) = probe_server_dir(&p, exe_dir.as_deref(), beacon.as_ref()) {
-                return loc;
+    for env_key in ["MELOS_HOME", "HIFISAMPLER_HOME"] {
+        if let Ok(env_home) = std::env::var(env_key) {
+            let p = PathBuf::from(env_home.trim());
+            if !env_home.trim().is_empty() {
+                if let Some(loc) = probe_server_dir(&p, exe_dir.as_deref(), beacon.as_ref()) {
+                    return loc;
+                }
             }
         }
     }
@@ -411,6 +418,6 @@ mod tests {
             8600
         );
         assert_eq!(resolve_target_port_with(None, None, Some(8700)), 8700);
-        assert_eq!(resolve_target_port_with(None, None, None), 8572);
+        assert_eq!(resolve_target_port_with(None, None, None), 8574);
     }
 }

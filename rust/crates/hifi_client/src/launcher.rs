@@ -98,9 +98,7 @@ pub fn startup_lock_path(port: u16) -> PathBuf {
             }
         })
         .collect();
-    std::env::temp_dir().join(format!(
-        "hifisampler-client-startup-{port}-{safe_user}.lock"
-    ))
+    std::env::temp_dir().join(format!("melos-client-startup-{port}-{safe_user}.lock"))
 }
 
 pub fn try_acquire_startup_lock(port: u16, timeout: Duration) -> Option<File> {
@@ -125,7 +123,55 @@ pub fn try_acquire_startup_lock(port: u16, timeout: Duration) -> Option<File> {
     }
 }
 
-pub fn wait_for_server_to_start(port: u16, timeout: Duration, log_prefix: &str) -> bool {
+struct SpawnedServerProcess {
+    #[cfg(windows)]
+    process_handle: windows_sys::Win32::Foundation::HANDLE,
+    working_dir: PathBuf,
+}
+
+impl SpawnedServerProcess {
+    fn poll_exit_code(&self) -> Option<u32> {
+        #[cfg(windows)]
+        unsafe {
+            use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+            use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+
+            if !self.process_handle.is_null()
+                && WaitForSingleObject(self.process_handle, 0) == WAIT_OBJECT_0
+            {
+                let mut code: u32 = 0;
+                if GetExitCodeProcess(self.process_handle, &mut code) != 0 {
+                    return Some(code);
+                }
+                return Some(1);
+            }
+            None
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SpawnedServerProcess {
+    fn drop(&mut self) {
+        if !self.process_handle.is_null() {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(self.process_handle);
+            }
+            self.process_handle = std::ptr::null_mut();
+        }
+    }
+}
+
+fn wait_for_server_with_child(
+    port: u16,
+    timeout: Duration,
+    log_prefix: &str,
+    child: Option<&SpawnedServerProcess>,
+) -> Result<(), String> {
     println!(
         "{log_prefix} Waiting up to {}s for server at port {port}...",
         timeout.as_secs()
@@ -138,7 +184,17 @@ pub fn wait_for_server_to_start(port: u16, timeout: Duration, log_prefix: &str) 
                 "{log_prefix} Server became ready after {:.1}s.",
                 t0.elapsed().as_secs_f64()
             );
-            return true;
+            return Ok(());
+        }
+        if let Some(proc_guard) = child {
+            if let Some(code) = proc_guard.poll_exit_code() {
+                if code != 0 {
+                    return Err(format!(
+                        "hifiserver exited prematurely with code {code} (check logs/hifiserver.log in '{}').",
+                        proc_guard.working_dir.display()
+                    ));
+                }
+            }
         }
         std::thread::sleep(Duration::from_millis(400));
     }
@@ -146,10 +202,25 @@ pub fn wait_for_server_to_start(port: u16, timeout: Duration, log_prefix: &str) 
         "{log_prefix} Server did not become ready within {}s.",
         timeout.as_secs()
     );
-    false
+    Err(format!(
+        "Server launched (warming up in background), but did not become ready within {}s.",
+        timeout.as_secs()
+    ))
+}
+
+pub fn wait_for_server_to_start(port: u16, timeout: Duration, log_prefix: &str) -> bool {
+    wait_for_server_with_child(port, timeout, log_prefix, None).is_ok()
 }
 
 pub fn ensure_server_running(port: u16, loc: &ServerLocation) -> Result<(), String> {
+    ensure_server_running_with_mode(port, loc, false)
+}
+
+pub fn ensure_server_running_with_mode(
+    port: u16,
+    loc: &ServerLocation,
+    require_native_server: bool,
+) -> Result<(), String> {
     if is_server_ready(port) {
         return Ok(());
     }
@@ -162,22 +233,16 @@ pub fn ensure_server_running(port: u16, loc: &ServerLocation) -> Result<(), Stri
         if is_server_ready(port) {
             proceed_to_communication = true;
         } else if !is_port_in_use(port) {
-            println!("[Main] Port {port} is free. Launching HifiSampler server...");
+            println!("[Main] Port {port} is free. Launching Melos server...");
             if loc.server_root.is_none() && loc.server_exe.is_none() {
                 return Err(
-                    "Could not locate HifiSampler server directory. Please run hifiserver --register-only once in the server folder to register ~/.hifisampler/server.json, or set HIFISAMPLER_HOME."
+                    "Could not locate Melos server directory. Please run hifiserver --register-only once in the server folder to register ~/.melos/server.json, or set MELOS_HOME."
                         .to_string(),
                 );
             }
-            launch_server_process(loc, port)?;
-            if wait_for_server_to_start(port, SERVER_WAIT_TIMEOUT, "[InitialWait]") {
-                proceed_to_communication = true;
-            } else {
-                return Err(
-                    "Server launched (warming up in background), but did not become ready within 45s."
-                        .to_string(),
-                );
-            }
+            let child = launch_server_process_with_mode(loc, port, require_native_server)?;
+            wait_for_server_with_child(port, SERVER_WAIT_TIMEOUT, "[InitialWait]", Some(&child))?;
+            proceed_to_communication = true;
         } else {
             println!("[Main] Port {port} is in use; waiting for server initialization...");
         }
@@ -186,7 +251,7 @@ pub fn ensure_server_running(port: u16, loc: &ServerLocation) -> Result<(), Stri
     }
 
     if !proceed_to_communication
-        && !wait_for_server_to_start(port, SERVER_WAIT_TIMEOUT, "[FinalWait]")
+        && wait_for_server_with_child(port, SERVER_WAIT_TIMEOUT, "[FinalWait]", None).is_err()
     {
         return Err("Error: Server failed readiness check within timeout.".to_string());
     }
@@ -254,8 +319,16 @@ pub fn communicate_with_server_path(
     Err("[Communicate] Failed after all attempts.".to_string())
 }
 
-#[cfg(windows)]
 pub fn launch_server_process(loc: &ServerLocation, port: u16) -> Result<(), String> {
+    launch_server_process_with_mode(loc, port, false).map(|_| ())
+}
+
+#[cfg(windows)]
+fn launch_server_process_with_mode(
+    loc: &ServerLocation,
+    port: u16,
+    require_native: bool,
+) -> Result<SpawnedServerProcess, String> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{
@@ -277,6 +350,11 @@ pub fn launch_server_process(loc: &ServerLocation, port: u16) -> Result<(), Stri
 
     let cmd_line = if let Some(ref server_exe) = loc.server_exe {
         format!("\"{}\" {managed_args}", server_exe.display())
+    } else if require_native {
+        return Err(
+            "Native hifiserver.exe binary was not found. Please run start.bat or 'hifiserver.exe --register-only' in your Melos installation folder to register ~/.melos/server.json (or set MELOS_HOME)."
+                .to_string(),
+        );
     } else if let (Some(ref py), Some(ref script)) = (&loc.python_exe, &loc.script_path) {
         format!(
             "\"{}\" \"{}\" {managed_args}",
@@ -300,7 +378,7 @@ pub fn launch_server_process(loc: &ServerLocation, port: u16) -> Result<(), Stri
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
-    let title_utf16: Vec<u16> = std::ffi::OsStr::new("HifiSampler Server")
+    let title_utf16: Vec<u16> = std::ffi::OsStr::new("Melos Server")
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
@@ -336,9 +414,6 @@ pub fn launch_server_process(loc: &ServerLocation, port: u16) -> Result<(), Stri
 
     let pid = pi.dwProcessId;
     unsafe {
-        if !pi.hProcess.is_null() {
-            CloseHandle(pi.hProcess);
-        }
         if !pi.hThread.is_null() {
             CloseHandle(pi.hThread);
         }
@@ -348,11 +423,18 @@ pub fn launch_server_process(loc: &ServerLocation, port: u16) -> Result<(), Stri
         "[LaunchServer] Started detached Windows server (PID {pid}) in '{}'.",
         working_dir.display()
     );
-    Ok(())
+    Ok(SpawnedServerProcess {
+        process_handle: pi.hProcess,
+        working_dir,
+    })
 }
 
 #[cfg(not(windows))]
-pub fn launch_server_process(loc: &ServerLocation, port: u16) -> Result<(), String> {
+fn launch_server_process_with_mode(
+    loc: &ServerLocation,
+    port: u16,
+    require_native: bool,
+) -> Result<SpawnedServerProcess, String> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
@@ -388,6 +470,11 @@ pub fn launch_server_process(loc: &ServerLocation, port: u16) -> Result<(), Stri
             &port.to_string(),
         ]);
         c
+    } else if require_native {
+        return Err(
+            "Native hifiserver binary was not found. Please run 'hifiserver --register-only' in your Melos installation folder to register ~/.melos/server.json (or set MELOS_HOME)."
+                .to_string(),
+        );
     } else if let (Some(ref py), Some(ref script)) = (&loc.python_exe, &loc.script_path) {
         let mut c = Command::new(py);
         c.arg(script).args([
@@ -435,5 +522,5 @@ pub fn launch_server_process(loc: &ServerLocation, port: u16) -> Result<(), Stri
         child.id(),
         log_file_path.display()
     );
-    Ok(())
+    Ok(SpawnedServerProcess { working_dir })
 }

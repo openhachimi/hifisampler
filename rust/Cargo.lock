@@ -306,7 +306,7 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "hifi_bench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hifi_core",
  "hifi_dsp",
@@ -321,7 +321,7 @@ dependencies = [
 
 [[package]]
 name = "hifi_client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -331,7 +331,7 @@ dependencies = [
 
 [[package]]
 name = "hifi_core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "approx",
  "bytemuck",
@@ -347,7 +347,7 @@ dependencies = [
 
 [[package]]
 name = "hifi_dsp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "approx",
  "hifi_core",
@@ -360,7 +360,7 @@ dependencies = [
 
 [[package]]
 name = "hifi_effects"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "approx",
  "hifi_dsp",
@@ -369,7 +369,7 @@ dependencies = [
 
 [[package]]
 name = "hifi_lufs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "approx",
  "thiserror",
@@ -377,7 +377,7 @@ dependencies = [
 
 [[package]]
 name = "hifi_onnx"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "approx",
  "libc",
@@ -391,7 +391,7 @@ dependencies = [
 
 [[package]]
 name = "hifi_server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "approx",
  "axum",

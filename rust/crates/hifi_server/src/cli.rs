@@ -1,7 +1,7 @@
 use crate::config::ServerConfig;
 use std::path::PathBuf;
 
-pub const DEFAULT_PORT: u16 = 8572;
+pub const DEFAULT_PORT: u16 = 8574;
 pub const DEFAULT_MANAGED_IDLE_TIMEOUT: u64 = 600;
 
 /// Parsed CLI options for `hifiserver`.
@@ -16,7 +16,7 @@ pub struct ServerCliArgs {
     pub parent_pid: Option<u32>,
 }
 
-/// Parse `hifiserver` CLI arguments with `HIFISAMPLER_PORT` fallback (CLI `--port` wins).
+/// Parse `hifiserver` CLI arguments with `MELOS_PORT` / `HIFISAMPLER_PORT` fallback (CLI `--port` wins).
 pub fn parse_server_cli_args_from(
     argv: &[String],
     env_port: Option<&str>,
@@ -35,6 +35,9 @@ pub fn parse_server_cli_args_from(
         match arg {
             "-h" | "--help" => {
                 return Err(help_text());
+            }
+            "-V" | "--version" => {
+                return Err(version_text());
             }
             "--register-only" => {
                 register_only = true;
@@ -167,7 +170,9 @@ pub fn parse_server_cli_args_from(
 
 pub fn parse_server_cli_args() -> Result<ServerCliArgs, String> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    let env_port = std::env::var("HIFISAMPLER_PORT").ok();
+    let env_port = ["MELOS_PORT", "HIFISAMPLER_PORT"]
+        .into_iter()
+        .find_map(|key| std::env::var(key).ok().filter(|v| !v.trim().is_empty()));
     parse_server_cli_args_from(&argv, env_port.as_deref())
 }
 
@@ -199,17 +204,22 @@ pub fn apply_managed_runtime_config(
     current_timeout
 }
 
+fn version_text() -> String {
+    format!("hifiserver {}", env!("CARGO_PKG_VERSION"))
+}
+
 fn help_text() -> String {
-    "HifiSampler UTAU inference server\n\n\
+    "Melos UTAU inference server\n\n\
      Options:\n  \
-       -p, --port <PORT>            HTTP listening port (1..65535, default 8572)\n  \
+       -p, --port <PORT>            HTTP listening port (1..65535, default 8574)\n  \
            --host <HOST>            Bind address (default 127.0.0.1)\n  \
            --config <PATH>          Path to YAML config file\n  \
            --managed                Run in client-managed lifecycle mode\n  \
            --idle-timeout <SECS>    Override idle auto-shutdown timeout in seconds\n  \
            --idle-timeout-secs <S>  Alias for --idle-timeout\n  \
            --parent-pid <PID>       Watch parent PID and exit when it terminates\n  \
-           --register-only          Write ~/.hifisampler/server.json beacon and exit"
+           --register-only          Write ~/.melos/server.json beacon and exit\n  \
+       -V, --version                Print version and exit"
         .to_string()
 }
 
@@ -220,7 +230,7 @@ mod tests {
     #[test]
     fn cli_defaults_and_env_override() {
         let a = parse_server_cli_args_from(&[], None).unwrap();
-        assert_eq!(a.port, 8572);
+        assert_eq!(a.port, 8574);
         assert!(!a.managed);
         assert!(!a.register_only);
         assert_eq!(a.idle_timeout, None);
@@ -231,6 +241,9 @@ mod tests {
         let c =
             parse_server_cli_args_from(&["--port".into(), "9200".into()], Some("9100")).unwrap();
         assert_eq!(c.port, 9200);
+
+        let ver = parse_server_cli_args_from(&["--version".into()], None).unwrap_err();
+        assert!(ver.starts_with("hifiserver "));
     }
 
     #[test]

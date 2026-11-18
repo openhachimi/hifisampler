@@ -2,7 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// Resolve the per-port single-instance lockfile path matching `hifiserver.py:get_lock_file_path`.
+/// Resolve the per-port single-instance lockfile path matching `hifiserver.py:get_lock_file_path` semantics with Melos namespace.
 pub fn get_lock_file_path(port: u16) -> PathBuf {
     let uid = resolve_uid_tag();
     let safe_uid: String = uid
@@ -15,7 +15,7 @@ pub fn get_lock_file_path(port: u16) -> PathBuf {
             }
         })
         .collect();
-    std::env::temp_dir().join(format!("hifisampler-{port}-{safe_uid}.lock"))
+    std::env::temp_dir().join(format!("melos-{port}-{safe_uid}.lock"))
 }
 
 fn resolve_uid_tag() -> String {
@@ -90,7 +90,7 @@ mod tests {
     fn lock_filename_contains_port_and_extension() {
         let p = get_lock_file_path(8599);
         let name = p.file_name().unwrap().to_string_lossy();
-        assert!(name.contains("hifisampler-8599-"));
+        assert!(name.contains("melos-8599-"));
         assert!(name.ends_with(".lock"));
     }
 

@@ -5,10 +5,10 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["hifisampler team"]
-license = "MIT"
+license = "Apache-2.0"
 
 [workspace.dependencies]
 # WAV audio I/O

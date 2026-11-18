@@ -12,20 +12,33 @@ use bat_inspector::locate_and_inspect_temp_bat;
 use config::{resolve_server_location, resolve_target_port};
 use http::build_request_payload;
 use launcher::{
-    communicate_with_server_path, ensure_server_running, try_optimistic_post_path, FastPathOutcome,
+    communicate_with_server_path, ensure_server_running_with_mode, try_optimistic_post_path,
+    FastPathOutcome,
 };
 use std::path::Path;
 use wavtool_cli::{looks_like_wavtool_invocation, run_wavtool};
 
 /// Execute the standard `hifisampler` single-note CLI client workflow (`POST /`) and return exit code.
 pub fn run(raw_args: &[String]) -> i32 {
-    run_resampler_with_endpoint(raw_args, "/")
+    if raw_args.len() == 1 && (raw_args[0] == "-V" || raw_args[0] == "--version") {
+        println!("hifisampler {}", env!("CARGO_PKG_VERSION"));
+        return 0;
+    }
+    run_resampler_with_endpoint(raw_args, "/", false)
 }
 
 /// Execute `melos` CLI: routes to wavtool when invoked in wavtool role/signature, or checks
 /// `temp.bat` to route `melos` -> `/phrase/prepare` when paired with `melos-wavtool`, falling back
 /// cleanly to single-note `POST /`.
 pub fn run_melos(raw_args: &[String]) -> i32 {
+    if raw_args.len() == 1 && (raw_args[0] == "-V" || raw_args[0] == "--version") {
+        if looks_like_wavtool_invocation(raw_args) {
+            println!("melos-wavtool {}", env!("CARGO_PKG_VERSION"));
+        } else {
+            println!("melos {}", env!("CARGO_PKG_VERSION"));
+        }
+        return 0;
+    }
     if raw_args.is_empty() {
         eprintln!("[Main] No arguments provided.");
         return 1;
@@ -60,10 +73,14 @@ pub fn run_melos(raw_args: &[String]) -> i32 {
         Err(_) => "/",
     };
 
-    run_resampler_with_endpoint(raw_args, endpoint)
+    run_resampler_with_endpoint(raw_args, endpoint, true)
 }
 
-pub fn run_resampler_with_endpoint(raw_args: &[String], endpoint: &str) -> i32 {
+pub fn run_resampler_with_endpoint(
+    raw_args: &[String],
+    endpoint: &str,
+    require_native_server: bool,
+) -> i32 {
     if raw_args.is_empty() {
         eprintln!("[Main] No arguments provided.");
         return 1;
@@ -91,7 +108,7 @@ pub fn run_resampler_with_endpoint(raw_args: &[String], endpoint: &str) -> i32 {
 
     let loc = resolve_server_location();
     let port = resolve_target_port();
-    if let Err(err) = ensure_server_running(port, &loc) {
+    if let Err(err) = ensure_server_running_with_mode(port, &loc, require_native_server) {
         eprintln!("[Main] Exiting due to critical error: {err}");
         return 1;
     }
