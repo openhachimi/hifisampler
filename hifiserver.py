@@ -94,6 +94,7 @@ def get_lock_file_path(port: int = 8572) -> Path:
 
 if __name__ == '__main__':
     ensure_runtime_env()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
     port = int(os.environ.get("HIFISAMPLER_PORT", "8572"))
 
     if "--register-only" in sys.argv:
