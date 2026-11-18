@@ -1,226 +1,100 @@
-name: Build and Upload Release All-in-One Packages
+name: Build and Upload Melos Release Packages
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to upload assets to'
+        description: 'Melos release tag (even minor version, e.g. v0.2.0)'
+        required: true
+        default: 'v0.2.0'
+      models_tag:
+        description: 'Release tag containing upstream models.7z'
         required: true
         default: 'v0.1.0'
-      models_tag:
-        description: 'Release tag containing models.7z'
-        required: true
-        default: 'v0.0.6'
-      flavor:
-        description: 'Package flavor to build (all, dml, cuda)'
-        required: true
-        default: 'all'
 
 permissions:
   contents: write
 
 jobs:
-  package-win64:
-    name: Package Windows x64 (${{ matrix.flavor }})
+  package-melos-win64:
+    name: Build & Package Melos (Windows x64 DirectML)
     runs-on: windows-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - flavor: dml
-            ext: zip
-          - flavor: cuda
-            ext: 7z
 
     steps:
-      - name: Checkout repository
+      - name: Checkout melos branch / tag
         uses: actions/checkout@v4
 
-      - name: Install uv and standalone Python 3.12
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install uv and Python 3.12 (for HN-SEP ONNX export & DirectML ORT DLLs)
         uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.12"
 
-      - name: Download models.7z from ${{ inputs.models_tag }}
+      - name: Setup packaging venv with CPU PyTorch and onnxruntime-directml
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          uv venv .pkg_venv --python 3.12
+          uv pip install --python .pkg_venv "torch>=2.6.0" --index-url https://download.pytorch.org/whl/cpu
+          uv pip install --python .pkg_venv onnx onnxruntime-directml pyyaml
+
+      - name: Download models.7z and prepare ONNX weights
         env:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |
-          gh release download "${{ inputs.models_tag }}" -p "models.7z" --clobber
-          if ("${{ matrix.flavor }}" -eq "dml" -and "${{ inputs.tag }}" -ne "${{ inputs.models_tag }}") {
-            Write-Host "Uploading models.7z to release ${{ inputs.tag }}..."
-            gh release upload "${{ inputs.tag }}" "models.7z" --clobber
-          }
-
-      - name: Assemble portable All-in-One directory (${{ matrix.flavor }})
-        shell: pwsh
-        run: |
           $ErrorActionPreference = "Stop"
-          $stage = Join-Path $PWD "stage\hifisampler"
-          New-Item -ItemType Directory -Force -Path $stage | Out-Null
-
-          $items = @(
-            "backend", "client", "util", "hnsep",
-            "config.default.yaml", "config.py", "hifisampler.exe", "hifisampler.sh", "hifisampler.yaml",
-            "hifiserver.py", "launch_server.py", "LICENSE", "pyproject.toml",
-            "README.md", "README_zh_cn.md", "requirements.txt", "start.bat", "start.sh"
-          )
-          foreach ($item in $items) {
-            if (Test-Path $item) {
-              Copy-Item -Recurse -Force $item $stage
-            }
-          }
-          Copy-Item -Force (Join-Path $stage "config.default.yaml") (Join-Path $stage "config.yaml")
-
-          # Extract models.7z and place into stage
+          gh release download "${{ inputs.models_tag }}" -p "models.7z" --clobber
           7z x "models.7z" -o"_models_extract" -y | Out-Null
+
           $onnxFile = Get-ChildItem "_models_extract" -Recurse -Filter "model.onnx" | Select-Object -First 1
           if (-not $onnxFile) { throw "model.onnx not found in models.7z" }
-          $vocoderDst = Join-Path $stage "pc_nsf_hifigan_44.1k_hop512_128bin_2025.02"
+          $vocoderDst = Join-Path $PWD "pc_nsf_hifigan_44.1k_hop512_128bin_2025.02"
           New-Item -ItemType Directory -Force -Path $vocoderDst | Out-Null
           Copy-Item -Recurse -Force "$($onnxFile.Directory.FullName)\*" $vocoderDst
 
           $ptFile = Get-ChildItem "_models_extract" -Recurse -Filter "model.pt" | Select-Object -First 1
           if (-not $ptFile) { throw "model.pt not found in models.7z" }
-          $vrDst = Join-Path $stage "hnsep\vr"
+          $vrDst = Join-Path $PWD "hnsep\vr"
           New-Item -ItemType Directory -Force -Path $vrDst | Out-Null
           Copy-Item -Recurse -Force "$($ptFile.Directory.FullName)\*" $vrDst
-          Remove-Item -Recurse -Force "_models_extract"
 
-          # Bundle uv.exe
-          $uvCmd = Get-Command uv.exe
-          Copy-Item -Force $uvCmd.Source (Join-Path $stage "uv.exe")
+          & .\.pkg_venv\Scripts\python.exe .\hnsep\convert_hnsep_to_onnx.py --ckpt "$vrDst\model.pt" --config "$vrDst\config.yaml" --out "$vrDst\model.onnx"
+          if ($LASTEXITCODE -ne 0) { throw "HN-SEP ONNX export failed" }
+          Remove-Item -Recurse -Force "_models_extract", "models.7z"
 
-          # Copy standalone Python 3.12 into stage\hifisampler\env
-          & uv python install 3.12 --managed-python
-          if ($LASTEXITCODE -ne 0) { throw "uv python install 3.12 failed" }
-          $pyExe = (& uv python find 3.12 --managed-python --system).Trim()
-          $pyRoot = Split-Path -Parent $pyExe
-          Write-Host "Copying standalone Python from: $pyRoot"
-          robocopy $pyRoot (Join-Path $stage "env") /E /NFL /NDL /NJH /NJS /NC /NS /NP | Out-Null
-          if ($LASTEXITCODE -ge 8) { throw "robocopy failed with exit code $LASTEXITCODE" }
-          $global:LASTEXITCODE = 0
-          $extManaged = Join-Path $stage "env\Lib\EXTERNALLY-MANAGED"
-          if (Test-Path $extManaged) { Remove-Item -Force $extManaged }
+      - name: Build Melos Rust release binaries and run unit tests
+        shell: pwsh
+        working-directory: ./rust
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo test --workspace --release
+          if ($LASTEXITCODE -ne 0) { throw "cargo test failed" }
+          cargo build --release --bins
+          if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
 
-          $envPy = Join-Path $stage "env\python.exe"
-          if ("${{ matrix.flavor }}" -eq "cuda") {
-            # Configure config.yaml for CUDA (PyTorch ckpt + fp16)
-            $cfgPath = Join-Path $stage "config.yaml"
-            $cfg = Get-Content $cfgPath -Raw
-            $cfg = $cfg -replace '(?m)^(\s*)vocoder_path:\s*"\.\/pc_nsf_hifigan_44\.1k_hop512_128bin_2025\.02\/model\.onnx"', '$1vocoder_path: "./pc_nsf_hifigan_44.1k_hop512_128bin_2025.02/model.ckpt"'
-            $cfg = $cfg -replace '(?m)^(\s*)model_type:\s*"onnx"', '$1model_type: "ckpt"'
-            $cfg = $cfg -replace '(?m)^(\s*)fp16:\s*false', '$1fp16: true'
-            [System.IO.File]::WriteAllText($cfgPath, $cfg, (New-Object System.Text.UTF8Encoding $false))
-
-            Write-Host "Installing CUDA PyTorch (cu128) + dependencies..."
-            & uv pip install --python $envPy --system --break-system-packages --no-cache "torch>=2.6.0" --index-url https://download.pytorch.org/whl/cu128
-            if ($LASTEXITCODE -ne 0) { throw "Failed to install CUDA torch" }
-            & uv pip install --python $envPy --system --break-system-packages --no-cache -r requirements.txt
-            if ($LASTEXITCODE -ne 0) { throw "Failed to install requirements" }
-          } else {
-            Write-Host "Installing CPU PyTorch + DirectML dependencies..."
-            & uv pip install --python $envPy --system --break-system-packages --no-cache "torch>=2.6.0" --index-url https://download.pytorch.org/whl/cpu
-            if ($LASTEXITCODE -ne 0) { throw "Failed to install CPU torch" }
-            & uv pip install --python $envPy --system --break-system-packages --no-cache -r requirements.txt
-            if ($LASTEXITCODE -ne 0) { throw "Failed to install requirements" }
-          }
-
-          # Strip C++ compile-time headers, static .lib import libraries, Tk/Idle/Ensurepip bloat, and __pycache__
-          $torchDir = Join-Path $stage "env\Lib\site-packages\torch"
-          foreach ($rel in @(
-            "env\include", "env\libs", "env\tcl",
-            "env\Lib\ensurepip", "env\Lib\idlelib", "env\Lib\tkinter", "env\Lib\turtledemo", "env\Lib\test",
-            "env\DLLs\tcl86t.dll", "env\DLLs\tk86t.dll",
-            "env\Lib\site-packages\torch\include", "env\Lib\site-packages\torch\test", "env\Lib\site-packages\torch\bin\protoc.exe"
-          )) {
-            $target = Join-Path $stage $rel
-            if (Test-Path $target) { Remove-Item -Recurse -Force $target }
-          }
-          Get-ChildItem (Join-Path $torchDir "lib") -Filter "*.lib" -ErrorAction SilentlyContinue | Remove-Item -Force
-          Get-ChildItem $stage -Recurse -Directory -Filter "__pycache__" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
-
-      - name: Verify portable environment (${{ matrix.flavor }})
+      - name: Package Melos archives and run 3-stage isolated smoke test
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $stage = Join-Path $PWD "stage\hifisampler"
-          $envPy = Join-Path $stage "env\python.exe"
-          if ("${{ matrix.flavor }}" -eq "cuda") {
-            & $envPy -c "import sys, torch, onnxruntime as ort, aiohttp, soundfile, pyloudnorm, numba; print('Python:', sys.executable); print('Torch:', torch.__version__, 'CUDA:', torch.version.cuda); assert torch.version.cuda, 'CUDA version empty!'"
-          } else {
-            & $envPy -c "import sys, torch, onnxruntime as ort, aiohttp, soundfile, pyloudnorm, numba; print('Python:', sys.executable); print('ORT providers:', ort.get_available_providers()); assert 'DmlExecutionProvider' in ort.get_available_providers(), 'DmlExecutionProvider missing!'"
-          }
-          if ($LASTEXITCODE -ne 0) { throw "Environment verification failed!" }
+          & .\.pkg_venv\Scripts\python.exe .\scripts\package_melos_release.py `
+            --version "${{ inputs.tag }}" `
+            --ort-dir "$PWD\.pkg_venv\Lib\site-packages\onnxruntime" `
+            --models-root "$PWD" `
+            --out-dir "$PWD\dist"
+          if ($LASTEXITCODE -ne 0) { throw "Melos packaging or smoke test failed" }
 
-          Push-Location $stage
-          try {
-            $requiredFiles = @(
-              "config.py", "config.default.yaml", "config.yaml",
-              "hifiserver.py", "launch_server.py", "hifisampler.exe", "hifisampler.yaml",
-              "start.bat", "backend\models.py", "backend\resampler.py", "backend\server.py",
-              "pc_nsf_hifigan_44.1k_hop512_128bin_2025.02\model.onnx",
-              "hnsep\vr\model.pt"
-            )
-            if ("${{ matrix.flavor }}" -eq "cuda") {
-              $requiredFiles += "pc_nsf_hifigan_44.1k_hop512_128bin_2025.02\model.ckpt"
-            }
-            foreach ($req in $requiredFiles) {
-              if (-not (Test-Path $req)) { throw "Missing required staged file: $req" }
-            }
-
-            & $envPy -c "import torch, hifiserver, launch_server; from config import CONFIG; CONFIG.device_preference = 'cpu'; CONFIG.device = torch.device('cpu'); from backend import models, server, resampler; models.initialize_models(); print('Stage smoke OK:', hifiserver.version, CONFIG.model_type)"
-            if ($LASTEXITCODE -ne 0) { throw "Staged application smoke test failed!" }
-
-            $tmpHome = Join-Path $env:RUNNER_TEMP "hifi_home_${{ matrix.flavor }}"
-            New-Item -ItemType Directory -Force -Path $tmpHome | Out-Null
-            $prevUserProfile = $env:USERPROFILE
-            try {
-              $env:USERPROFILE = $tmpHome
-              cmd /c "start.bat --register-only <nul"
-              if ($LASTEXITCODE -ne 0) { throw "start.bat --register-only failed with exit code $LASTEXITCODE" }
-              if (-not (Test-Path (Join-Path $tmpHome ".hifisampler\server.json"))) {
-                throw "start.bat --register-only did not write server.json locator beacon!"
-              }
-            } finally {
-              $env:USERPROFILE = $prevUserProfile
-              if (Test-Path $tmpHome) { Remove-Item -Recurse -Force $tmpHome }
-            }
-
-            Get-ChildItem $stage -Recurse -Directory -Filter "__pycache__" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
-          } finally {
-            Pop-Location
-          }
-
-      - name: Compress and Upload Release Asset (${{ matrix.flavor }})
+      - name: Upload Melos release assets to ${{ inputs.tag }}
         env:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $tag = "${{ inputs.tag }}"
-          $flavor = "${{ matrix.flavor }}"
-          $ext = "${{ matrix.ext }}"
-          $archiveName = "hifisampler-$tag-win64-$flavor.$ext"
-          $archivePath = Join-Path $PWD $archiveName
-
-          Push-Location "stage"
-          if ($ext -eq "7z") {
-            7z a -t7z -mx=7 -md=128m -mmt=on $archivePath "hifisampler"
-          } else {
-            7z a -tzip -mx=7 -mmt=on $archivePath "hifisampler"
-          }
-          if ($LASTEXITCODE -ne 0) { throw "7z compression failed!" }
-          Pop-Location
-
-          $item = Get-Item $archivePath
-          Write-Host ("Created {0}: {1:N2} MB ({2} bytes)" -f $item.Name, ($item.Length / 1MB), $item.Length)
-
-          # Rebuild lightweight source zip at latest commit as well on the dml runner
-          if ($flavor -eq "dml") {
-            $srcZip = "hifisampler-$tag.zip"
-            git archive --format=zip --prefix=hifisampler/ -o $srcZip HEAD
-            gh release upload $tag $srcZip --clobber
-          }
-
-          gh release upload $tag $archivePath --clobber
+          gh release upload $tag `
+            "dist\melos-$tag-win64-dml.zip" `
+            "dist\melos-$tag-win64-bins-only.zip" `
+            "rust\melos.yaml" `
+            --clobber
