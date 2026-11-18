@@ -2,6 +2,22 @@
 setlocal
 cd /d "%~dp0"
 
+if not exist "config.yaml" if exist "config.default.yaml" (
+    copy /Y "config.default.yaml" "config.yaml" >nul
+)
+
+rem --- Fast path 0: native Rust hifiserver (Melos release / local build) ---
+if exist "%~dp0hifiserver.exe" (
+    "%~dp0hifiserver.exe" %*
+    if errorlevel 1 pause
+    goto :eof
+)
+if exist "%~dp0rust\target\release\hifiserver.exe" (
+    "%~dp0rust\target\release\hifiserver.exe" %*
+    if errorlevel 1 pause
+    goto :eof
+)
+
 rem --- Fast path 1: bundled portable environment (env\python.exe) ---
 if exist "env\python.exe" if exist "env\Lib\site-packages\aiohttp" (
     "env\python.exe" hifiserver.py %*
