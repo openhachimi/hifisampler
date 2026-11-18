@@ -44,7 +44,8 @@
 
 无需安装 Rust、Python 或手动配置任何环境与模型依赖：
 
-1. 前往 [Releases](https://github.com/openhachimi/hifisampler/releases) 下载对应系统的 Melos All-in-One 一键整合包（例如 `melos-v*-win64-dml.zip`，Windows 全显卡通用：内置 DirectML 加速与完整 ONNX 模型，支持 AMD / Intel / NVIDIA 独显、核显及纯 CPU）并解压。
+1. 前往 [Releases](https://github.com/openhachimi/hifisampler/releases) 下载对应版本的 Melos All-in-One 一键整合包（例如 `melos-v0.2.0-win64-dml.zip`，Release 标题 `v0.2.0-melos`；Windows 全显卡通用：内置 DirectML 加速与完整 ONNX 模型，支持 AMD / Intel / NVIDIA 独显、核显及纯 CPU）并解压。
+   - **版本号约定（与 `main` 分支区分）**：为避免与同仓库的 `hifisampler`（`main` 分支，采用奇数次版本号 `0.1.0` / `0.3.0` / `0.5.0`……）混淆，**Melos（`melos` 分支）从 `0.2.0` 起步并采用偶数次版本号**（`0.2.0`、`0.4.0`、`0.6.0`……）。同时 Melos 默认使用独立端口 `8574` 与独立信标 `~/.melos/server.json`，可与旧版同机共存互不干扰。
 2. **首次使用时运行一次目录中的 `start.bat`**（会自动注册引擎路径并启动后台推理服务）。
    - 注册完成后，日常在 OpenUtau 中**无需手动提前运行 `start.bat`**——每次渲染时 `melos.exe` 检测到服务端未运行，都会自动在后台按需拉起服务端并在就绪后完成渲染。
 3. **接入原生 OpenUtau 客户端（保持默认的 `CLASSIC` 渲染器）**：
@@ -93,7 +94,7 @@
 
 ### 服务端状态与诊断接口
 
-`hifiserver` 默认监听 `http://127.0.0.1:8572`（可通过 `--port` 参数或 `config.yaml` 修改）：
+`hifiserver` 默认监听 `http://127.0.0.1:8574`（可通过 `--port` 参数、`MELOS_PORT` 或 `config.yaml` 修改，默认与 `hifisampler` 错开端口与 `~/.melos/server.json` 信标以便并存）：
 - `GET /health`：返回服务就绪状态、在途任务数与运行时间
 - `GET /stats`：返回总请求数、特征缓存/HN-SEP 缓存命中率、P95 延迟及各阶段耗时分布（特征提取 / 声码器推理 / 后处理）
 

@@ -44,7 +44,8 @@ Traditional UTAU / OpenUtau resamplers are constrained to per-note synthesis, pr
 
 No Rust toolchain, Python installation, or manual dependency/model setup required:
 
-1. Download the Melos All-in-One package from [Releases](https://github.com/openhachimi/hifisampler/releases) (e.g. `melos-v*-win64-dml.zip` — universal Windows archive bundling DirectML GPU acceleration for AMD / Intel / NVIDIA discrete & integrated GPUs as well as CPU, plus pre-packaged ONNX models) and extract it.
+1. Download the Melos All-in-One package from [Releases](https://github.com/openhachimi/hifisampler/releases) (e.g. `melos-v0.2.0-win64-dml.zip` under `v0.2.0-melos` — universal Windows archive bundling DirectML GPU acceleration for AMD / Intel / NVIDIA discrete & integrated GPUs as well as CPU, plus pre-packaged ONNX models) and extract it.
+   - **Versioning Convention**: To clearly distinguish releases in the shared repository, **Melos (`melos` branch) starts at `0.2.0` and uses even minor versions (`0.2.0`, `0.4.0`, `0.6.0`, ...)**, whereas **hifisampler (`main` branch) uses odd minor versions (`0.1.0`, `0.3.0`, `0.5.0`, ...)**. Melos also defaults to isolated port `8574` and beacon `~/.melos/server.json`, allowing safe side-by-side coexistence.
 2. **Double-click `start.bat` once on first use** (registers the server location and starts the background inference service).
    - Once registered, you **do not need to open `start.bat` manually** in daily OpenUtau use — `melos.exe` automatically starts `hifiserver.exe` in the background on demand whenever rendering starts.
 3. **Connect to the native OpenUtau client (using the default `CLASSIC` renderer)**:
@@ -93,7 +94,7 @@ No Rust toolchain, Python installation, or manual dependency/model setup require
 
 ### Telemetry & Health Endpoints
 
-`hifiserver` listens on `http://127.0.0.1:8572` by default (configurable via `--port` or `config.yaml`):
+`hifiserver` listens on `http://127.0.0.1:8574` by default (configurable via `--port`, `MELOS_PORT`, or `config.yaml`; isolated from `hifisampler`'s port `8572` and `~/.hifisampler/server.json` so both can coexist via `~/.melos/server.json`):
 - `GET /health`: Readiness state, active in-flight job count, and server uptime
 - `GET /stats`: Request counts, feature & HN-SEP cache hit rates, P95 latency, and per-stage timing breakdown (feature / synthesis / postprocess)
 
