@@ -31,7 +31,7 @@ impl RealOnnxRunner {
         };
 
         let t0 = Instant::now();
-        let vocoder = load_session_with_fallbacks(
+        let mut vocoder = load_session_with_fallbacks(
             "vocoder",
             server_root,
             &cfg.vocoder_path,
@@ -41,9 +41,30 @@ impl RealOnnxRunner {
         if let Some(reason) = vocoder.fallback_reason() {
             tracing::warn!("Vocoder EP fallback: {reason}");
         }
-        vocoder
-            .warmup()
-            .map_err(|e| format!("Vocoder warmup failed: {e}"))?;
+        if let Err(err) = vocoder.warmup() {
+            if vocoder.is_gpu_ep() {
+                tracing::warn!(
+                    "Vocoder warmup failed on {} ({err}); retrying on CPUExecutionProvider",
+                    vocoder.execution_provider()
+                );
+                let cpu_cfg = SessionConfig {
+                    device: OnnxDevicePreference::Cpu,
+                    ..session_cfg.clone()
+                };
+                vocoder = load_session_with_fallbacks(
+                    "vocoder (CPU fallback)",
+                    server_root,
+                    &cfg.vocoder_path,
+                    &[DEFAULT_VOCODER_ONNX_PATH],
+                    |p| VocoderSession::load_with_config(p, &cpu_cfg),
+                )?;
+                vocoder
+                    .warmup()
+                    .map_err(|e| format!("Vocoder warmup failed on CPU fallback: {e}"))?;
+            } else {
+                return Err(format!("Vocoder warmup failed: {err}"));
+            }
+        }
         tracing::info!(
             "Loaded vocoder '{}' on {} (gpu={}, {:.1}ms)",
             vocoder.model_path().display(),
@@ -56,7 +77,7 @@ impl RealOnnxRunner {
             None
         } else {
             let t_hnsep = Instant::now();
-            let sep = load_session_with_fallbacks(
+            let mut sep = load_session_with_fallbacks(
                 "HN-SEP",
                 server_root,
                 &cfg.hnsep_model_path,
@@ -66,8 +87,29 @@ impl RealOnnxRunner {
             if let Some(reason) = sep.fallback_reason() {
                 tracing::warn!("HN-SEP EP fallback: {reason}");
             }
-            sep.warmup()
-                .map_err(|e| format!("HN-SEP warmup failed: {e}"))?;
+            if let Err(err) = sep.warmup() {
+                if sep.is_gpu_ep() {
+                    tracing::warn!(
+                        "HN-SEP warmup failed on {} ({err}); retrying on CPUExecutionProvider",
+                        sep.execution_provider()
+                    );
+                    let cpu_cfg = SessionConfig {
+                        device: OnnxDevicePreference::Cpu,
+                        ..session_cfg.clone()
+                    };
+                    sep = load_session_with_fallbacks(
+                        "HN-SEP (CPU fallback)",
+                        server_root,
+                        &cfg.hnsep_model_path,
+                        DEFAULT_HNSEP_ONNX_PATHS,
+                        |p| HnsepSession::load_with_config(p, &cpu_cfg),
+                    )?;
+                    sep.warmup()
+                        .map_err(|e| format!("HN-SEP warmup failed on CPU fallback: {e}"))?;
+                } else {
+                    return Err(format!("HN-SEP warmup failed: {err}"));
+                }
+            }
             tracing::info!(
                 "Loaded HN-SEP '{}' on {} (gpu={}, {:.1}ms)",
                 sep.model_path().display(),

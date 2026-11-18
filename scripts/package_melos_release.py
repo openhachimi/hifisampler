@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
-"""Build Melos release archives, run 3-stage isolated smoke tests, and emit release notes."""
+"""Build multi-platform Melos release archives, run 3-stage isolated smoke tests, and emit release notes."""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import math
 import os
+import platform as py_platform
 import shutil
 import socket
+import stat
 import struct
 import subprocess
+import sys
+import tarfile
 import tempfile
 import time
 import urllib.request
@@ -24,6 +29,7 @@ DEFAULT_REPO_ROOT = Path(__file__).resolve().parent.parent
 FORBIDDEN_ENTRIES = {
     "model.ckpt",
     "model.pt",
+    "hifisampler",
     "hifisampler.exe",
     "hifisampler.yaml",
 }
@@ -51,10 +57,81 @@ if %_rc% neq 0 (
 )
 """
 
+PACKAGED_START_SH = """\
+#!/usr/bin/env bash
+set -e
 
-def make_aio_config_yaml(version_num: str) -> str:
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+if [ ! -f "$SCRIPT_DIR/config.yaml" ] && [ -f "$SCRIPT_DIR/config.default.yaml" ]; then
+    cp "$SCRIPT_DIR/config.default.yaml" "$SCRIPT_DIR/config.yaml"
+fi
+
+if [ ! -f "$SCRIPT_DIR/hifiserver" ]; then
+    echo "[Melos] Error: hifiserver binary was not found in $SCRIPT_DIR" >&2
+    exit 1
+fi
+
+chmod +x "$SCRIPT_DIR/hifiserver" "$SCRIPT_DIR/melos" "$SCRIPT_DIR/melos-wavtool" 2>/dev/null || true
+exec "$SCRIPT_DIR/hifiserver" "$@"
+"""
+
+
+def detect_default_platform() -> str:
+    sys_p = sys.platform.lower()
+    mach = py_platform.machine().lower()
+    if sys_p.startswith("win"):
+        return "win64-dml"
+    if sys_p == "darwin":
+        return "macos-arm64-coreml" if ("arm" in mach or "aarch64" in mach) else "macos-x64-coreml"
+    if "aarch64" in mach or "arm64" in mach:
+        return "linux-arm64-aio"
+    return "linux-x64-aio"
+
+
+def derive_platform_meta(pkg_platform: str) -> dict[str, object]:
+    p = pkg_platform.strip().lower()
+    if p.startswith("win"):
+        return {
+            "platform": pkg_platform,
+            "os_kind": "windows",
+            "os_arch": p.split("-", 1)[0],
+            "ext": "zip",
+            "bins": ("melos.exe", "melos-wavtool.exe", "hifiserver.exe"),
+            "launcher": "start.bat",
+            "config_label": "Windows x64 DirectML All-in-One",
+        }
+    if p.startswith("macos-"):
+        parts = p.split("-")
+        arch = parts[1] if len(parts) >= 2 else "arm64"
+        return {
+            "platform": pkg_platform,
+            "os_kind": "macos",
+            "os_arch": f"macos-{arch}",
+            "ext": "tar.gz",
+            "bins": ("melos", "melos-wavtool", "hifiserver"),
+            "launcher": "start.sh",
+            "config_label": f"macOS ({arch}) CoreML/CPU All-in-One",
+        }
+    if p.startswith("linux-"):
+        parts = p.split("-")
+        arch = parts[1] if len(parts) >= 2 else "x64"
+        return {
+            "platform": pkg_platform,
+            "os_kind": "linux",
+            "os_arch": f"linux-{arch}",
+            "ext": "tar.gz",
+            "bins": ("melos", "melos-wavtool", "hifiserver"),
+            "launcher": "start.sh",
+            "config_label": f"Linux ({arch}) ONNX All-in-One",
+        }
+    raise ValueError(f"Unsupported --platform value: {pkg_platform!r}")
+
+
+def make_aio_config_yaml(version_num: str, label: str) -> str:
     return f"""\
-# Melos Default Configuration (Windows x64 DirectML All-in-One)
+# Melos Default Configuration ({label})
 # Edit config.yaml (or copy config.default.yaml -> config.yaml) to customize settings.
 version: {version_num}
 
@@ -98,73 +175,258 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def add_file(zf: zipfile.ZipFile, src: Path, arcname: str) -> None:
-    if not src.is_file():
-        raise FileNotFoundError(f"Missing required release asset: {src}")
-    zf.write(src, arcname=arcname)
+class ArchiveWriter:
+    """Unified .zip / .tar.gz writer supporting executable permissions and POSIX symlinks."""
+
+    def __init__(self, path: Path, ext: str) -> None:
+        self.path = path
+        self.ext = ext
+        if ext == "zip":
+            self._zf = zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6)
+            self._tf = None
+        elif ext == "tar.gz":
+            self._zf = None
+            self._tf = tarfile.open(path, "w:gz", compresslevel=6)
+        else:
+            raise ValueError(f"Unsupported archive ext: {ext}")
+
+    def __enter__(self) -> "ArchiveWriter":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._zf is not None:
+            self._zf.close()
+        if self._tf is not None:
+            self._tf.close()
+
+    def add_file(self, src: Path, arcname: str, executable: bool = False) -> None:
+        if not src.is_file():
+            raise FileNotFoundError(f"Missing required release asset: {src}")
+        if self._zf is not None:
+            self._zf.write(src, arcname=arcname)
+            return
+        assert self._tf is not None
+        tarinfo = self._tf.gettarinfo(str(src), arcname=arcname)
+        tarinfo.uid = 0
+        tarinfo.gid = 0
+        tarinfo.uname = "root"
+        tarinfo.gname = "root"
+        tarinfo.mode = 0o755 if executable else 0o644
+        with src.open("rb") as fh:
+            self._tf.addfile(tarinfo, fh)
+
+    def add_text(
+        self,
+        text: str,
+        arcname: str,
+        crlf: bool = False,
+        executable: bool = False,
+    ) -> None:
+        normalized = text.replace("\r\n", "\n")
+        if crlf:
+            normalized = normalized.replace("\n", "\r\n")
+        data = normalized.encode("utf-8")
+        if self._zf is not None:
+            info = zipfile.ZipInfo(arcname, date_time=(2026, 11, 18, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = (0o755 if executable else 0o644) << 16
+            self._zf.writestr(info, data)
+            return
+        assert self._tf is not None
+        ti = tarfile.TarInfo(name=arcname)
+        ti.size = len(data)
+        ti.mtime = 1794988800
+        ti.mode = 0o755 if executable else 0o644
+        ti.uid = 0
+        ti.gid = 0
+        ti.uname = "root"
+        ti.gname = "root"
+        self._tf.addfile(ti, io.BytesIO(data))
+
+    def add_symlink(self, arcname: str, target: str) -> None:
+        if self._tf is None:
+            return
+        ti = tarfile.TarInfo(name=arcname)
+        ti.type = tarfile.SYMTYPE
+        ti.linkname = target
+        ti.mtime = 1794988800
+        ti.mode = 0o777
+        ti.uid = 0
+        ti.gid = 0
+        ti.uname = "root"
+        ti.gname = "root"
+        self._tf.addfile(ti)
 
 
-def add_text(zf: zipfile.ZipFile, text: str, arcname: str, crlf: bool = False) -> None:
-    normalized = text.replace("\r\n", "\n")
-    if crlf:
-        normalized = normalized.replace("\n", "\r\n")
-    info = zipfile.ZipInfo(arcname, date_time=(2026, 11, 18, 0, 0, 0))
-    info.compress_type = zipfile.ZIP_DEFLATED
-    info.external_attr = 0o644 << 16
-    zf.writestr(info, normalized.encode("utf-8"))
+def find_ort_notice(ort_root: Path, filename: str) -> Path:
+    direct = ort_root / filename
+    if direct.is_file():
+        return direct
+    for pattern in (
+        f"onnxruntime*.dist-info/**/{filename}",
+        f"onnxruntime*.dist-info/{filename}",
+    ):
+        matches = sorted(ort_root.parent.glob(pattern))
+        for m in matches:
+            if m.is_file():
+                return m
+    raise FileNotFoundError(f"Could not locate ONNX Runtime notice '{filename}' near {ort_root}")
 
 
-def populate_common_binaries(zf: zipfile.ZipFile, repo_root: Path, version_num: str) -> None:
-    rust_release_dir = repo_root / "rust" / "target" / "release"
+def collect_posix_ort_libs(ort_capi: Path, os_kind: str) -> tuple[list[tuple[Path, str]], list[tuple[str, str]]]:
+    """Return ([(real_path, arc_basename), ...], [(symlink_name, target_basename), ...])."""
+    if not ort_capi.is_dir():
+        raise FileNotFoundError(f"ONNX Runtime capi directory not found: {ort_capi}")
+
+    real_libs: dict[Path, str] = {}
+    for entry in sorted(ort_capi.iterdir()):
+        name = entry.name
+        if "pybind11" in name.lower():
+            continue
+        if os_kind == "macos":
+            match = name.startswith("libonnxruntime") and name.endswith(".dylib")
+        else:
+            match = name.startswith("libonnxruntime") and ".so" in name
+        if not match or not entry.is_file():
+            continue
+        resolved = entry.resolve()
+        if resolved not in real_libs:
+            real_libs[resolved] = resolved.name
+
+    if not real_libs:
+        raise FileNotFoundError(f"No libonnxruntime shared library found in {ort_capi}")
+
+    archived_names = set(real_libs.values())
+    symlinks: list[tuple[str, str]] = []
+
+    if os_kind == "macos":
+        core_libs = sorted(
+            n for n in archived_names if n.startswith("libonnxruntime.") and n.endswith(".dylib")
+        )
+        main_lib = next((n for n in core_libs if n != "libonnxruntime.dylib"), core_libs[0] if core_libs else None)
+        if main_lib and "libonnxruntime.dylib" not in archived_names:
+            symlinks.append(("libonnxruntime.dylib", main_lib))
+    else:
+        core_libs = sorted(n for n in archived_names if n.startswith("libonnxruntime.so"))
+        main_lib = next((n for n in core_libs if n != "libonnxruntime.so"), core_libs[0] if core_libs else None)
+        if main_lib:
+            if "libonnxruntime.so" not in archived_names:
+                symlinks.append(("libonnxruntime.so", main_lib))
+            if "libonnxruntime.so.1" not in archived_names and main_lib != "libonnxruntime.so.1":
+                symlinks.append(("libonnxruntime.so.1", main_lib))
+
+    files = [(p, name) for p, name in real_libs.items()]
+    return files, symlinks
+
+
+def populate_common_binaries(
+    writer: ArchiveWriter,
+    repo_root: Path,
+    version_num: str,
+    meta: dict[str, object],
+    stage_bin_dir: Path | None,
+) -> None:
+    is_win = meta["os_kind"] == "windows"
+    bin_source = stage_bin_dir if stage_bin_dir is not None else (repo_root / "rust" / "target" / "release")
     prefix = "melos"
-    add_file(zf, rust_release_dir / "melos.exe", f"{prefix}/melos.exe")
-    add_file(zf, rust_release_dir / "melos-wavtool.exe", f"{prefix}/melos-wavtool.exe")
-    add_file(zf, rust_release_dir / "hifiserver.exe", f"{prefix}/hifiserver.exe")
-    add_file(zf, repo_root / "rust" / "melos.yaml", f"{prefix}/melos.yaml")
-    add_text(zf, PACKAGED_START_BAT, f"{prefix}/start.bat", crlf=True)
-    add_file(zf, repo_root / "LICENSE", f"{prefix}/LICENSE")
-    add_file(zf, repo_root / "README.md", f"{prefix}/README.md")
-    add_file(zf, repo_root / "README_zh_cn.md", f"{prefix}/README_zh_cn.md")
-    add_file(zf, repo_root / "hnsep" / "LICENSE", f"{prefix}/hnsep/LICENSE")
-    add_text(zf, make_aio_config_yaml(version_num), f"{prefix}/config.default.yaml", crlf=True)
+
+    for bin_name in meta["bins"]:  # type: ignore[attr-defined]
+        writer.add_file(bin_source / bin_name, f"{prefix}/{bin_name}", executable=True)
+
+    writer.add_file(repo_root / "rust" / "melos.yaml", f"{prefix}/melos.yaml")
+    if is_win:
+        writer.add_text(PACKAGED_START_BAT, f"{prefix}/start.bat", crlf=True, executable=True)
+    else:
+        writer.add_text(PACKAGED_START_SH, f"{prefix}/start.sh", crlf=False, executable=True)
+
+    writer.add_file(repo_root / "LICENSE", f"{prefix}/LICENSE")
+    writer.add_file(repo_root / "README.md", f"{prefix}/README.md")
+    writer.add_file(repo_root / "README_zh_cn.md", f"{prefix}/README_zh_cn.md")
+    writer.add_file(repo_root / "hnsep" / "LICENSE", f"{prefix}/hnsep/LICENSE")
+    writer.add_text(
+        make_aio_config_yaml(version_num, str(meta["config_label"])),
+        f"{prefix}/config.default.yaml",
+        crlf=is_win,
+    )
 
 
-def assert_clean_zip(zip_path: Path, expect_models: bool) -> list[str]:
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        names = zf.namelist()
+def prepare_signed_bins_if_macos(repo_root: Path, os_kind: str) -> tuple[tempfile.TemporaryDirectory[str] | None, Path | None]:
+    if os_kind != "macos" or sys.platform != "darwin" or shutil.which("codesign") is None:
+        return None, None
+    tmp = tempfile.TemporaryDirectory(prefix="melos_codesign_")
+    tmp_path = Path(tmp.name)
+    src_dir = repo_root / "rust" / "target" / "release"
+    for name in ("melos", "melos-wavtool", "hifiserver"):
+        src = src_dir / name
+        dst = tmp_path / name
+        shutil.copy2(src, dst)
+        dst.chmod(0o755)
+        subprocess.run(["codesign", "--force", "--sign", "-", str(dst)], check=True)
+    return tmp, tmp_path
+
+
+def list_archive_entries(archive_path: Path, ext: str) -> list[str]:
+    if ext == "zip":
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            return zf.namelist()
+    with tarfile.open(archive_path, "r:gz") as tf:
+        return [m.name for m in tf.getmembers() if not m.isdir()]
+
+
+def assert_clean_archive(archive_path: Path, meta: dict[str, object], expect_models: bool) -> list[str]:
+    names = list_archive_entries(archive_path, str(meta["ext"]))
     basenames = {Path(n).name.lower() for n in names if not n.endswith("/")}
     bad = basenames & FORBIDDEN_ENTRIES
     if bad:
-        raise AssertionError(f"{zip_path.name} contains forbidden files: {sorted(bad)}")
+        raise AssertionError(f"{archive_path.name} contains forbidden files: {sorted(bad)}")
+    if any("pybind11" in b for b in basenames):
+        raise AssertionError(f"{archive_path.name} contains unexpected pybind11 module")
+
+    os_kind = str(meta["os_kind"])
     if not expect_models:
-        if any(n.endswith(".onnx") or n.endswith(".dll") for n in names):
-            raise AssertionError(f"{zip_path.name} unexpectedly contains ONNX weights or DLLs")
-    else:
-        required_subpaths = {
-            "melos/melos.exe",
-            "melos/melos-wavtool.exe",
-            "melos/hifiserver.exe",
-            "melos/melos.yaml",
-            "melos/start.bat",
-            "melos/config.default.yaml",
-            "melos/config.yaml",
+        if any(
+            n.endswith(".onnx") or n.endswith(".dll") or n.endswith(".dylib") or ".so" in Path(n).name
+            for n in names
+        ):
+            raise AssertionError(f"{archive_path.name} unexpectedly contains ONNX weights or shared libraries")
+        return names
+
+    bins = tuple(meta["bins"])  # type: ignore[arg-type]
+    required_subpaths = {
+        f"melos/{bins[0]}",
+        f"melos/{bins[1]}",
+        f"melos/{bins[2]}",
+        "melos/melos.yaml",
+        f"melos/{meta['launcher']}",
+        "melos/config.default.yaml",
+        "melos/config.yaml",
+        "melos/pc_nsf_hifigan_44.1k_hop512_128bin_2025.02/model.onnx",
+        "melos/pc_nsf_hifigan_44.1k_hop512_128bin_2025.02/config.json",
+        "melos/pc_nsf_hifigan_44.1k_hop512_128bin_2025.02/NOTICE.txt",
+        "melos/pc_nsf_hifigan_44.1k_hop512_128bin_2025.02/NOTICE.zh-CN.txt",
+        "melos/pc_nsf_hifigan_44.1k_hop512_128bin_2025.02/STATEMENTS.txt",
+        "melos/hnsep/LICENSE",
+        "melos/hnsep/vr/model.onnx",
+        "melos/hnsep/vr/config.yaml",
+        "melos/THIRD_PARTY_NOTICES/onnxruntime-LICENSE.txt",
+        "melos/THIRD_PARTY_NOTICES/onnxruntime-ThirdPartyNotices.txt",
+    }
+    if os_kind == "windows":
+        required_subpaths |= {
             "melos/onnxruntime.dll",
             "melos/onnxruntime_providers_shared.dll",
             "melos/DirectML.dll",
-            "melos/pc_nsf_hifigan_44.1k_hop512_128bin_2025.02/model.onnx",
-            "melos/pc_nsf_hifigan_44.1k_hop512_128bin_2025.02/config.json",
-            "melos/pc_nsf_hifigan_44.1k_hop512_128bin_2025.02/NOTICE.txt",
-            "melos/pc_nsf_hifigan_44.1k_hop512_128bin_2025.02/NOTICE.zh-CN.txt",
-            "melos/pc_nsf_hifigan_44.1k_hop512_128bin_2025.02/STATEMENTS.txt",
-            "melos/hnsep/LICENSE",
-            "melos/hnsep/vr/model.onnx",
-            "melos/hnsep/vr/config.yaml",
-            "melos/THIRD_PARTY_NOTICES/onnxruntime-LICENSE.txt",
-            "melos/THIRD_PARTY_NOTICES/onnxruntime-ThirdPartyNotices.txt",
         }
-        missing = required_subpaths - set(names)
-        if missing:
-            raise AssertionError(f"{zip_path.name} missing required AIO files: {sorted(missing)}")
+    elif os_kind == "macos":
+        if not any(n.startswith("melos/libonnxruntime") and n.endswith(".dylib") for n in names):
+            raise AssertionError(f"{archive_path.name} missing macOS libonnxruntime dylib")
+    else:
+        if not any(n.startswith("melos/libonnxruntime.so") for n in names):
+            raise AssertionError(f"{archive_path.name} missing Linux libonnxruntime.so")
+
+    missing = required_subpaths - set(names)
+    if missing:
+        raise AssertionError(f"{archive_path.name} missing required AIO files: {sorted(missing)}")
     return names
 
 
@@ -174,46 +436,71 @@ def build_archives(
     models_root: Path,
     out_dir: Path,
     version_tag: str,
-) -> tuple[Path, Path]:
+    pkg_platform: str,
+) -> tuple[Path, Path, dict[str, object]]:
+    meta = derive_platform_meta(pkg_platform)
+    os_kind = str(meta["os_kind"])
+    ext = str(meta["ext"])
+    os_arch = str(meta["os_arch"])
     version_num = version_tag.lstrip("vV")
+
     out_dir.mkdir(parents=True, exist_ok=True)
-    aio_zip = out_dir / f"melos-{version_tag}-win64-dml.zip"
-    bins_zip = out_dir / f"melos-{version_tag}-win64-bins-only.zip"
+    aio_path = out_dir / f"melos-{version_tag}-{pkg_platform}.{ext}"
+    bins_path = out_dir / f"melos-{version_tag}-{os_arch}-bins-only.{ext}"
 
-    print(f"[build] Writing {bins_zip} ...")
-    with zipfile.ZipFile(bins_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-        populate_common_binaries(zf, repo_root, version_num)
-    bins_names = assert_clean_zip(bins_zip, expect_models=False)
-    print(f"[build] {bins_zip.name}: {len(bins_names)} entries, {bins_zip.stat().st_size:,} bytes")
+    codesign_tmp, stage_bin_dir = prepare_signed_bins_if_macos(repo_root, os_kind)
+    try:
+        print(f"[build] Writing {bins_path} ...")
+        with ArchiveWriter(bins_path, ext) as writer:
+            populate_common_binaries(writer, repo_root, version_num, meta, stage_bin_dir)
+        bins_names = assert_clean_archive(bins_path, meta, expect_models=False)
+        print(f"[build] {bins_path.name}: {len(bins_names)} entries, {bins_path.stat().st_size:,} bytes")
 
-    print(f"[build] Writing {aio_zip} ...")
-    ort_capi = ort_root / "capi"
-    vocoder_dir = models_root / "pc_nsf_hifigan_44.1k_hop512_128bin_2025.02"
-    hnsep_vr_dir = models_root / "hnsep" / "vr"
-    prefix = "melos"
-    with zipfile.ZipFile(aio_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-        populate_common_binaries(zf, repo_root, version_num)
-        add_text(zf, make_aio_config_yaml(version_num), f"{prefix}/config.yaml", crlf=True)
+        print(f"[build] Writing {aio_path} ...")
+        ort_capi = ort_root / "capi"
+        vocoder_dir = models_root / "pc_nsf_hifigan_44.1k_hop512_128bin_2025.02"
+        hnsep_vr_dir = models_root / "hnsep" / "vr"
+        prefix = "melos"
+        with ArchiveWriter(aio_path, ext) as writer:
+            populate_common_binaries(writer, repo_root, version_num, meta, stage_bin_dir)
+            writer.add_text(
+                make_aio_config_yaml(version_num, str(meta["config_label"])),
+                f"{prefix}/config.yaml",
+                crlf=(os_kind == "windows"),
+            )
 
-        for dll_name in ("onnxruntime.dll", "onnxruntime_providers_shared.dll", "DirectML.dll"):
-            add_file(zf, ort_capi / dll_name, f"{prefix}/{dll_name}")
-        add_file(zf, ort_root / "LICENSE", f"{prefix}/THIRD_PARTY_NOTICES/onnxruntime-LICENSE.txt")
-        add_file(
-            zf,
-            ort_root / "ThirdPartyNotices.txt",
-            f"{prefix}/THIRD_PARTY_NOTICES/onnxruntime-ThirdPartyNotices.txt",
-        )
+            if os_kind == "windows":
+                for dll_name in ("onnxruntime.dll", "onnxruntime_providers_shared.dll", "DirectML.dll"):
+                    writer.add_file(ort_capi / dll_name, f"{prefix}/{dll_name}")
+            else:
+                ort_files, ort_symlinks = collect_posix_ort_libs(ort_capi, os_kind)
+                for src_lib, arc_basename in ort_files:
+                    writer.add_file(src_lib, f"{prefix}/{arc_basename}", executable=True)
+                for sym_name, sym_target in ort_symlinks:
+                    writer.add_symlink(f"{prefix}/{sym_name}", sym_target)
 
-        voc_arc = f"{prefix}/pc_nsf_hifigan_44.1k_hop512_128bin_2025.02"
-        for name in ("model.onnx", "config.json", "NOTICE.txt", "NOTICE.zh-CN.txt", "STATEMENTS.txt"):
-            add_file(zf, vocoder_dir / name, f"{voc_arc}/{name}")
+            writer.add_file(
+                find_ort_notice(ort_root, "LICENSE"),
+                f"{prefix}/THIRD_PARTY_NOTICES/onnxruntime-LICENSE.txt",
+            )
+            writer.add_file(
+                find_ort_notice(ort_root, "ThirdPartyNotices.txt"),
+                f"{prefix}/THIRD_PARTY_NOTICES/onnxruntime-ThirdPartyNotices.txt",
+            )
 
-        add_file(zf, hnsep_vr_dir / "model.onnx", f"{prefix}/hnsep/vr/model.onnx")
-        add_file(zf, hnsep_vr_dir / "config.yaml", f"{prefix}/hnsep/vr/config.yaml")
+            voc_arc = f"{prefix}/pc_nsf_hifigan_44.1k_hop512_128bin_2025.02"
+            for name in ("model.onnx", "config.json", "NOTICE.txt", "NOTICE.zh-CN.txt", "STATEMENTS.txt"):
+                writer.add_file(vocoder_dir / name, f"{voc_arc}/{name}")
 
-    aio_names = assert_clean_zip(aio_zip, expect_models=True)
-    print(f"[build] {aio_zip.name}: {len(aio_names)} entries, {aio_zip.stat().st_size:,} bytes")
-    return aio_zip, bins_zip
+            writer.add_file(hnsep_vr_dir / "model.onnx", f"{prefix}/hnsep/vr/model.onnx")
+            writer.add_file(hnsep_vr_dir / "config.yaml", f"{prefix}/hnsep/vr/config.yaml")
+
+        aio_names = assert_clean_archive(aio_path, meta, expect_models=True)
+        print(f"[build] {aio_path.name}: {len(aio_names)} entries, {aio_path.stat().st_size:,} bytes")
+        return aio_path, bins_path, meta
+    finally:
+        if codesign_tmp is not None:
+            codesign_tmp.cleanup()
 
 
 def write_synthetic_voice_wav(path: Path, sr: int = 44100, duration_s: float = 1.6) -> None:
@@ -288,30 +575,45 @@ def choose_smoke_port(preferred: int = 8574) -> int:
         return int(s.getsockname()[1])
 
 
-def kill_server_by_exe_path(exe_path: Path) -> None:
-    if os.name != "nt":
+def extract_archive(archive_path: Path, dest_dir: Path, ext: str) -> None:
+    if ext == "zip":
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            zf.extractall(dest_dir)
         return
-    norm = str(exe_path.resolve()).replace("'", "''")
-    ps_cmd = (
-        f"Get-CimInstance Win32_Process | Where-Object {{ $_.ExecutablePath -eq '{norm}' }} | "
-        "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
-    )
-    subprocess.run(
-        ["powershell", "-NoProfile", "-Command", ps_cmd],
-        capture_output=True,
-        timeout=10,
-    )
+    with tarfile.open(archive_path, "r:gz") as tf:
+        if sys.version_info >= (3, 12):
+            tf.extractall(dest_dir, filter="data")
+        else:
+            tf.extractall(dest_dir)
 
 
-def run_isolated_smoke_test(aio_zip: Path, version_tag: str) -> dict:
+def kill_smoke_server(server_exe: Path) -> None:
+    if os.name == "nt":
+        norm = str(server_exe.resolve()).replace("'", "''")
+        ps_cmd = (
+            f"Get-CimInstance Win32_Process | Where-Object {{ $_.ExecutablePath -eq '{norm}' }} | "
+            "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+        )
+        subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd], capture_output=True, timeout=10)
+    else:
+        subprocess.run(["pkill", "-TERM", "-f", str(server_exe)], capture_output=True, timeout=5)
+        time.sleep(0.3)
+        subprocess.run(["pkill", "-KILL", "-f", str(server_exe)], capture_output=True, timeout=5)
+
+
+def run_isolated_smoke_test(aio_path: Path, version_tag: str, meta: dict[str, object]) -> dict:
     version_num = version_tag.lstrip("vV")
+    os_kind = str(meta["os_kind"])
+    is_win = os_kind == "windows"
+    bins = tuple(meta["bins"])  # type: ignore[arg-type]
+    melos_bin, wavtool_bin, server_bin = bins
+
     smoke_root = Path(tempfile.mkdtemp(prefix="melos_aio_smoke_"))
-    print(f"[smoke] Isolated temp root: {smoke_root}")
+    print(f"[smoke] Isolated temp root ({os_kind}): {smoke_root}")
     melos_dir = smoke_root / "extracted" / "melos"
 
     try:
-        with zipfile.ZipFile(aio_zip, "r") as zf:
-            zf.extractall(smoke_root / "extracted")
+        extract_archive(aio_path, smoke_root / "extracted", str(meta["ext"]))
 
         home_dir = smoke_root / "home"
         tmp_dir = smoke_root / "tmp"
@@ -329,26 +631,36 @@ def run_isolated_smoke_test(aio_zip: Path, version_tag: str) -> dict:
         ):
             d.mkdir(parents=True, exist_ok=True)
 
-        sanitized_env = {
-            "SystemRoot": os.environ.get("SystemRoot", r"C:\Windows"),
-            "WINDIR": os.environ.get("WINDIR", r"C:\Windows"),
-            "ComSpec": os.environ.get("ComSpec", r"C:\Windows\System32\cmd.exe"),
-            "PATH": r"C:\Windows\System32;C:\Windows",
-            "USERNAME": os.environ.get("USERNAME", "melos_smoke"),
-            "USERPROFILE": str(home_dir),
-            "HOME": str(home_dir),
-            "APPDATA": str(home_dir / "AppData" / "Roaming"),
-            "LOCALAPPDATA": str(home_dir / "AppData" / "Local"),
-            "TEMP": str(tmp_dir),
-            "TMP": str(tmp_dir),
-            "NO_PROXY": "127.0.0.1,localhost",
-        }
+        if is_win:
+            sanitized_env = {
+                "SystemRoot": os.environ.get("SystemRoot", r"C:\Windows"),
+                "WINDIR": os.environ.get("WINDIR", r"C:\Windows"),
+                "ComSpec": os.environ.get("ComSpec", r"C:\Windows\System32\cmd.exe"),
+                "PATH": r"C:\Windows\System32;C:\Windows",
+                "USERNAME": os.environ.get("USERNAME", "melos_smoke"),
+                "USERPROFILE": str(home_dir),
+                "HOME": str(home_dir),
+                "APPDATA": str(home_dir / "AppData" / "Roaming"),
+                "LOCALAPPDATA": str(home_dir / "AppData" / "Local"),
+                "TEMP": str(tmp_dir),
+                "TMP": str(tmp_dir),
+                "NO_PROXY": "127.0.0.1,localhost",
+            }
+        else:
+            sanitized_env = {
+                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                "USER": os.environ.get("USER", "melos_smoke"),
+                "HOME": str(home_dir),
+                "XDG_CACHE_HOME": str(tmp_dir),
+                "TMPDIR": str(tmp_dir),
+                "NO_PROXY": "127.0.0.1,localhost",
+            }
 
         # Stage 1: Verify --version on all 3 extracted binaries
         for bin_name, expected_prefix in (
-            ("hifiserver.exe", f"hifiserver {version_num}"),
-            ("melos.exe", f"melos {version_num}"),
-            ("melos-wavtool.exe", f"melos-wavtool {version_num}"),
+            (server_bin, f"hifiserver {version_num}"),
+            (melos_bin, f"melos {version_num}"),
+            (wavtool_bin, f"melos-wavtool {version_num}"),
         ):
             res = subprocess.run(
                 [str(melos_dir / bin_name), "--version"],
@@ -365,11 +677,18 @@ def run_isolated_smoke_test(aio_zip: Path, version_tag: str) -> dict:
                 )
         print(f"[smoke] Stage 1 passed: all 3 binaries report v{version_num}.")
 
-        # Stage 2: Register locator beacon via extracted start.bat --register-only
+        # Stage 2: Register locator beacon via extracted launcher --register-only
         smoke_port = choose_smoke_port(8574)
-        reg_args = "start.bat --register-only" if smoke_port == 8574 else f"start.bat --register-only --port {smoke_port}"
+        extra_port_args = [] if smoke_port == 8574 else ["--port", str(smoke_port)]
+        if is_win:
+            reg_cmd = ["cmd.exe", "/d", "/c", " ".join(["start.bat", "--register-only", *extra_port_args])]
+        else:
+            start_sh = melos_dir / "start.sh"
+            assert (start_sh.stat().st_mode & stat.S_IXUSR) != 0, "start.sh must retain +x permission"
+            reg_cmd = ["/bin/bash", "./start.sh", "--register-only", *extra_port_args]
+
         reg_res = subprocess.run(
-            ["cmd.exe", "/d", "/c", reg_args],
+            reg_cmd,
             cwd=str(melos_dir),
             env=sanitized_env,
             stdin=subprocess.DEVNULL,
@@ -381,7 +700,7 @@ def run_isolated_smoke_test(aio_zip: Path, version_tag: str) -> dict:
         )
         if reg_res.returncode != 0:
             raise RuntimeError(
-                f"{reg_args} failed with rc={reg_res.returncode}\nSTDOUT:\n{reg_res.stdout}\nSTDERR:\n{reg_res.stderr}"
+                f"register-only failed with rc={reg_res.returncode}\nSTDOUT:\n{reg_res.stdout}\nSTDERR:\n{reg_res.stderr}"
             )
         melos_beacon = home_dir / ".melos" / "server.json"
         legacy_beacon = home_dir / ".hifisampler" / "server.json"
@@ -394,28 +713,28 @@ def run_isolated_smoke_test(aio_zip: Path, version_tag: str) -> dict:
             raise AssertionError(f"Beacon port mismatch: {beacon_data}")
         if Path(beacon_data["server_root"]).resolve() != melos_dir.resolve():
             raise AssertionError(f"Beacon server_root mismatch: {beacon_data}")
-        if Path(beacon_data["server_exe"]).resolve() != (melos_dir / "hifiserver.exe").resolve():
+        if Path(beacon_data["server_exe"]).resolve() != (melos_dir / server_bin).resolve():
             raise AssertionError(f"Beacon server_exe mismatch: {beacon_data}")
         print(f"[smoke] Stage 2 passed: ~/.melos/server.json registered on port {smoke_port}; ~/.hifisampler untouched.")
 
-        # Stage 3: Simulate real OpenUtau layout & cold auto-launch via ~/.melos/server.json (no server pre-started)
-        shutil.copy2(melos_dir / "melos.exe", openutau_resamplers / "melos.exe")
+        # Stage 3: Simulate real OpenUtau layout & cold auto-launch via ~/.melos/server.json
+        resamp_copied = openutau_resamplers / melos_bin
+        wavtool_copied = openutau_wavtools / wavtool_bin
+        shutil.copy2(melos_dir / melos_bin, resamp_copied)
         shutil.copy2(melos_dir / "melos.yaml", openutau_resamplers / "melos.yaml")
-        shutil.copy2(melos_dir / "melos-wavtool.exe", openutau_wavtools / "melos-wavtool.exe")
+        shutil.copy2(melos_dir / wavtool_bin, wavtool_copied)
+        if not is_win:
+            resamp_copied.chmod(0o755)
+            wavtool_copied.chmod(0o755)
 
         in_wav = work_dir / "oto" / "a.wav"
         write_synthetic_voice_wav(in_wav)
 
-        helper_bat = work_dir / "temp_helper.bat"
-        helper_bat.write_text(
-            "@chcp 65001 >nul\r\n"
-            '@if not exist "%temp%" "%resamp%" %1 "%temp%" %2 %vel% %flag% %5 %6 %7 %8 %params%\r\n'
-            "@if errorlevel 1 exit /b 1\r\n"
-            '@"%tool%" "%output%" "%temp%" %4 %3 0 10 0 100 100 0 0\r\n'
-            "@if errorlevel 1 exit /b 1\r\n",
-            encoding="utf-8",
-        )
+        out_wav = work_dir / "phrase_out.wav"
+        note1_wav = work_dir / "cache" / "note1.wav"
+        note2_wav = work_dir / "cache" / "note2.wav"
 
+        sep = "\\\\" if is_win else "/"
         temp_bat = work_dir / "temp.bat"
         temp_bat.write_text(
             "@chcp 65001 >nul\r\n"
@@ -423,45 +742,78 @@ def run_isolated_smoke_test(aio_zip: Path, version_tag: str) -> dict:
             "@set tempo=120\r\n"
             "@set samples=44100\r\n"
             f"@set oto={work_dir / 'oto'}\r\n"
-            f"@set tool={openutau_wavtools / 'melos-wavtool.exe'}\r\n"
-            f"@set resamp={openutau_resamplers / 'melos.exe'}\r\n"
-            f"@set output={work_dir / 'phrase_out.wav'}\r\n"
+            f"@set tool={wavtool_copied}\r\n"
+            f"@set resamp={resamp_copied}\r\n"
+            f"@set output={out_wav}\r\n"
             "@set helper=temp_helper.bat\r\n"
             f"@set cachedir={work_dir / 'cache'}\r\n"
             '@del "%output%" 2>nul\r\n'
             '@set flag="Ht15"\r\n'
             "@set vel=100\r\n"
-            f"@set temp={work_dir / 'cache' / 'note1.wav'}\r\n"
+            f"@set temp={note1_wav}\r\n"
             "@set params=100 0 !120 AA\r\n"
-            '@call %helper% "%oto%\\a.wav" C4 480@120+0 0 40 600 100 -300 0 10 0 100 100 0 0\r\n'
+            f'@call %helper% "%oto%{sep}a.wav" C4 480@120+0 0 40 600 100 -300 0 10 0 100 100 0 0\r\n'
             "@if errorlevel 1 exit /b 1\r\n"
             '@set flag="Ht15"\r\n'
             "@set vel=100\r\n"
-            f"@set temp={work_dir / 'cache' / 'note2.wav'}\r\n"
+            f"@set temp={note2_wav}\r\n"
             "@set params=100 0 !120 AA\r\n"
-            '@call %helper% "%oto%\\a.wav" D4 480@120+0 0 40 600 100 -300 0 10 0 100 100 0 0\r\n'
+            f'@call %helper% "%oto%{sep}a.wav" D4 480@120+0 0 40 600 100 -300 0 10 0 100 100 0 0\r\n'
             "@if errorlevel 1 exit /b 1\r\n",
             encoding="utf-8",
         )
 
-        bat_res = subprocess.run(
-            ["cmd.exe", "/d", "/c", str(temp_bat)],
-            cwd=str(work_dir),
-            env=sanitized_env,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=90,
-        )
-        if bat_res.returncode != 0:
-            log_path = melos_dir / "logs" / "hifiserver.log"
-            log_dump = log_path.read_text(encoding="utf-8", errors="replace") if log_path.is_file() else "<missing>"
-            raise RuntimeError(
-                f"Cold auto-launch temp.bat exited with {bat_res.returncode}\nSTDOUT:\n{bat_res.stdout}\nSTDERR:\n{bat_res.stderr}\nSERVER LOG:\n{log_dump}"
+        if is_win:
+            helper_bat = work_dir / "temp_helper.bat"
+            helper_bat.write_text(
+                "@chcp 65001 >nul\r\n"
+                '@if not exist "%temp%" "%resamp%" %1 "%temp%" %2 %vel% %flag% %5 %6 %7 %8 %params%\r\n'
+                "@if errorlevel 1 exit /b 1\r\n"
+                '@"%tool%" "%output%" "%temp%" %4 %3 0 10 0 100 100 0 0\r\n'
+                "@if errorlevel 1 exit /b 1\r\n",
+                encoding="utf-8",
             )
+            bat_res = subprocess.run(
+                ["cmd.exe", "/d", "/c", str(temp_bat)],
+                cwd=str(work_dir),
+                env=sanitized_env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=90,
+            )
+            if bat_res.returncode != 0:
+                log_path = melos_dir / "logs" / "hifiserver.log"
+                log_dump = log_path.read_text(encoding="utf-8", errors="replace") if log_path.is_file() else "<missing>"
+                raise RuntimeError(
+                    f"Cold auto-launch temp.bat exited with {bat_res.returncode}\nSTDOUT:\n{bat_res.stdout}\nSTDERR:\n{bat_res.stderr}\nSERVER LOG:\n{log_dump}"
+                )
+        else:
+            steps = [
+                [str(resamp_copied), str(in_wav), str(note1_wav), "C4", "100", "Ht15", "40", "600", "100", "-300", "100", "0", "!120", "AA"],
+                [str(wavtool_copied), str(out_wav), str(note1_wav), "0", "480@120+0", "0", "10", "0", "100", "100", "0", "0"],
+                [str(resamp_copied), str(in_wav), str(note2_wav), "D4", "100", "Ht15", "40", "600", "100", "-300", "100", "0", "!120", "AA"],
+                [str(wavtool_copied), str(out_wav), str(note2_wav), "0", "480@120+0", "0", "10", "0", "100", "100", "0", "0"],
+            ]
+            for idx, cmd in enumerate(steps, 1):
+                step_res = subprocess.run(
+                    cmd,
+                    cwd=str(work_dir),
+                    env=sanitized_env,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=90,
+                )
+                if step_res.returncode != 0:
+                    log_path = melos_dir / "logs" / "hifiserver.log"
+                    log_dump = log_path.read_text(encoding="utf-8", errors="replace") if log_path.is_file() else "<missing>"
+                    raise RuntimeError(
+                        f"POSIX step {idx} ({Path(cmd[0]).name}) failed rc={step_res.returncode}\nSTDOUT:\n{step_res.stdout}\nSTDERR:\n{step_res.stderr}\nSERVER LOG:\n{log_dump}"
+                    )
 
-        out_wav = work_dir / "phrase_out.wav"
         if not out_wav.is_file():
             raise AssertionError(f"Phrase output WAV not created: {out_wav}")
         sr, n_frames, dur_s, rms, peak = read_wav_stats(out_wav)
@@ -493,8 +845,7 @@ def run_isolated_smoke_test(aio_zip: Path, version_tag: str) -> dict:
         if not log_path.is_file():
             raise AssertionError(f"Expected managed log file missing: {log_path}")
         log_text = log_path.read_text(encoding="utf-8", errors="replace")
-        has_ep = ("DmlExecutionProvider" in log_text) or ("CPUExecutionProvider" in log_text)
-        if not has_ep or "Loaded vocoder" not in log_text or "Loaded HN-SEP" not in log_text:
+        if "Loaded vocoder" not in log_text or "Loaded HN-SEP" not in log_text:
             raise AssertionError(f"Managed server log incomplete:\n{log_text}")
 
         print(f"[smoke] Stage 3 passed (cold auto-launch from copied OpenUtau folders on port {smoke_port}):")
@@ -505,6 +856,7 @@ def run_isolated_smoke_test(aio_zip: Path, version_tag: str) -> dict:
             print(f"    | {line}")
 
         return {
+            "platform": meta["platform"],
             "port": smoke_port,
             "sr": sr,
             "samples": n_frames,
@@ -515,7 +867,7 @@ def run_isolated_smoke_test(aio_zip: Path, version_tag: str) -> dict:
             "synthesis_ms": round(float(phrase_entries[0]["synthesis_ms"]), 2),
         }
     finally:
-        kill_server_by_exe_path(melos_dir / "hifiserver.exe")
+        kill_smoke_server(melos_dir / server_bin)
         for _ in range(10):
             try:
                 if smoke_root.exists():
@@ -528,104 +880,38 @@ def run_isolated_smoke_test(aio_zip: Path, version_tag: str) -> dict:
         print("[smoke] Temporary smoke directory deleted cleanly.")
 
 
-def write_release_notes(
-    out_dir: Path,
-    version_tag: str,
-    assets: list[tuple[str, int, str]],
-    smoke_summary: dict | None,
-) -> Path:
-    notes_path = out_dir / f"RELEASE_NOTES_melos_{version_tag}.md"
-    aio_zip_name = f"melos-{version_tag}-win64-dml.zip"
-    bins_zip_name = f"melos-{version_tag}-win64-bins-only.zip"
-
-    table_rows = "\n".join(
-        f"| `{name}` | {size:,} bytes ({size / (1024 * 1024):.2f} MiB) | `{digest}` |"
-        if size >= 1024 * 1024
-        else f"| `{name}` | {size:,} bytes | `{digest}` |"
-        for name, size, digest in assets
-    )
-    smoke_note = (
-        f"- **独立环境三阶段全冷启动冒烟测试**：将 `{aio_zip_name}` 解压至仓库外目录，在纯净环境（`PATH=C:\\Windows\\System32;C:\\Windows`）依次验证 `--version` 校验、`start.bat --register-only` 写入 `~/.melos/server.json`（不触碰 `~/.hifisampler`），以及将 `melos.exe`+`melos.yaml` 与 `melos-wavtool.exe` 分别复制至模拟 `OpenUtau/Resamplers`、`OpenUtau/Wavtools` 后由客户端冷拉起 `hifiserver.exe --managed`（写入 `logs/hifiserver.log` 并启用 DirectML），完成带 `Ht15` 的 2 音符整句单次声码渲染（`{smoke_summary['note_name']}`，端口 `{smoke_summary['port']}`，输出 {smoke_summary['sr']} Hz / {smoke_summary['duration_s']}s，RMS={smoke_summary['rms']}，声码器耗时 {smoke_summary['synthesis_ms']} ms）。"
-        if smoke_summary
-        else "- **Smoke Test**: Skipped during this archive run."
-    )
-
-    notes = f"""\
-# {version_tag}-melos — 纯 Rust 后端 & 整句 Mel+F0 连续声码渲染
-
-本 Release 从 [`melos`](https://github.com/openhachimi/hifisampler/tree/melos) 分支独立发布，仅包含 **Melos**（纯 Rust 架构与连续短语合成引擎），与 `main` 分支的 Python `hifisampler` 保持独立区分（已设置 `--latest=false`，不改变仓库 `/releases/latest` 指向）。
-
-> [!NOTE]
-> **分支版本号奇偶约定 / Branch Versioning Convention**
-> - **Melos（`melos` 分支）**：从 `0.2.0` 起步并采用**偶数次版本号**（`0.2.0`、`0.4.0`、`0.6.0`……，Release 标题为 `{version_tag}-melos`）。
-> - **hifisampler（`main` 分支）**：采用**奇数次版本号**（`0.1.0`、`0.3.0`、`0.5.0`……，Release 标题为 `v0.1.0-hifi` 等）。
-> - **同机并存隔离**：Melos 默认监听端口 `8574`（`http://127.0.0.1:8574`）并将服务端信标写入 `~/.melos/server.json`，与旧版端口 `8572` / `~/.hifisampler/server.json` 互相隔离，可同机并存。
-
----
-
-## 📦 下载文件说明 / Download Assets
-
-| 文件名 (Asset) | 大小 (Size) | SHA-256 |
-| --- | --- | --- |
-{table_rows}
-
-- **`{aio_zip_name}`（推荐 / Windows x64 DirectML 一键整合包）**：解压即用，内置 `melos.exe`、`melos-wavtool.exe`、`hifiserver.exe`、`melos.yaml`、纯 Melos `start.bat`、`config.yaml`/`config.default.yaml`，以及已转换的 `pc_nsf_hifigan` ONNX 声码器、`hnsep` ONNX 谐波噪声分离模型和 Microsoft ONNX Runtime + DirectML 运行时 DLL；**无需安装 Python 或 CUDA**，在原生 OpenUtau 客户端即可使用整句 Mel+F0 连续合成。
-- **`{bins_zip_name}`（纯开源二进制包 / Pure OSS Binaries Only）**：仅包含 Apache-2.0 编译的 `melos.exe`、`melos-wavtool.exe`、`hifiserver.exe`、`melos.yaml`、纯 Melos `start.bat`、`config.default.yaml` 与 `hnsep/LICENSE`；**不含**模型权重与闭源运行时 DLL，适合自行准备模型或合规审计使用。
-- **`melos.yaml`**：OpenUtau 表情配置清单（与压缩包内相同，方便单独更新）。
-
----
-
-## 🚀 原生 OpenUtau 快速配置 / Quick Setup (Native OpenUtau)
-
-1. 下载并解压 **`{aio_zip_name}`** 到任意英文或中文路径。
-2. **首次使用双击运行一次目录中的 `start.bat`**（自动生成 `config.yaml`、注册 `~/.melos/server.json` 并预热引擎；后续日常渲染无需提前启动，客户端会自动按需拉起托管服务，后台日志自动记录在 `logs/hifiserver.log`）。
-3. 接入原生 OpenUtau（保持 `CLASSIC` 渲染器）：
-   - 将 `melos.exe` 与 `melos.yaml` 复制到 OpenUtau 的 `Resamplers/` 目录；
-   - 将 `melos-wavtool.exe` 复制到 OpenUtau 的 `Wavtools/` 目录；
-   - 在轨道头将 **Resampler** 设为 `melos.exe`，**Wavtool** 设为 `melos-wavtool.exe`（若切回 `convergence` / `simple`，`melos.exe` 也会自动退回单音兼容模式）。
-
----
-
-## ⚖️ 分发协议与模型许可证说明 / Distribution & Model License Terms
-
-> [!IMPORTANT]
-> **`{aio_zip_name}` 包含受非商业条款（Non-Commercial）约束的第三方预训练模型权重及闭源 DirectML 运行时组件，仅供个人研究、非商业艺术创作与技术评估；严禁将预训练模型权重或完整整合包用于任何商业用途。**
-
-| 组件 (Component) | 适用许可证 / 条款 (License / Terms) | 说明与随附文件 (Notes & Bundled Notices) |
-| --- | --- | --- |
-| Melos Rust 源码与二进制（`hifiserver.exe` / `melos.exe` / `melos-wavtool.exe`） | **Apache-2.0** | 见包内 `LICENSE`（`{bins_zip_name}` 仅含本类与 `hnsep/LICENSE`）。 |
-| `hnsep/` 脚本与许可证声明 | **MIT** | 上游 `yxlllc/vocal-remover`（`Copyright (c) 2019 tsurumeso`），见 `hnsep/LICENSE`。 |
-| `pc_nsf_hifigan_44.1k_hop512_128bin_2025.02` ONNX 权重 | **CC BY-NC-SA 4.0（署名-非商业性使用-相同方式共享）** | 上游为 OpenVPI / DiffSinger 社区公开权重；包内保留原始 `NOTICE.txt`、`NOTICE.zh-CN.txt` 与 `STATEMENTS.txt`，未调整训练参数。 |
-| `hnsep/vr/model.onnx`（240512） | **上游非商业声明 / Non-Commercial Notice** | 由 `yxlllc/vocal-remover` 发布的 `hnsep_240512` checkpoint 导出；上游仓库明确限制预训练模型权重不可用于商业用途。 |
-| ONNX Runtime & DirectML DLL（`onnxruntime.dll`、`onnxruntime_providers_shared.dll`、`DirectML.dll`） | **MIT（ORT） / Microsoft Redistributable Notice（DirectML）** | 随附 `THIRD_PARTY_NOTICES/onnxruntime-LICENSE.txt` 与 `THIRD_PARTY_NOTICES/onnxruntime-ThirdPartyNotices.txt`。 |
-
----
-
-## 🧪 验证摘要 / Verification Summary
-
-{smoke_note}
-"""
-    notes_path.write_text(notes, encoding="utf-8")
-    print(f"[notes] Wrote {notes_path}")
-    return notes_path
+def write_platform_summary_json(out_dir: Path, pkg_platform: str, assets: list[tuple[str, int, str]], smoke: dict | None) -> Path:
+    summary_path = out_dir / f"summary-{pkg_platform}.json"
+    summary = {
+        "platform": pkg_platform,
+        "assets": [{"name": n, "size": s, "sha256": d} for n, s, d in assets],
+        "smoke": smoke,
+    }
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    return summary_path
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Package Melos release archives and run isolated smoke tests.")
     parser.add_argument("--version", default="v0.2.0", help="Release tag version (default: v0.2.0)")
+    parser.add_argument(
+        "--platform",
+        default=None,
+        help="Target package flavor (win64-dml, macos-arm64-coreml, macos-x64-coreml, linux-x64-aio, linux-arm64-aio)",
+    )
     parser.add_argument("--repo-root", type=Path, default=DEFAULT_REPO_ROOT, help="Repository root directory")
     parser.add_argument(
         "--ort-dir",
         type=Path,
         default=None,
-        help="Path to onnxruntime package root containing capi/*.dll, LICENSE, ThirdPartyNotices.txt",
+        help="Path to onnxruntime package root containing capi/, LICENSE, ThirdPartyNotices.txt",
     )
     parser.add_argument("--models-root", type=Path, default=None, help="Root directory containing ONNX model dirs")
     parser.add_argument(
         "--out-dir",
         type=Path,
         default=None,
-        help="Output directory for generated zips and release notes",
+        help="Output directory for generated archives and checksum summary",
     )
     parser.add_argument("--skip-smoke", action="store_true", help="Skip isolated AIO smoke test")
     return parser.parse_args()
@@ -633,25 +919,29 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    pkg_platform = args.platform or detect_default_platform()
     repo_root = args.repo_root.resolve()
     ort_root = (args.ort_dir or (repo_root / ".venv" / "Lib" / "site-packages" / "onnxruntime")).resolve()
     models_root = (args.models_root or repo_root).resolve()
     out_dir = (args.out_dir or (repo_root / "TestResults" / "release_build")).resolve()
 
-    aio_zip, bins_zip = build_archives(repo_root, ort_root, models_root, out_dir, args.version)
-    smoke_summary = None if args.skip_smoke else run_isolated_smoke_test(aio_zip, args.version)
+    aio_path, bins_path, meta = build_archives(
+        repo_root, ort_root, models_root, out_dir, args.version, pkg_platform
+    )
+    smoke_summary = None if args.skip_smoke else run_isolated_smoke_test(aio_path, args.version, meta)
 
     melos_yaml = repo_root / "rust" / "melos.yaml"
     assets = [
-        (aio_zip.name, aio_zip.stat().st_size, sha256_file(aio_zip)),
-        (bins_zip.name, bins_zip.stat().st_size, sha256_file(bins_zip)),
+        (aio_path.name, aio_path.stat().st_size, sha256_file(aio_path)),
+        (bins_path.name, bins_path.stat().st_size, sha256_file(bins_path)),
         (melos_yaml.name, melos_yaml.stat().st_size, sha256_file(melos_yaml)),
     ]
-    print("\n=== RELEASE ARTIFACT CHECKSUMS ===")
+    print(f"\n=== RELEASE ARTIFACT CHECKSUMS ({pkg_platform}) ===")
     for name, size, digest in assets:
         print(f"{name}: {size} bytes | sha256={digest}")
 
-    write_release_notes(out_dir, args.version, assets, smoke_summary)
+    summary_path = write_platform_summary_json(out_dir, pkg_platform, assets, smoke_summary)
+    print(f"[summary] Wrote {summary_path}")
 
 
 if __name__ == "__main__":

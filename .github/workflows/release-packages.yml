@@ -8,17 +8,46 @@ on:
         required: true
         default: 'v0.2.0'
       models_tag:
-        description: 'Release tag containing upstream models.7z'
+        description: 'Release tag containing pre-packaged melos-*-win64-dml.zip ONNX weights'
         required: true
-        default: 'v0.1.0'
+        default: 'v0.2.0'
+      platforms:
+        description: 'Targets to build (all, unix, or comma-separated ids: win64,macos-arm64,macos-x64,linux-x64,linux-arm64)'
+        required: true
+        default: 'all'
 
 permissions:
   contents: write
 
 jobs:
-  package-melos-win64:
-    name: Build & Package Melos (Windows x64 DirectML)
-    runs-on: windows-latest
+  package-melos:
+    name: Build & Package Melos (${{ matrix.id }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: win64
+            runner: windows-latest
+            pkg_platform: win64-dml
+            ort_pkg: onnxruntime-directml==1.24.4
+          - id: macos-arm64
+            runner: macos-15
+            pkg_platform: macos-arm64-coreml
+            ort_pkg: onnxruntime==1.24.4
+          - id: macos-x64
+            runner: macos-15-intel
+            pkg_platform: macos-x64-coreml
+            ort_pkg: onnxruntime==1.23.2
+          - id: linux-x64
+            runner: ubuntu-latest
+            pkg_platform: linux-x64-aio
+            ort_pkg: onnxruntime==1.24.4
+          - id: linux-arm64
+            runner: ubuntu-24.04-arm
+            pkg_platform: linux-arm64-aio
+            ort_pkg: onnxruntime==1.24.4
+    if: ${{ inputs.platforms == 'all' || (inputs.platforms == 'unix' && matrix.id != 'win64') || contains(inputs.platforms, matrix.id) }}
 
     steps:
       - name: Checkout melos branch / tag
@@ -27,74 +56,76 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install uv and Python 3.12 (for HN-SEP ONNX export & DirectML ORT DLLs)
+      - name: Install uv and Python 3.12 (for ONNX Runtime shared libs & packager)
         uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.12"
 
-      - name: Setup packaging venv with CPU PyTorch and onnxruntime-directml
-        shell: pwsh
+      - name: Setup packaging venv (.venv) with ONNX Runtime (${{ matrix.ort_pkg }})
+        shell: bash
         run: |
-          $ErrorActionPreference = "Stop"
-          uv venv .pkg_venv --python 3.12
-          uv pip install --python .pkg_venv "torch>=2.6.0" --index-url https://download.pytorch.org/whl/cpu
-          uv pip install --python .pkg_venv onnx onnxruntime-directml pyyaml
+          set -e
+          uv venv .venv --python 3.12
+          uv pip install --python .venv "${{ matrix.ort_pkg }}"
 
-      - name: Download models.7z and prepare ONNX weights
+      - name: Download ONNX model weights from ${{ inputs.models_tag }}
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: pwsh
+        shell: bash
         run: |
-          $ErrorActionPreference = "Stop"
-          gh release download "${{ inputs.models_tag }}" -p "models.7z" --clobber
-          7z x "models.7z" -o"_models_extract" -y | Out-Null
+          set -e
+          gh release download "${{ inputs.models_tag }}" -p "melos-*-win64-dml.zip" -O models_bundle.zip --clobber
+          if [ -x ".venv/Scripts/python.exe" ]; then
+            PY=".venv/Scripts/python.exe"
+          else
+            PY=".venv/bin/python"
+          fi
+          "$PY" - <<'PY'
+          import pathlib, shutil, zipfile
+          dst = pathlib.Path(".")
+          with zipfile.ZipFile("models_bundle.zip") as zf:
+              for m in zf.infolist():
+                  if m.is_dir():
+                      continue
+                  for prefix in ("melos/pc_nsf_hifigan_44.1k_hop512_128bin_2025.02/", "melos/hnsep/vr/"):
+                      if m.filename.startswith(prefix):
+                          rel = m.filename[len("melos/"):]
+                          out = dst / rel
+                          out.parent.mkdir(parents=True, exist_ok=True)
+                          with zf.open(m) as src, out.open("wb") as f:
+                              shutil.copyfileobj(src, f)
+          PY
+          rm -f models_bundle.zip
 
-          $onnxFile = Get-ChildItem "_models_extract" -Recurse -Filter "model.onnx" | Select-Object -First 1
-          if (-not $onnxFile) { throw "model.onnx not found in models.7z" }
-          $vocoderDst = Join-Path $PWD "pc_nsf_hifigan_44.1k_hop512_128bin_2025.02"
-          New-Item -ItemType Directory -Force -Path $vocoderDst | Out-Null
-          Copy-Item -Recurse -Force "$($onnxFile.Directory.FullName)\*" $vocoderDst
-
-          $ptFile = Get-ChildItem "_models_extract" -Recurse -Filter "model.pt" | Select-Object -First 1
-          if (-not $ptFile) { throw "model.pt not found in models.7z" }
-          $vrDst = Join-Path $PWD "hnsep\vr"
-          New-Item -ItemType Directory -Force -Path $vrDst | Out-Null
-          Copy-Item -Recurse -Force "$($ptFile.Directory.FullName)\*" $vrDst
-
-          & .\.pkg_venv\Scripts\python.exe .\hnsep\convert_hnsep_to_onnx.py --ckpt "$vrDst\model.pt" --config "$vrDst\config.yaml" --out "$vrDst\model.onnx"
-          if ($LASTEXITCODE -ne 0) { throw "HN-SEP ONNX export failed" }
-          Remove-Item -Recurse -Force "_models_extract", "models.7z"
-
-      - name: Build Melos Rust release binaries and run unit tests
-        shell: pwsh
+      - name: Build Melos Rust release binaries and run unit/integration tests
+        shell: bash
         working-directory: ./rust
         run: |
-          $ErrorActionPreference = "Stop"
+          set -e
           cargo test --workspace --release
-          if ($LASTEXITCODE -ne 0) { throw "cargo test failed" }
-          cargo build --release --bins
-          if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
+          cargo build --release -p hifi_server -p hifi_client
 
-      - name: Package Melos archives and run 3-stage isolated smoke test
-        shell: pwsh
+      - name: Package Melos archives and run 3-stage isolated smoke test (${{ matrix.pkg_platform }})
+        shell: bash
         run: |
-          $ErrorActionPreference = "Stop"
-          & .\.pkg_venv\Scripts\python.exe .\scripts\package_melos_release.py `
-            --version "${{ inputs.tag }}" `
-            --ort-dir "$PWD\.pkg_venv\Lib\site-packages\onnxruntime" `
-            --models-root "$PWD" `
-            --out-dir "$PWD\dist"
-          if ($LASTEXITCODE -ne 0) { throw "Melos packaging or smoke test failed" }
+          set -e
+          if [ -x ".venv/Scripts/python.exe" ]; then
+            PY=".venv/Scripts/python.exe"
+          else
+            PY=".venv/bin/python"
+          fi
+          ORT_DIR="$("$PY" -c "import pathlib, onnxruntime; print(pathlib.Path(onnxruntime.__file__).resolve().parent)")"
+          "$PY" ./scripts/package_melos_release.py \
+            --version "${{ inputs.tag }}" \
+            --platform "${{ matrix.pkg_platform }}" \
+            --ort-dir "$ORT_DIR" \
+            --models-root "$PWD" \
+            --out-dir "$PWD/dist"
 
       - name: Upload Melos release assets to ${{ inputs.tag }}
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: pwsh
+        shell: bash
         run: |
-          $ErrorActionPreference = "Stop"
-          $tag = "${{ inputs.tag }}"
-          gh release upload $tag `
-            "dist\melos-$tag-win64-dml.zip" `
-            "dist\melos-$tag-win64-bins-only.zip" `
-            "rust\melos.yaml" `
-            --clobber
+          set -e
+          gh release upload "${{ inputs.tag }}" dist/melos-* --clobber

@@ -4,7 +4,25 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Fast path: if .venv is fully initialized, run hifiserver.py directly without uv overhead
+if [ ! -f "$SCRIPT_DIR/config.yaml" ] && [ -f "$SCRIPT_DIR/config.default.yaml" ]; then
+    cp "$SCRIPT_DIR/config.default.yaml" "$SCRIPT_DIR/config.yaml"
+fi
+
+# Fast path 0: native Rust hifiserver (Melos release / local build)
+if [ -f "$SCRIPT_DIR/hifiserver" ]; then
+    chmod +x "$SCRIPT_DIR/hifiserver" "$SCRIPT_DIR/melos" "$SCRIPT_DIR/melos-wavtool" 2>/dev/null || true
+    exec "$SCRIPT_DIR/hifiserver" "$@"
+fi
+if [ -x "$SCRIPT_DIR/rust/target/release/hifiserver" ]; then
+    exec "$SCRIPT_DIR/rust/target/release/hifiserver" "$@"
+fi
+
+if [ ! -f "$SCRIPT_DIR/hifiserver.py" ]; then
+    echo "[Melos] Error: hifiserver binary was not found in $SCRIPT_DIR" >&2
+    exit 1
+fi
+
+# Fast path 1: if .venv is fully initialized, run hifiserver.py directly without uv overhead
 if [ -x "$SCRIPT_DIR/.venv/bin/python" ] && [ -f "$SCRIPT_DIR/.venv/.hifisampler_ready" ]; then
     exec "$SCRIPT_DIR/.venv/bin/python" "$SCRIPT_DIR/hifiserver.py" "$@"
 fi
