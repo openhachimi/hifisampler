@@ -47,6 +47,12 @@ if not exist ".venv\Lib\site-packages\torch" (
         )
     ) else (
         echo --- No NVIDIA GPU detected. Installing lightweight PyTorch ^(CPU^) + DirectML support...
+        uv pip install --python .venv "torch>=2.6.0" --index-url https://download.pytorch.org/whl/cpu
+        if errorlevel 1 (
+            echo Error: Failed to install PyTorch ^(CPU^).
+            pause
+            goto :eof
+        )
     )
 )
 
