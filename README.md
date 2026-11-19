@@ -4,7 +4,7 @@
 
 A neural UTAU / OpenUtau resampler based on [pc-nsf-hifigan](https://github.com/openvpi/vocoders) for virtual singers. Runs on Windows, Linux, and macOS with support for NVIDIA, AMD, and Intel GPUs as well as CPU.
 
-**For Jinriki VOCALOID / OtoMAD use, please check out our [Hachimisampler](https://github.com/openhachimi/hachimisampler).**
+**For Jinriki VOCALOID / OtoMAD use, please check out our [HachiShifter](https://github.com/openhachimi/hachishifter).**
 
 ## Next-Gen Rust Engine Branch: Melos (`melos` branch)
 
