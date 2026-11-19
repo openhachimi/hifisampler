@@ -4,7 +4,7 @@
 
 一个基于 [pc-nsf-hifigan](https://github.com/openvpi/vocoders) 的 UTAU / OpenUtau 重采样器，支持 Windows、Linux 与 macOS，兼容 NVIDIA、AMD、Intel 显卡及纯 CPU 运行。
 
-**如果您用于人力 VOCALOID（音MAD），推荐使用我们的 [Hachimisampler](https://github.com/openhachimi/hachimisampler)。**
+**如果您用于人力 VOCALOID（音MAD），推荐使用我们的 [HachiShifter](https://github.com/openhachimi/hachishifter) 这是灵感源于知名调音软件的全流程人力鬼畜工具。**
 
 ## 下一代 Rust 引擎分支：Melos（`melos` 分支）
 
